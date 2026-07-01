@@ -34,6 +34,7 @@
     "src",
     "README.md",
     "SECURITY.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "engines": {
