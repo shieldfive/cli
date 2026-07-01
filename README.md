@@ -42,7 +42,20 @@ size, uploading nothing.
 - Node.js >= 20
 - A ShieldFive account with a vault (create one in the web app first)
 
-Not yet published to npm. For now, clone and run:
+## Install
+
+```sh
+npm install -g @shieldfive/cli    # provides the `sf` command
+```
+
+Or run it without installing:
+
+```sh
+npx @shieldfive/cli --help
+```
+
+To read and build from source (the whole point — verify what it does before you
+trust it):
 
 ```sh
 git clone https://github.com/shieldfive/cli.git
