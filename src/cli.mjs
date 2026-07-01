@@ -27,8 +27,10 @@ function usage() {
       '                              [--interval=<seconds>]  poll interval for --watch (default 5)',
       '  --help',
       '',
-      'push / sync read: SF_API_BASE_URL, SF_SUPABASE_URL, SF_SUPABASE_ANON_KEY,',
-      '                  SF_EMAIL, SF_PASSWORD, [SF_VAULT_PASSWORD]',
+      'push / sync need only your ShieldFive account:',
+      '  SF_EMAIL, SF_PASSWORD   [SF_VAULT_PASSWORD if your vault password differs]',
+      'SF_API_BASE_URL, SF_SUPABASE_URL, SF_SUPABASE_ANON_KEY default to ShieldFive',
+      '(override only for a development backend).',
       '',
     ].join('\n') + '\n',
   )
@@ -60,26 +62,40 @@ async function cmdEncrypt(folder) {
   }
 }
 
+// ShieldFive's PUBLIC client configuration — the same values the website ships
+// to every browser and the mobile app embeds. The anon key is a Supabase JWT
+// with role=anon, gated by row-level security; it is designed to be public.
+// All three default here and are overridable via env for development or a
+// staging backend, so a normal user only needs SF_EMAIL + SF_PASSWORD.
+const DEFAULTS = {
+  apiBaseUrl: 'https://shieldfive.com',
+  supabaseUrl: 'https://dskbmjpanehckhqzkclp.supabase.co',
+  anonKey:
+    'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImRza2JtanBhbmVoY2tocXprY2xwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzAxMTc3MzEsImV4cCI6MjA4NTY5MzczMX0.AK7K8tyrAWFWgfaa6vvTveqmKiMrL2nY1m7qS9TII9U',
+}
+
 function readLiveConfig() {
   const e = process.env
-  const required = {
-    apiBaseUrl: e.SF_API_BASE_URL,
-    supabaseUrl: e.SF_SUPABASE_URL,
-    anonKey: e.SF_SUPABASE_ANON_KEY,
-    email: e.SF_EMAIL,
-    password: e.SF_PASSWORD,
-  }
-  const missing = Object.entries(required)
-    .filter(([, v]) => !v)
-    .map(([k]) => k)
+  const email = e.SF_EMAIL
+  const password = e.SF_PASSWORD
+  const missing = []
+  if (!email) missing.push('SF_EMAIL')
+  if (!password) missing.push('SF_PASSWORD')
   if (missing.length) {
     throw new Error(
-      'this command needs env vars SF_API_BASE_URL, SF_SUPABASE_URL, ' +
-        'SF_SUPABASE_ANON_KEY, SF_EMAIL, SF_PASSWORD (and optionally ' +
-        `SF_VAULT_PASSWORD). Missing: ${missing.join(', ')}`,
+      `this command needs your ShieldFive account: set ${missing.join(' and ')}. ` +
+        '(SF_API_BASE_URL, SF_SUPABASE_URL, and SF_SUPABASE_ANON_KEY default to ' +
+        'ShieldFive; override them only for a development backend.)',
     )
   }
-  return { ...required, vaultPassword: e.SF_VAULT_PASSWORD || e.SF_PASSWORD }
+  return {
+    apiBaseUrl: e.SF_API_BASE_URL || DEFAULTS.apiBaseUrl,
+    supabaseUrl: e.SF_SUPABASE_URL || DEFAULTS.supabaseUrl,
+    anonKey: e.SF_SUPABASE_ANON_KEY || DEFAULTS.anonKey,
+    email,
+    password,
+    vaultPassword: e.SF_VAULT_PASSWORD || password,
+  }
 }
 
 // Sign in (Supabase -> Bearer) then fetch + unlock the vault root key. Shared by

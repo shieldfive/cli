@@ -67,23 +67,23 @@ everything.
 
 ## Running the live commands
 
-The live commands read your account details from environment variables. Your
-password is typed, never passed on the command line:
+`sf push` and `sf sync` need only your ShieldFive account. Your password is
+typed, never passed on the command line:
 
 ```sh
-export SF_API_BASE_URL=https://shieldfive.com
-export SF_SUPABASE_URL="<your project's public Supabase URL>"
-export SF_SUPABASE_ANON_KEY="<your project's public anon key>"
 export SF_EMAIL=you@example.com
 read -rs SF_PASSWORD; echo; export SF_PASSWORD
-export SF_VAULT_PASSWORD="$SF_PASSWORD"   # set separately if your vault password differs
+export SF_VAULT_PASSWORD="$SF_PASSWORD"   # only if your vault password differs
 
 sf push ./my-folder
 sf sync ./my-folder --watch
 ```
 
-`SF_SUPABASE_URL` and `SF_SUPABASE_ANON_KEY` are the public Supabase project URL
-and anonymous key (the same values a browser client uses). If two-factor
+The backend endpoints default to ShieldFive, so there is nothing else to
+configure. `SF_API_BASE_URL`, `SF_SUPABASE_URL`, and `SF_SUPABASE_ANON_KEY` are
+baked in with ShieldFive's public values — the Supabase anon key is a `role=anon`
+JWT gated by row-level security, the same value any browser receives — and only
+need overriding if you point the CLI at a development backend. If two-factor
 authentication is enabled on your account, the MFA step-up is not yet handled by
 the CLI.
 
