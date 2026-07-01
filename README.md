@@ -5,8 +5,8 @@
 > post-quantum vault. Everything is encrypted locally before it leaves your
 > machine. Read the code and verify that for yourself.
 
+[![CI](https://github.com/shieldfive/cli/actions/workflows/ci.yml/badge.svg)](https://github.com/shieldfive/cli/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-27%2F27-brightgreen.svg)](test/)
 [![Status](https://img.shields.io/badge/status-early-yellow.svg)](#honest-scope)
 
 The point of this tool being open source is that you do not have to trust a
