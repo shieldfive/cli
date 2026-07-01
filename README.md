@@ -94,11 +94,22 @@ sf sync ./my-folder --watch
 
 The backend endpoints default to ShieldFive, so there is nothing else to
 configure. `SF_API_BASE_URL`, `SF_SUPABASE_URL`, and `SF_SUPABASE_ANON_KEY` are
-baked in with ShieldFive's public values — the Supabase anon key is a `role=anon`
-JWT gated by row-level security, the same value any browser receives — and only
-need overriding if you point the CLI at a development backend. If two-factor
-authentication is enabled on your account, the MFA step-up is not yet handled by
-the CLI.
+baked in with ShieldFive's public values (the Supabase anon key is a `role=anon`
+JWT gated by row-level security, the same value any browser receives) and only
+need overriding if you point the CLI at a development backend.
+
+### Two-factor authentication
+
+If your account has an authenticator app (TOTP) enabled, the CLI performs the
+AAL2 step-up automatically: after your password it prompts
+
+```
+Two-factor code (6 digits):
+```
+
+Enter the current code from your authenticator. In a non-interactive context
+(scripts, CI) set `SF_TOTP_CODE` to the current code instead of being prompted.
+Only TOTP is supported; SMS and other factors are not.
 
 ## How the upload works (for auditors)
 

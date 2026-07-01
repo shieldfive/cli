@@ -1,6 +1,6 @@
 {
   "name": "@shieldfive/cli",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "description": "Open-source command-line client for ShieldFive: encrypt a folder on your machine and sync it to your EU-hosted, post-quantum vault. Read the code; it encrypts before upload.",
   "license": "Apache-2.0",

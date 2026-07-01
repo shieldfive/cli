@@ -13,6 +13,7 @@
 import { webcrypto } from 'node:crypto'
 import { readFile, readdir, stat } from 'node:fs/promises'
 import { join } from 'node:path'
+import { createInterface } from 'node:readline'
 
 import { deriveVaultIdentity, encryptFileForVault } from './sfCrypto.mjs'
 
@@ -29,8 +30,9 @@ function usage() {
       '',
       'push / sync need only your ShieldFive account:',
       '  SF_EMAIL, SF_PASSWORD   [SF_VAULT_PASSWORD if your vault password differs]',
-      'SF_API_BASE_URL, SF_SUPABASE_URL, SF_SUPABASE_ANON_KEY default to ShieldFive',
-      '(override only for a development backend).',
+      'If two-factor (TOTP) is enabled, you are prompted for a 6-digit code',
+      '(or set SF_TOTP_CODE). SF_API_BASE_URL, SF_SUPABASE_URL, SF_SUPABASE_ANON_KEY',
+      'default to ShieldFive (override only for a development backend).',
       '',
     ].join('\n') + '\n',
   )
@@ -98,9 +100,36 @@ function readLiveConfig() {
   }
 }
 
-// Sign in (Supabase -> Bearer) then fetch + unlock the vault root key. Shared by
-// `push` and `sync`. Network deps are imported lazily so `sf encrypt` runs
-// without @supabase/supabase-js.
+// Prompt for a single line on the terminal. A TOTP code is short-lived, not a
+// long-term secret, so echoing it is fine (unlike the password).
+function promptLine(question) {
+  return new Promise((resolve, reject) => {
+    const rl = createInterface({ input: process.stdin, output: process.stderr })
+    rl.question(question, (answer) => {
+      rl.close()
+      resolve(answer)
+    })
+    rl.on('error', reject)
+  })
+}
+
+// Source a TOTP code for the 2FA step-up: SF_TOTP_CODE if set (handy for
+// scripting), otherwise prompt interactively. Only invoked when the account
+// actually requires a step-up.
+async function readTotpCode() {
+  if (process.env.SF_TOTP_CODE) return process.env.SF_TOTP_CODE
+  if (!process.stdin.isTTY) {
+    throw new Error(
+      'Two-factor code required but no terminal is attached. Set SF_TOTP_CODE ' +
+        'to your current 6-digit authenticator code.',
+    )
+  }
+  return promptLine('Two-factor code (6 digits): ')
+}
+
+// Sign in (Supabase -> Bearer, with 2FA step-up if enabled) then fetch + unlock
+// the vault root key. Shared by `push` and `sync`. Network deps are imported
+// lazily so `sf encrypt` runs without @supabase/supabase-js.
 async function authAndUnlock(cfg) {
   const { signIn } = await import('./auth.mjs')
   const { fetchAndUnlockVault } = await import('./vault.mjs')
@@ -111,6 +140,7 @@ async function authAndUnlock(cfg) {
     anonKey: cfg.anonKey,
     email: cfg.email,
     password: cfg.password,
+    getTotpCode: readTotpCode,
   })
 
   process.stderr.write('unlocking vault…\n')
