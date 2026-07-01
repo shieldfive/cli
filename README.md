@@ -47,7 +47,7 @@ Not yet published to npm. For now, clone and run:
 ```sh
 git clone https://github.com/shieldfive/cli.git
 cd cli
-npm install     # @shieldfive/crypto, @supabase/supabase-js, @noble/*
+npm install     # @shieldfive/crypto (+ libsodium), @supabase/supabase-js, @noble/*
 npm test        # 27/27
 ```
 
