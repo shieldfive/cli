@@ -196,6 +196,87 @@ test('multipart push: parts, nonce sequencing, first-chunk proof, ciphertextHash
   )
 })
 
+test('multipart push: a 5xx on a part is retried with a fresh URL and succeeds', async () => {
+  const chunkSize = 8
+  const content = webcrypto.getRandomValues(new Uint8Array(12)) // 2 parts: 8, 4
+  const rootKey = webcrypto.getRandomValues(new Uint8Array(32))
+
+  const parts = []
+  let refreshCount = 0
+  let part1Attempts = 0
+  let finalizeBody = null
+
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.toString()
+
+    if (url === `${API}/api/files/create-upload-session`) {
+      return jsonResponse(200, {
+        uploadKind: 'large',
+        fileId: 'file-abc',
+        uploadUrl: 'https://b2.test/part',
+        authToken: 'tok-initial',
+        chunkSize,
+        b2FileId: 'b2-large-1',
+        proofKey: PROOF_KEY,
+      })
+    }
+    if (url === `${API}/api/files/upload-part-url`) {
+      refreshCount += 1
+      return jsonResponse(200, {
+        uploadUrl: 'https://b2.test/part-refreshed',
+        authToken: 'tok-refreshed',
+      })
+    }
+    if (url.startsWith('https://b2.test/part')) {
+      const partNumber = Number(init.headers['X-Bz-Part-Number'])
+      // First attempt at part 1 fails with a transient 503; the retry succeeds.
+      if (partNumber === 1) {
+        part1Attempts += 1
+        if (part1Attempts === 1) {
+          return jsonResponse(503, { code: 'service_unavailable' })
+        }
+      }
+      parts.push({
+        partNumber,
+        sha1: init.headers['X-Bz-Content-Sha1'],
+        body: new Uint8Array(init.body),
+      })
+      return jsonResponse(200, { fileId: `b2-part-${partNumber}` })
+    }
+    if (url === `${API}/api/files/complete-upload`) {
+      finalizeBody = JSON.parse(init.body)
+      return jsonResponse(200, { ok: true, fileId: finalizeBody.fileId })
+    }
+    throw new Error(`unexpected fetch: ${url}`)
+  }
+
+  try {
+    await withTempFile(content, (path) =>
+      uploadFile({
+        apiBaseUrl: API,
+        accessToken: 'bearer-xyz',
+        rootKey,
+        name: 'Secret.pdf',
+        path,
+        size: content.length,
+      }),
+    )
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+
+  // Part 1 was attempted twice (503 then 200); a fresh part URL was fetched for
+  // the retry; both parts ultimately landed in order and the upload finalized.
+  assert.equal(part1Attempts, 2)
+  assert.equal(refreshCount, 1)
+  assert.deepEqual(
+    parts.map((p) => p.partNumber),
+    [1, 2],
+  )
+  assert.equal(finalizeBody.fileId, 'file-abc')
+})
+
 test('direct push: single chunk, storage id from PUT, single-part ciphertextHash', async () => {
   const content = webcrypto.getRandomValues(new Uint8Array(64)) // <= chunkSize -> direct
   const rootKey = webcrypto.getRandomValues(new Uint8Array(32))

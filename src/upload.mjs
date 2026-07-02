@@ -27,6 +27,17 @@ const COMPLETE_PATH = '/api/files/complete-upload'
 const PART_URL_PATH = '/api/files/upload-part-url'
 const CHUNK_SIZE = 5 * 1024 * 1024
 
+// Backblaze documents retrying b2_upload_part on 5xx / network failures, and a
+// part upload is idempotent by (part number, SHA-1) — retrying overwrites the
+// same part. Bound the retries and back off so one transient blip does not
+// abort a whole multi-gigabyte upload.
+const MAX_PART_ATTEMPTS = 3
+const PART_RETRY_BASE_DELAY_MS = 250
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+const partRetryDelayMs = (attempt) =>
+  PART_RETRY_BASE_DELAY_MS * 2 ** (attempt - 1) // 250ms, 500ms, ...
+
 // Read a file in fixed-size chunks without holding it all in memory. Each yield
 // is an independent copy (the read buffer is reused), so the caller may retain
 // or transform a chunk across the next read safely.
@@ -147,8 +158,11 @@ async function refreshUploadPartUrl({ apiBaseUrl, accessToken, fileId }) {
 }
 
 // One b2_upload_part POST. On an expired token (401/403) refresh the part URL
-// once and retry, mirroring uploadMultipartCiphertextPart in the apps. Returns
-// the (possibly refreshed) url/token so the caller reuses them for the next part.
+// and retry immediately, mirroring uploadMultipartCiphertextPart in the apps.
+// On a transient failure (5xx / 408 / 429 / network error) refresh the part URL
+// and retry with exponential backoff, up to MAX_PART_ATTEMPTS, so a single blip
+// does not abort the whole upload. Returns the (possibly refreshed) url/token so
+// the caller reuses them for the next part.
 async function putPartToBackblaze({
   apiBaseUrl,
   accessToken,
@@ -173,22 +187,57 @@ async function putPartToBackblaze({
 
   let url = uploadUrl
   let token = authToken
-  let res = await attempt(url, token)
+  let lastError
 
-  if (res.status === 401 || res.status === 403) {
-    const refreshed = await refreshUploadPartUrl({ apiBaseUrl, accessToken, fileId })
-    url = refreshed.uploadUrl
-    token = refreshed.authToken
-    res = await attempt(url, token)
-  }
+  for (let tries = 1; tries <= MAX_PART_ATTEMPTS; tries += 1) {
+    let res
+    try {
+      res = await attempt(url, token)
+    } catch (err) {
+      // Network/transport failure (reset, timeout, DNS). Retry with a fresh
+      // part URL after a backoff.
+      lastError = err
+      if (tries === MAX_PART_ATTEMPTS) break
+      await sleep(partRetryDelayMs(tries))
+      ;({ uploadUrl: url, authToken: token } = await refreshUploadPartUrl({
+        apiBaseUrl,
+        accessToken,
+        fileId,
+      }))
+      continue
+    }
 
-  if (!res.ok) {
-    throw new Error(
+    if (res.status === 401 || res.status === 403) {
+      // Expected token rotation, not a transient failure: refresh and retry
+      // immediately without consuming a backoff slot.
+      const refreshed = await refreshUploadPartUrl({ apiBaseUrl, accessToken, fileId })
+      url = refreshed.uploadUrl
+      token = refreshed.authToken
+      res = await attempt(url, token)
+    }
+
+    if (res.ok) return { uploadUrl: url, authToken: token }
+
+    lastError = new Error(
       `Backblaze part ${partNumber} upload failed (HTTP ${res.status}): ` +
         `${await res.text().catch(() => '')}`,
     )
+
+    // 5xx / 408 / 429 are worth retrying; other 4xx (after the auth refresh
+    // above) are terminal.
+    const retryable =
+      res.status >= 500 || res.status === 429 || res.status === 408
+    if (!retryable || tries === MAX_PART_ATTEMPTS) throw lastError
+
+    await sleep(partRetryDelayMs(tries))
+    ;({ uploadUrl: url, authToken: token } = await refreshUploadPartUrl({
+      apiBaseUrl,
+      accessToken,
+      fileId,
+    }))
   }
-  return { uploadUrl: url, authToken: token }
+
+  throw lastError ?? new Error(`Backblaze part ${partNumber} upload failed`)
 }
 
 async function finalizeUpload({

@@ -57,11 +57,11 @@ test('generateNoncePrefixB64 decodes to 4 bytes', () => {
   assert.equal(base64ToBytes(generateNoncePrefixB64()).length, 4)
 })
 
-test('encryptFileChunk round-trips (suite 0x01 AES-GCM, nonce = prefix||counter)', () => {
+test('encryptFileChunk round-trips (suite 0x01 AES-GCM, nonce = prefix||counter)', async () => {
   const cskB64 = generateRandomKeyB64()
   const noncePrefixB64 = generateNoncePrefixB64()
   const plaintext = new TextEncoder().encode('the file contents, kept private')
-  const ciphertext = encryptFileChunk({
+  const ciphertext = await encryptFileChunk({
     cskB64,
     noncePrefixB64,
     chunkIndex: 0,
@@ -69,8 +69,55 @@ test('encryptFileChunk round-trips (suite 0x01 AES-GCM, nonce = prefix||counter)
   })
   const nonce = new Uint8Array(12)
   nonce.set(base64ToBytes(noncePrefixB64), 0) // chunkIndex 0 -> counter is all zero
+  // Decrypt with @noble: proves the WebCrypto ciphertext||tag is the exact
+  // format @noble (and the server / apps) expect.
   const recovered = gcm(base64ToBytes(cskB64), nonce).decrypt(ciphertext)
   assert.deepEqual(recovered, plaintext)
+})
+
+test('encryptFileChunk (WebCrypto) is byte-identical to @noble AES-GCM', async () => {
+  const cskB64 = generateRandomKeyB64()
+  const noncePrefixB64 = generateNoncePrefixB64()
+  const plaintext = new TextEncoder().encode(
+    'a longer chunk that spans a counter increment to be safe',
+  )
+  const chunkIndex = 7
+
+  const viaWebCrypto = await encryptFileChunk({
+    cskB64,
+    noncePrefixB64,
+    chunkIndex,
+    plaintext,
+  })
+
+  // Rebuild the nonce exactly as encryptFileChunk does, then encrypt with
+  // @noble and assert the bytes match — the byte-for-byte compatibility proof.
+  const nonce = new Uint8Array(12)
+  nonce.set(base64ToBytes(noncePrefixB64), 0)
+  let counter = BigInt(chunkIndex)
+  for (let i = 0; i < 8; i += 1) {
+    nonce[11 - i] = Number(counter & 0xffn)
+    counter >>= 8n
+  }
+  const viaNoble = gcm(base64ToBytes(cskB64), nonce).encrypt(plaintext)
+
+  assert.deepEqual(viaWebCrypto, viaNoble)
+})
+
+test('encryptFileChunk handles an empty chunk (ciphertext = tag only)', async () => {
+  const cskB64 = generateRandomKeyB64()
+  const noncePrefixB64 = generateNoncePrefixB64()
+  const empty = new Uint8Array(0)
+  const ciphertext = await encryptFileChunk({
+    cskB64,
+    noncePrefixB64,
+    chunkIndex: 0,
+    plaintext: empty,
+  })
+  assert.equal(ciphertext.length, 16) // GCM tag only, no plaintext
+  const nonce = new Uint8Array(12)
+  nonce.set(base64ToBytes(noncePrefixB64), 0)
+  assert.deepEqual(gcm(base64ToBytes(cskB64), nonce).decrypt(ciphertext), empty)
 })
 
 test('computeAesGcmUploadProof is deterministic 64-hex', () => {
