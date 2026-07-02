@@ -24,6 +24,30 @@ export function aesGcmEncrypt(key, iv, plaintext) {
   return gcm(key, iv).encrypt(plaintext)
 }
 
+// WebCrypto AES-GCM. Its output is ciphertext||tag with a 16-byte (128-bit)
+// tag — byte-identical to @noble's gcm().encrypt for the same key, 12-byte
+// nonce and no additional data — so ciphertexts, the SHA-1 digests Backblaze
+// checks, and the HMAC upload proof are all unchanged. Native WebCrypto runs
+// at ~5 GiB/s versus @noble's ~70 MiB/s, so it is used for the per-chunk file
+// encryption (the throughput-bound path). @noble stays for the once-per-file
+// key wrap and filename metadata, and for all decryption. It is async because
+// subtle.encrypt is; the chunk path (encryptChunkWithDigest) is already async.
+async function aesGcmEncryptSubtle(key, iv, plaintext) {
+  const cryptoKey = await webcrypto.subtle.importKey(
+    'raw',
+    key,
+    { name: 'AES-GCM' },
+    false,
+    ['encrypt'],
+  )
+  const ciphertext = await webcrypto.subtle.encrypt(
+    { name: 'AES-GCM', iv },
+    cryptoKey,
+    plaintext,
+  )
+  return new Uint8Array(ciphertext)
+}
+
 export function generateRandomKeyB64(bytes = 32) {
   return bytesToBase64(randomBytes(bytes))
 }
@@ -104,7 +128,7 @@ function hexToBytes(hex) {
 }
 
 // nonce = 4-byte random prefix || 8-byte big-endian chunk counter.
-export function encryptFileChunk({ cskB64, noncePrefixB64, chunkIndex, plaintext }) {
+export async function encryptFileChunk({ cskB64, noncePrefixB64, chunkIndex, plaintext }) {
   const noncePrefix = base64ToBytes(noncePrefixB64)
   if (noncePrefix.length !== 4) throw new Error('Invalid nonce prefix')
   const nonce = new Uint8Array(12)
@@ -114,7 +138,7 @@ export function encryptFileChunk({ cskB64, noncePrefixB64, chunkIndex, plaintext
     nonce[11 - i] = Number(counter & 0xffn)
     counter >>= 8n
   }
-  return aesGcmEncrypt(base64ToBytes(cskB64), nonce, plaintext)
+  return aesGcmEncryptSubtle(base64ToBytes(cskB64), nonce, plaintext)
 }
 
 function buildUploadProofPrefix({ cipherVersion, chunkSize, noncePrefixBytes }) {
@@ -166,7 +190,7 @@ export async function encryptChunkWithDigest({
   proofKeyHex,
   chunkSize,
 }) {
-  const ciphertext = encryptFileChunk({
+  const ciphertext = await encryptFileChunk({
     cskB64,
     noncePrefixB64,
     chunkIndex,
