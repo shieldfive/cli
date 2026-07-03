@@ -7,6 +7,7 @@ import { webcrypto } from 'node:crypto'
 import { test } from 'node:test'
 
 import { gcm } from '@noble/ciphers/aes.js'
+import { argon2id } from '@noble/hashes/argon2.js'
 
 import {
   base64ToBytes,
@@ -37,12 +38,41 @@ test('wrapKeyB64 / unwrapKeyB64 round-trip (csk wrap)', () => {
   assert.equal(recovered, keyToWrapB64)
 })
 
-test('encryptMetadataV4 / decryptMetadataV4 round-trip (filename)', () => {
+test('encryptMetadataV4 (libsodium KDF) / decryptMetadataV4 (@noble KDF) round-trip', async () => {
   const rootKeyB64 = randKeyB64()
-  const envelope = encryptMetadataV4('Quarterly-Report-Q3.pdf', rootKeyB64)
+  // encrypt derives the key with libsodium; decrypt derives it with @noble.
+  // A successful round-trip proves the two Argon2id backends agree byte-for-byte.
+  const envelope = await encryptMetadataV4('Quarterly-Report-Q3.pdf', rootKeyB64)
   assert.equal(envelope.v, 4)
   assert.equal(envelope.kdf, 'interactive')
   assert.equal(decryptMetadataV4(envelope, rootKeyB64), 'Quarterly-Report-Q3.pdf')
+})
+
+test('decryptMetadataV4 still reads a legacy envelope produced by the @noble encrypt path', () => {
+  // Reproduce the pre-change encrypt exactly (pure @noble Argon2id) so this test
+  // fails if the v4 envelope format or KDF params ever drift and break stored
+  // production filenames.
+  const rootKeyB64 = randKeyB64()
+  const name = 'Legacy File (2025).pdf'
+  const salt = webcrypto.getRandomValues(new Uint8Array(16))
+  const iv = webcrypto.getRandomValues(new Uint8Array(12))
+  const metadataKey = argon2id(rootKeyB64, salt, {
+    t: 2,
+    m: 64 * 1024,
+    p: 1,
+    version: 0x13,
+    dkLen: 32,
+  })
+  const ctWithTag = gcm(metadataKey, iv).encrypt(new TextEncoder().encode(name))
+  const legacyEnvelope = {
+    v: 4,
+    ct: bytesToBase64(ctWithTag.slice(0, ctWithTag.length - 16)),
+    iv: bytesToBase64(iv),
+    tag: bytesToBase64(ctWithTag.slice(ctWithTag.length - 16)),
+    salt: bytesToBase64(salt),
+    kdf: 'interactive',
+  }
+  assert.equal(decryptMetadataV4(legacyEnvelope, rootKeyB64), name)
 })
 
 test('hashMetadataV4 is deterministic and v4-prefixed', () => {

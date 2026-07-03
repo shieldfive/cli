@@ -10,6 +10,25 @@ import { gcm } from '@noble/ciphers/aes.js'
 import { argon2id } from '@noble/hashes/argon2.js'
 import { hmac } from '@noble/hashes/hmac.js'
 import { sha256 } from '@noble/hashes/sha2.js'
+import sodium from 'libsodium-wrappers-sumo'
+
+// libsodium's Argon2id (crypto_pwhash) is byte-identical to @noble's at the same
+// params but ~15x faster (native/WASM vs pure JS). It is used for the ENCRYPT
+// side of the v4 filename metadata — the once-per-file KDF that makes `sf sync`
+// over many files KDF-bound. decryptMetadataV4 stays on @noble (off the hot
+// path, and a second independent implementation guards reads against a
+// libsodium regression). libsodium is already a dependency and initialised in
+// the unlock path; this memoised gate awaits sodium.ready once.
+let sodiumReadyPromise
+const getSodium = async () => {
+  if (!sodiumReadyPromise) {
+    sodiumReadyPromise = (async () => {
+      await sodium.ready
+      return sodium
+    })()
+  }
+  return sodiumReadyPromise
+}
 
 const AES_GCM_TAG_BYTES = 16
 
@@ -87,10 +106,24 @@ const ARGON2_PARAMS = {
 
 // v4 filename metadata (Argon2id "interactive" + AES-GCM) — the format the web
 // reads. rootKeySecret is the base64 string of the vault root key.
-export function encryptMetadataV4(plaintext, rootKeySecret) {
+//
+// Derives the metadata key with libsodium crypto_pwhash (ARGON2ID13, opslimit=2,
+// memlimit=64 MiB) — byte-identical to ARGON2_PARAMS.interactive but far faster.
+// The envelope (v/ct/iv/tag/salt/kdf) is unchanged, so it decrypts on the web
+// and mobile clients exactly as before. Async because of the libsodium ready
+// gate; the sole caller (createUploadSession) is already async.
+export async function encryptMetadataV4(plaintext, rootKeySecret) {
+  const s = await getSodium()
   const salt = randomBytes(16)
   const iv = randomBytes(12)
-  const metadataKey = argon2id(rootKeySecret, salt, ARGON2_PARAMS.interactive)
+  const metadataKey = s.crypto_pwhash(
+    32,
+    rootKeySecret,
+    salt,
+    2,
+    64 * 1024 * 1024,
+    s.crypto_pwhash_ALG_ARGON2ID13,
+  )
   const ciphertextWithTag = aesGcmEncrypt(metadataKey, iv, utf8(plaintext))
   const tagStart = ciphertextWithTag.length - AES_GCM_TAG_BYTES
   return {
