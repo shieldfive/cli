@@ -67,7 +67,7 @@ export async function createUploadSession({
   size,
 }) {
   const rootKeyB64 = bytesToBase64(rootKey)
-  const nameEnvelope = encryptMetadataV4(name, rootKeyB64)
+  const nameEnvelope = await encryptMetadataV4(name, rootKeyB64)
   const csk = generateRandomKeyB64()
   const cskEnvelope = wrapKeyB64({ wrappingKeyB64: rootKeyB64, keyToWrapB64: csk })
   const noncePrefix = generateNoncePrefixB64()
