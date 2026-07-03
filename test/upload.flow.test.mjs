@@ -62,6 +62,11 @@ async function withTempFile(content, fn) {
 }
 
 test('multipart push: parts, nonce sequencing, first-chunk proof, ciphertextHash, refresh', async () => {
+  // Serial: this test asserts exact arrival order + a single URL refresh, which
+  // only hold when one part is in flight at a time. Concurrency is covered by
+  // the out-of-order test below.
+  const prevConcurrency = process.env.SF_UPLOAD_CONCURRENCY
+  process.env.SF_UPLOAD_CONCURRENCY = '1'
   const chunkSize = 8
   const content = webcrypto.getRandomValues(new Uint8Array(20)) // 3 parts: 8,8,4
   const rootKey = webcrypto.getRandomValues(new Uint8Array(32))
@@ -135,6 +140,8 @@ test('multipart push: parts, nonce sequencing, first-chunk proof, ciphertextHash
     )
   } finally {
     globalThis.fetch = originalFetch
+    if (prevConcurrency === undefined) delete process.env.SF_UPLOAD_CONCURRENCY
+    else process.env.SF_UPLOAD_CONCURRENCY = prevConcurrency
   }
 
   // Session was requested with the true byte size.
@@ -196,7 +203,162 @@ test('multipart push: parts, nonce sequencing, first-chunk proof, ciphertextHash
   )
 })
 
+test('multipart push: parts completing OUT OF ORDER still finalize in chunk order', async () => {
+  // The reordering guarantee. With concurrency, parts finish in an order the
+  // network decides, not chunk order. The server's b2_finish_large_file needs
+  // partSha1Array in strict part order (part 1..N), and the multipart
+  // ciphertextHash is SHA-1 over the concatenated part digests in that same
+  // order — so a single scrambled slot silently corrupts the stored file.
+  // We run 5 parts fully concurrent and force completion order 5,4,3,2,1, then
+  // assert the finalized manifest is back in chunk order and the file reassembles.
+  const prevConcurrency = process.env.SF_UPLOAD_CONCURRENCY
+  process.env.SF_UPLOAD_CONCURRENCY = '5'
+  const chunkSize = 8
+  const partCount = 5
+  const content = webcrypto.getRandomValues(new Uint8Array(36)) // 8,8,8,8,4 -> 5 parts
+  const rootKey = webcrypto.getRandomValues(new Uint8Array(32))
+
+  let createBody = null
+  let finalizeBody = null
+  let refreshCount = 0
+  const parts = [] // captured in COMPLETION order (when each PUT resolves)
+  const pending = new Map() // partNumber -> () => resolve its PUT
+
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.toString()
+
+    if (url === `${API}/api/files/create-upload-session`) {
+      createBody = JSON.parse(init.body)
+      return jsonResponse(200, {
+        uploadKind: 'large',
+        fileId: 'file-abc',
+        uploadUrl: 'https://b2.test/part-seed',
+        authToken: 'tok-seed',
+        chunkSize,
+        b2FileId: 'b2-large-1',
+        proofKey: PROOF_KEY,
+      })
+    }
+
+    if (url === `${API}/api/files/upload-part-url`) {
+      refreshCount += 1
+      return jsonResponse(200, {
+        uploadUrl: `https://b2.test/part-refreshed-${refreshCount}`,
+        authToken: `tok-refreshed-${refreshCount}`,
+      })
+    }
+
+    if (url.startsWith('https://b2.test/part')) {
+      const partNumber = Number(init.headers['X-Bz-Part-Number'])
+      const captured = {
+        partNumber,
+        sha1: init.headers['X-Bz-Content-Sha1'],
+        body: new Uint8Array(init.body),
+      }
+      // Hold every part open until all N have been PUT, then release them in
+      // strict reverse order so completion order is deterministically [5..1].
+      return await new Promise((resolve) => {
+        pending.set(partNumber, () => {
+          parts.push(captured) // completion order
+          resolve(jsonResponse(200, { fileId: `b2-part-${partNumber}` }))
+        })
+        if (pending.size === partCount) {
+          for (const pn of [...pending.keys()].sort((a, b) => b - a)) {
+            pending.get(pn)()
+          }
+        }
+      })
+    }
+
+    if (url === `${API}/api/files/complete-upload`) {
+      finalizeBody = JSON.parse(init.body)
+      return jsonResponse(200, { ok: true, fileId: finalizeBody.fileId })
+    }
+
+    throw new Error(`unexpected fetch: ${url}`)
+  }
+
+  try {
+    await withTempFile(content, (path) =>
+      uploadFile({
+        apiBaseUrl: API,
+        accessToken: 'bearer-xyz',
+        rootKey,
+        name: 'Big Secret.pdf',
+        path,
+        size: content.length,
+      }),
+    )
+  } finally {
+    globalThis.fetch = originalFetch
+    if (prevConcurrency === undefined) delete process.env.SF_UPLOAD_CONCURRENCY
+    else process.env.SF_UPLOAD_CONCURRENCY = prevConcurrency
+  }
+
+  // All five parts landed, and they completed in reverse order — proving the
+  // reordering path is actually exercised (not accidentally sequential).
+  assert.deepEqual(
+    parts.map((p) => p.partNumber),
+    [5, 4, 3, 2, 1],
+    'completion order was forced reverse',
+  )
+  // One upload URL per concurrent connection: the seed plus four refreshes.
+  assert.equal(refreshCount, partCount - 1)
+
+  // The finalized manifest is in CHUNK order (part 1..N), NOT completion order.
+  const sha1ByPart = new Map(parts.map((p) => [p.partNumber, p.sha1]))
+  const chunkOrderSha1 = Array.from({ length: partCount }, (_v, i) => sha1ByPart.get(i + 1))
+  assert.equal(finalizeBody.partSha1Array.length, partCount, 'no missing/duplicate slot')
+  assert.deepEqual(finalizeBody.partSha1Array, chunkOrderSha1, 'manifest in chunk order')
+  assert.notDeepEqual(
+    finalizeBody.partSha1Array,
+    parts.map((p) => p.sha1),
+    'manifest is not in completion order',
+  )
+  assert.equal(
+    finalizeBody.ciphertextHash,
+    await getCiphertextHashFromParts(chunkOrderSha1),
+    'ciphertextHash hashes the chunk-order digests',
+  )
+
+  // Reassemble in chunk order and decrypt: the plaintext must equal the file.
+  const cskB64 = unwrapKeyB64({
+    wrappingKeyB64: bytesToBase64(rootKey),
+    wrappedKeyB64: createBody.csk_wrapped,
+    ivB64: createBody.csk_iv,
+  })
+  const noncePrefixB64 = createBody.cipher_nonce_prefix
+  const bodyByPart = new Map(parts.map((p) => [p.partNumber, p.body]))
+  const joined = new Uint8Array(content.length)
+  let off = 0
+  for (let i = 0; i < partCount; i += 1) {
+    const body = bodyByPart.get(i + 1)
+    assert.equal(sha1ByPart.get(i + 1), sha1HexOf(body), `part ${i + 1} sha1`)
+    const plain = gcm(base64ToBytes(cskB64), nonceFor(noncePrefixB64, i)).decrypt(body)
+    joined.set(plain, off)
+    off += plain.length
+  }
+  assert.deepEqual(joined, content, 'reassembled plaintext == original file')
+
+  // Proof is still computed from chunk 0 (part 1), regardless of completion order.
+  assert.equal(
+    finalizeBody.proof,
+    computeAesGcmUploadProof({
+      proofKeyHex: PROOF_KEY,
+      cipherVersion: 1,
+      chunkSize,
+      noncePrefixB64,
+      ciphertextChunk: bodyByPart.get(1),
+    }),
+  )
+})
+
 test('multipart push: a 5xx on a part is retried with a fresh URL and succeeds', async () => {
+  // Serial: asserts an exact attempt count and a single URL refresh, which only
+  // hold with one part in flight (concurrency would prefetch extra part URLs).
+  const prevConcurrency = process.env.SF_UPLOAD_CONCURRENCY
+  process.env.SF_UPLOAD_CONCURRENCY = '1'
   const chunkSize = 8
   const content = webcrypto.getRandomValues(new Uint8Array(12)) // 2 parts: 8, 4
   const rootKey = webcrypto.getRandomValues(new Uint8Array(32))
@@ -264,6 +426,8 @@ test('multipart push: a 5xx on a part is retried with a fresh URL and succeeds',
     )
   } finally {
     globalThis.fetch = originalFetch
+    if (prevConcurrency === undefined) delete process.env.SF_UPLOAD_CONCURRENCY
+    else process.env.SF_UPLOAD_CONCURRENCY = prevConcurrency
   }
 
   // Part 1 was attempted twice (503 then 200); a fresh part URL was fetched for

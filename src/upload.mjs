@@ -307,48 +307,110 @@ async function uploadDirect({ apiBaseUrl, accessToken, session, csk, noncePrefix
 // bytes of the stored object, which is exactly part 1. b2FileId is the
 // large-file id from the session; the server calls b2_finish_large_file with
 // the ordered part hashes at finalize.
+// Bounded concurrency for multipart part uploads. The serial version left the
+// network idle during encrypt and the CPU idle during each PUT; uploading a few
+// parts at once fills the pipe. Backblaze needs one upload URL per concurrent
+// connection, so K concurrent parts draw K URLs from a small pool. Default 3;
+// override with SF_UPLOAD_CONCURRENCY (clamped 1..6). SF_UPLOAD_CONCURRENCY=1
+// reproduces the exact serial behaviour. Memory ceiling ≈ 2 * K * chunkSize
+// (K plaintext chunks + K ciphertexts resident at once).
+const DEFAULT_UPLOAD_CONCURRENCY = 3
+const MAX_UPLOAD_CONCURRENCY = 6
+function resolveUploadConcurrency() {
+  const raw = Number.parseInt(process.env.SF_UPLOAD_CONCURRENCY ?? '', 10)
+  if (Number.isInteger(raw) && raw >= 1) {
+    return Math.min(raw, MAX_UPLOAD_CONCURRENCY)
+  }
+  return DEFAULT_UPLOAD_CONCURRENCY
+}
+
 async function uploadMultipart({ apiBaseUrl, accessToken, session, csk, noncePrefix, path }) {
   if (!session.b2FileId) {
     throw new Error('Multipart upload session is missing storage id (b2FileId).')
   }
   const chunkSize = session.chunkSize ?? CHUNK_SIZE
+  const concurrency = resolveUploadConcurrency()
 
-  let uploadUrl = session.uploadUrl
-  let authToken = session.authToken
-  const partSha1Array = []
-  let proof
+  // Part SHA-1s keyed by chunkIndex, NOT push order, so parts finishing out of
+  // order under concurrency never scramble the manifest the server checks.
+  const partSha1ByIndex = []
+  let proof // computed from chunk 0 only (the server verifies the proof over part 1)
+  let firstError = null
+
+  // Pool of b2_upload_part URLs — one per concurrent connection. Seed with the
+  // session URL, fetch more on demand up to `concurrency`, and return each after
+  // a successful part so URLs are reused rather than re-fetched per part.
+  // putPartToBackblaze already self-heals expired tokens and retries 5xx.
+  const urlPool = [{ uploadUrl: session.uploadUrl, authToken: session.authToken }]
+  const acquireUrl = async () =>
+    urlPool.pop() ??
+    (await refreshUploadPartUrl({ apiBaseUrl, accessToken, fileId: session.fileId }))
+
+  const inFlight = new Set()
+  const dispatch = (chunkIndex, plaintext) => {
+    const run = (async () => {
+      try {
+        const encrypted = await encryptChunkWithDigest({
+          cskB64: csk,
+          noncePrefixB64: noncePrefix,
+          chunkIndex,
+          plaintext,
+          proofKeyHex: chunkIndex === 0 ? session.proofKey : undefined,
+          chunkSize: chunkIndex === 0 ? chunkSize : undefined,
+        })
+        if (chunkIndex === 0) proof = encrypted.proofHex
+
+        const slot = await acquireUrl()
+        const updated = await putPartToBackblaze({
+          apiBaseUrl,
+          accessToken,
+          fileId: session.fileId,
+          uploadUrl: slot.uploadUrl,
+          authToken: slot.authToken,
+          partNumber: chunkIndex + 1, // Backblaze parts are 1-based
+          ciphertext: encrypted.ciphertext,
+          sha1: encrypted.sha1Hex,
+        })
+        // Return the (possibly refreshed) URL for the next part to reuse. A URL
+        // whose part failed is intentionally NOT returned (it may be bad).
+        urlPool.push({ uploadUrl: updated.uploadUrl, authToken: updated.authToken })
+        partSha1ByIndex[chunkIndex] = encrypted.sha1Hex
+      } catch (err) {
+        if (!firstError) firstError = err
+      }
+    })()
+    inFlight.add(run)
+    run.finally(() => inFlight.delete(run))
+  }
+
   let chunkIndex = 0
-
   for await (const plaintext of readFileChunks(path, chunkSize)) {
-    const encrypted = await encryptChunkWithDigest({
-      cskB64: csk,
-      noncePrefixB64: noncePrefix,
-      chunkIndex,
-      plaintext,
-      // Only the first chunk carries the proof; the server verifies over part 1.
-      proofKeyHex: chunkIndex === 0 ? session.proofKey : undefined,
-      chunkSize: chunkIndex === 0 ? chunkSize : undefined,
-    })
-    if (chunkIndex === 0) proof = encrypted.proofHex
-
-    const updated = await putPartToBackblaze({
-      apiBaseUrl,
-      accessToken,
-      fileId: session.fileId,
-      uploadUrl,
-      authToken,
-      partNumber: chunkIndex + 1, // Backblaze parts are 1-based
-      ciphertext: encrypted.ciphertext,
-      sha1: encrypted.sha1Hex,
-    })
-    uploadUrl = updated.uploadUrl
-    authToken = updated.authToken
-    partSha1Array.push(encrypted.sha1Hex)
+    if (firstError) break
+    // Backpressure: hold at most `concurrency` parts in flight. inFlight is
+    // non-empty when this runs (size >= concurrency >= 1), so race never hangs.
+    while (inFlight.size >= concurrency) {
+      await Promise.race(inFlight)
+      if (firstError) break
+    }
+    if (firstError) break
+    dispatch(chunkIndex, plaintext)
     chunkIndex += 1
   }
 
-  if (!partSha1Array.length || !proof) {
+  // Let every in-flight part settle before finalizing or surfacing the error.
+  await Promise.allSettled(inFlight)
+  if (firstError) throw firstError
+
+  if (!chunkIndex || !proof) {
     throw new Error('Multipart upload produced no parts.')
+  }
+  // Dense, in chunk order; a gap means a part silently went missing.
+  const partSha1Array = Array.from(
+    { length: chunkIndex },
+    (_value, index) => partSha1ByIndex[index],
+  )
+  if (partSha1Array.some((sha1) => typeof sha1 !== 'string')) {
+    throw new Error('Multipart upload is missing a part.')
   }
 
   const ciphertextHash = await getCiphertextHashFromParts(partSha1Array)
