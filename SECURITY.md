@@ -63,9 +63,13 @@ not pursue civil claims or refer law enforcement against researchers who:
 
 ## Bug bounty
 
-ShieldFive operates a paid bug bounty program. For current scope, reward tiers,
-rules of engagement, and submission instructions, see
-https://shieldfive.com/security/bug-bounty.
+**There is no bug bounty.** ShieldFive ran one until 2026-07; it closed, and
+`/security/bug-bounty` now redirects to the security page. Reports are answered
+on the timelines above, and credited if you want credit. They are not paid.
+
+This section previously said the opposite and pointed at that redirected URL.
+It is corrected here rather than removed, so anyone who read the old text finds
+out what changed.
 
 ## Scope
 
@@ -79,6 +83,6 @@ Out of scope for *this* repository (report elsewhere or not at all):
   [`@shieldfive/crypto`](https://github.com/shieldfive/crypto).
 - Vulnerabilities in dependencies (`@noble/*`, `@supabase/supabase-js`) — report
   those upstream.
-- Server-side issues in the ShieldFive backend — report via the bug bounty
-  program above.
+- Server-side issues in the ShieldFive backend — same address,
+  `security@shieldfive.com`, different codebase.
 - Attacks that require an attacker to already control the user's device.
