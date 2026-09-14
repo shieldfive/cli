@@ -61,6 +61,18 @@ test('refreshAccessToken carries the HTTP status on failure so the agent can tel
   )
 })
 
+test('revokeSession scope=global ends every session; an unknown scope is refused; the signal is passed through', async () => {
+  const f = recordingFetch({ ok: true, status: 204, json: async () => ({}) })
+  const signal = AbortSignal.timeout(1000)
+  await revokeSession({ supabaseUrl: 'https://s.test', anonKey: 'anon', accessToken: 'at1', scope: 'global', fetchImpl: f.fn, signal })
+  assert.equal(f.calls[0].url, 'https://s.test/auth/v1/logout?scope=global')
+  assert.equal(f.calls[0].init.signal, signal)
+  await assert.rejects(
+    revokeSession({ supabaseUrl: 'https://s.test', anonKey: 'anon', accessToken: 'at1', scope: 'others', fetchImpl: f.fn }),
+    /Unknown sign-out scope/,
+  )
+})
+
 test('revokeSession signs out this session only, with the bearer token', async () => {
   const f = recordingFetch({ ok: true, status: 204, json: async () => ({}) })
   assert.deepEqual(await revokeSession({ supabaseUrl: 'https://s.test', anonKey: 'anon', accessToken: 'at1', fetchImpl: f.fn }), {

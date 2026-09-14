@@ -9,6 +9,7 @@ import { test } from 'node:test'
 
 import {
   UnsafeDirectoryError,
+  UnsupportedPlatformError,
   agentDir,
   assertPrivateDir,
   deviceId,
@@ -19,17 +20,23 @@ async function tmp() {
   return mkdtemp(join(tmpdir(), 'sf-cli-paths-'))
 }
 
-test('agentDir: XDG_RUNTIME_DIR on Linux, TMPDIR on macOS, ~/.shieldfive/run otherwise', () => {
+test('agentDir is ~/.shieldfive/run on every POSIX platform, whatever the environment says', () => {
+  // A cron job or an `env -i` shell has no TMPDIR or XDG_RUNTIME_DIR. If the
+  // location depended on either, unattended sync would look in the wrong place.
+  for (const platform of ['linux', 'darwin', 'freebsd']) {
+    assert.equal(agentDir({ platform, home: '/home/u' }), '/home/u/.shieldfive/run')
+  }
   assert.equal(
-    agentDir({ platform: 'linux', env: { XDG_RUNTIME_DIR: '/run/user/1000' }, home: '/home/u' }),
-    '/run/user/1000/shieldfive',
+    agentDir({ platform: 'darwin', home: '/Users/u', env: { TMPDIR: '/var/folders/x/T/', XDG_RUNTIME_DIR: '/run/user/1' } }),
+    '/Users/u/.shieldfive/run',
   )
-  assert.equal(
-    agentDir({ platform: 'darwin', env: { TMPDIR: '/var/folders/ab/T/' }, home: '/Users/u' }),
-    '/var/folders/ab/T/shieldfive-agent',
+})
+
+test('agentDir on Windows throws an error callers can recognise', () => {
+  assert.throws(
+    () => agentDir({ platform: 'win32', home: 'C:\\u' }),
+    (e) => e instanceof UnsupportedPlatformError && e.code === 'unsupported_platform',
   )
-  assert.equal(agentDir({ platform: 'linux', env: {}, home: '/home/u' }), '/home/u/.shieldfive/run')
-  assert.throws(() => agentDir({ platform: 'win32', env: {}, home: 'C:\\u' }), /Windows/)
 })
 
 test('ensurePrivateDir creates a 0700 directory', async () => {

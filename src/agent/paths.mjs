@@ -21,26 +21,31 @@ export class UnsafeDirectoryError extends Error {
   }
 }
 
-/** The directory holding the agent socket for this user and platform. */
-export function agentDir({
-  env = process.env,
-  platform = process.platform,
-  home = homedir(),
-} = {}) {
+export class UnsupportedPlatformError extends Error {
+  constructor(message) {
+    super(message)
+    this.name = 'UnsupportedPlatformError'
+    this.code = 'unsupported_platform'
+  }
+}
+
+/**
+ * The directory holding the agent socket: always ~/.shieldfive/run.
+ *
+ * An earlier version preferred $XDG_RUNTIME_DIR on Linux and $TMPDIR on macOS.
+ * Cron jobs and `env -i` shells set neither, so `sf sync` run from cron looked
+ * in a different directory from the one `sf login` used, reported that no agent
+ * was running, and fell back to asking for a password. Unattended sync is the
+ * reason the agent exists, so every process the user runs has to find it in the
+ * same place.
+ */
+export function agentDir({ platform = process.platform, home = homedir() } = {}) {
   if (platform === 'win32') {
-    throw new Error(
+    throw new UnsupportedPlatformError(
       'sf agent does not run on Windows yet: named pipes have a different ' +
         'permission model and it has not been designed. Use SF_EMAIL and ' +
         'SF_PASSWORD with sf push / sf sync instead.',
     )
-  }
-  // Linux: tmpfs owned by the user and removed when their session ends.
-  if (platform === 'linux' && env.XDG_RUNTIME_DIR) {
-    return join(env.XDG_RUNTIME_DIR, 'shieldfive')
-  }
-  // macOS gives every user a private $TMPDIR under /var/folders.
-  if (platform === 'darwin' && env.TMPDIR) {
-    return join(env.TMPDIR, 'shieldfive-agent')
   }
   return join(home, '.shieldfive', 'run')
 }
@@ -92,8 +97,9 @@ export async function assertPrivateDir(dir, { uid = process.getuid?.() } = {}) {
 /**
  * A random identifier for this installation, created on first use.
  *
- * Not a secret. It lets a ledger entry say which machine an upload came from,
- * so a ledger copied to another computer does not vouch for files there.
+ * Not a secret. Every ledger record carries it, and `verify` only counts
+ * records made on this device, so a ledger copied from another computer does
+ * not vouch for files here.
  */
 export async function deviceId(home = homedir()) {
   const dir = shieldfiveHome(home)

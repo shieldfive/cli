@@ -4,13 +4,15 @@
 //   sf encrypt <folder>          encrypt each file locally (verified core demo)
 //   sf login [--idle=<hours>]    sign in once; an agent holds the session in memory
 //   sf status                    is an agent running, and for which account
-//   sf logout                    revoke the session and stop the agent
+//   sf logout [--everywhere]     revoke the session and stop the agent
 //   sf push <folder>             encrypt and upload every file, once
 //   sf sync <folder> [--watch]   upload new and changed files
 //   sf verify <file>...          is each file safely stored in your vault
 //
-// push and sync use a running agent when there is one, and otherwise sign in
-// from SF_EMAIL / SF_PASSWORD exactly as before. See docs/agent-design.md.
+// push and sync use a running agent when there is one. When SF_EMAIL and
+// SF_PASSWORD are set they sign in from those instead, exactly as before, so a
+// script written for one account is never quietly redirected to an agent
+// signed in as another. See docs/agent-design.md.
 
 import { webcrypto } from 'node:crypto'
 import { readFile, readdir, stat } from 'node:fs/promises'
@@ -24,9 +26,10 @@ function usage() {
     [
       'sf <command>',
       '',
-      '  login [--idle=<hours>]      sign in once and start an agent (default: locks after 8 h idle)',
+      '  login [--idle=<hours>]      sign in once and start an agent (default: locks after 8 h without use)',
       '  status                      show whether an agent is running',
-      '  logout                      revoke the session and stop the agent',
+      '  logout [--everywhere]       revoke the session and stop the agent',
+      '                              --everywhere also signs out your browser and phone',
       '  push <folder>               encrypt and upload every file in <folder>',
       '  sync <folder> [--watch]     upload new and changed files',
       '                              [--interval=<seconds>]  poll interval for --watch (default 5)',
@@ -35,10 +38,10 @@ function usage() {
       '  --help',
       '',
       'After sf login, push / sync / verify go through the agent and need nothing',
-      'in the environment. Without an agent, push and sync read SF_EMAIL and',
-      'SF_PASSWORD [SF_VAULT_PASSWORD if your vault password differs].',
-      'SF_API_BASE_URL, SF_SUPABASE_URL, SF_SUPABASE_ANON_KEY default to ShieldFive',
-      '(override only for a development backend).',
+      'in the environment. Without an agent, or when SF_EMAIL and SF_PASSWORD are',
+      'set, push and sync sign in from those [SF_VAULT_PASSWORD if your vault',
+      'password differs]. SF_API_BASE_URL, SF_SUPABASE_URL, SF_SUPABASE_ANON_KEY',
+      'default to ShieldFive (override only for a development backend).',
       '',
     ].join('\n') + '\n',
   )
@@ -89,6 +92,10 @@ function backendConfig() {
     supabaseUrl: e.SF_SUPABASE_URL || DEFAULTS.supabaseUrl,
     anonKey: e.SF_SUPABASE_ANON_KEY || DEFAULTS.anonKey,
   }
+}
+
+function envCredentialsSet() {
+  return Boolean(process.env.SF_EMAIL && process.env.SF_PASSWORD)
 }
 
 function readLiveConfig() {
@@ -159,17 +166,37 @@ async function runningAgent() {
   return status?.unlocked ? status : null
 }
 
+/**
+ * Decide how push and sync authenticate. Environment credentials win when both
+ * are set: that is how these commands behaved before the agent existed, and it
+ * keeps a script that names an account from being redirected to whichever
+ * account the agent happens to hold.
+ */
+async function chooseAuth() {
+  const agent = await runningAgent()
+  if (envCredentialsSet()) {
+    if (agent) {
+      process.stderr.write(
+        `SF_EMAIL and SF_PASSWORD are set, so this signs in with them rather than ` +
+          `through the running agent (account ${agent.account}). Unset them to use the agent.\n`,
+      )
+    }
+    return { agent: null }
+  }
+  return { agent }
+}
+
 // Start the agent as a detached child and hand it the session over stdin.
 async function launchAgent({ session, rootKey, config, idleMs }) {
   const { spawn } = await import('node:child_process')
   const { fileURLToPath } = await import('node:url')
 
-  // Only what the agent needs to find its socket, its home directory and the
+  // Only what the agent needs to find its home directory and reach the
   // network. Not SF_PASSWORD, not SF_TOTP_CODE, and nothing else the shell
   // happened to export.
   const env = {}
   for (const name of [
-    'PATH', 'HOME', 'USER', 'LOGNAME', 'TMPDIR', 'XDG_RUNTIME_DIR', 'LANG',
+    'PATH', 'HOME', 'USER', 'LOGNAME', 'LANG',
     'SF_API_BASE_URL', 'SF_SUPABASE_URL', 'SF_SUPABASE_ANON_KEY',
     'HTTPS_PROXY', 'HTTP_PROXY', 'NO_PROXY', 'NODE_EXTRA_CA_CERTS',
   ]) {
@@ -227,18 +254,27 @@ async function launchAgent({ session, rootKey, config, idleMs }) {
   return ready
 }
 
+function readIdle(flags) {
+  if (flags.idle === true) {
+    throw new Error('--idle needs a value: sf login --idle=<hours>')
+  }
+  const hours = flags.idle === undefined ? 8 : Number(flags.idle)
+  if (!Number.isFinite(hours) || hours * 60 < 1 || hours > 168) {
+    throw new Error('--idle must be a number of hours from 1 minute (0.0167) to 168')
+  }
+  return { hours, ms: Math.round(hours * 3_600_000) }
+}
+
 async function cmdLogin(flags) {
+  const idle = readIdle(flags)
+
   const existing = await runningAgent()
   if (existing) {
     process.stdout.write(
-      `Already logged in (agent pid ${existing.pid}). Run sf logout first to use another account.\n`,
+      `Already logged in (account ${existing.account}, agent pid ${existing.pid}). ` +
+        'Run sf logout first to use another account.\n',
     )
     return
-  }
-
-  const idleHours = flags.idle === undefined ? 8 : Number(flags.idle)
-  if (!Number.isFinite(idleHours) || idleHours <= 0 || idleHours > 168) {
-    throw new Error('--idle must be a number of hours greater than 0 and at most 168')
   }
   if (!process.stdin.isTTY) {
     throw new Error(
@@ -266,17 +302,13 @@ async function cmdLogin(flags) {
     password: vaultPassword,
   })
 
-  const started = await launchAgent({
-    session,
-    rootKey,
-    config: cfg,
-    idleMs: Math.round(idleHours * 3600 * 1000),
-  })
+  const started = await launchAgent({ session, rootKey, config: cfg, idleMs: idle.ms })
   rootKey.fill(0)
 
   process.stdout.write(
     `Logged in as ${email}. The agent (pid ${started.pid}) holds the session in memory ` +
-      `only and locks after ${idleHours} h idle. Run sf logout to end it.\n`,
+      `only and locks after ${idle.hours} h without an upload, sync or verify. ` +
+      'Run sf logout to end it.\n',
   )
 }
 
@@ -286,25 +318,21 @@ async function cmdStatus() {
     process.stdout.write('Not logged in: no agent is running.\n')
     return
   }
-  const hours = Math.floor(status.idleLocksInSec / 3600)
-  const minutes = Math.round((status.idleLocksInSec % 3600) / 60)
+  const totalMinutes = Math.round(status.idleLocksInSec / 60)
+  const hours = Math.floor(totalMinutes / 60)
+  const minutes = totalMinutes % 60
   process.stdout.write(
-    `Logged in (account ${status.account}). Agent pid ${status.pid}; ` +
-      `locks after ${hours} h ${minutes} min without use.\n`,
+    `Logged in (account ${status.account}). Agent pid ${status.pid}; locks after ` +
+      `${hours} h ${minutes} min without an upload, sync or verify.\n`,
   )
 }
 
-async function cmdLogout() {
+async function cmdLogout(flags) {
   const { AgentUnavailableError, request } = await import('./agent/client.mjs')
+  const everywhere = flags.everywhere === true
+  let result
   try {
-    const result = await request('logout', {}, { timeoutMs: 15_000 })
-    process.stdout.write(
-      result.sessionRevoked
-        ? 'Logged out. The session was revoked on the server.\n'
-        : 'Logged out locally, but the server could not be reached to revoke the ' +
-            'session. It stays valid until it is signed out; run sf login and sf ' +
-            'logout again once you are online.\n',
-    )
+    result = await request('logout', { everywhere }, { timeoutMs: 15_000 })
   } catch (err) {
     if (err instanceof AgentUnavailableError) {
       process.stdout.write('Not logged in: no agent is running.\n')
@@ -312,20 +340,57 @@ async function cmdLogout() {
     }
     throw err
   }
+
+  if (result.sessionRevoked) {
+    process.stdout.write(
+      everywhere
+        ? 'Logged out. Every ShieldFive session on this account was signed out, including your browser and phone.\n'
+        : 'Logged out. The session was revoked on the server.\n',
+    )
+    return
+  }
+
+  // Both failures leave the key wiped here. They differ in what is known about
+  // the session, and in what the user can do about it.
+  process.exitCode = 1
+  if (result.revokeStatus === 0) {
+    process.stdout.write(
+      'Logged out on this machine, but the server could not be reached, so the ' +
+        'session is still valid there. Once you are online, run sf login and then ' +
+        'sf logout --everywhere to end it.\n',
+    )
+  } else {
+    process.stdout.write(
+      `Logged out on this machine, but the server did not accept the sign-out ` +
+        `(HTTP ${result.revokeStatus}). The session may already have ended. To be ` +
+        'certain, run sf login and then sf logout --everywhere, which ends every ' +
+        'session on this account, including your browser.\n',
+    )
+  }
 }
 
 // login -> unlock -> encrypt -> upload every file in the folder, once.
 async function cmdPush(folder) {
-  if (await runningAgent()) {
+  const { agent } = await chooseAuth()
+  if (agent) {
     const { request } = await import('./agent/client.mjs')
+    process.stderr.write(`pushing to account ${agent.account} through the agent\n`)
+    let differs = 0
     for await (const { name, path } of filesIn(resolve(folder))) {
       const result = await request('upload', { path }, { timeoutMs: 0 })
-      process.stdout.write(
-        result.recorded
-          ? `pushed ${name}\n`
-          : `pushed ${name} (it changed while uploading, so it is not recorded as a backup)\n`,
-      )
+      if (result.matchesFileNow) {
+        process.stdout.write(`pushed ${name}\n`)
+      } else {
+        differs++
+        process.stdout.write(
+          `pushed ${name}, but it changed while uploading: the vault holds the ` +
+            'version that was read, not the file as it is now\n',
+        )
+      }
     }
+    // Non-zero so a script does not treat a file whose current contents are not
+    // in the vault as pushed.
+    if (differs) process.exitCode = 2
     return
   }
 
@@ -346,7 +411,7 @@ async function cmdPush(folder) {
   }
 }
 
-async function syncViaAgent(folder, { watch, intervalMs }) {
+async function syncViaAgent(folder, { watch, intervalMs }, agent) {
   const { AgentUnavailableError, request } = await import('./agent/client.mjs')
   const controller = new AbortController()
   const onSigint = () => {
@@ -354,6 +419,7 @@ async function syncViaAgent(folder, { watch, intervalMs }) {
     controller.abort()
   }
   if (watch) process.on('SIGINT', onSigint)
+  process.stderr.write(`syncing to account ${agent.account} through the agent\n`)
 
   try {
     do {
@@ -361,24 +427,29 @@ async function syncViaAgent(folder, { watch, intervalMs }) {
       try {
         summary = await request('sync', { folder }, { timeoutMs: 0 })
       } catch (err) {
-        if (err instanceof AgentUnavailableError) {
-          throw new Error('The agent stopped (idle lock or logout). Run sf login to continue.')
+        if (err instanceof AgentUnavailableError || err.code === 'locked') {
+          throw new Error('The agent was locked or logged out. Run sf login to continue.')
         }
         throw err
       }
       for (const e of summary.errors) process.stdout.write(`failed ${e.path}: ${e.message}\n`)
       process.stderr.write(
         `pass: ${summary.uploaded} synced, ${summary.skipped} unchanged` +
+          (summary.changed ? `, ${summary.changed} changed while uploading (uploaded again on the next pass)` : '') +
           (summary.failed ? `, ${summary.failed} failed` : '') +
           '\n',
       )
       if (!watch || controller.signal.aborted) break
       await new Promise((r) => {
         const timer = setTimeout(r, intervalMs)
-        controller.signal.addEventListener('abort', () => {
-          clearTimeout(timer)
-          r()
-        }, { once: true })
+        controller.signal.addEventListener(
+          'abort',
+          () => {
+            clearTimeout(timer)
+            r()
+          },
+          { once: true },
+        )
       })
     } while (!controller.signal.aborted)
   } finally {
@@ -388,7 +459,8 @@ async function syncViaAgent(folder, { watch, intervalMs }) {
 
 // login -> unlock -> mirror new/changed files into the vault, once or on a loop.
 async function cmdSync(folder, { watch, intervalMs }) {
-  if (await runningAgent()) return syncViaAgent(resolve(folder), { watch, intervalMs })
+  const { agent } = await chooseAuth()
+  if (agent) return syncViaAgent(resolve(folder), { watch, intervalMs }, agent)
 
   const cfg = readLiveConfig()
   const { uploadFile } = await import('./upload.mjs')
@@ -464,7 +536,7 @@ async function main() {
   } else if (cmd === 'status') {
     await cmdStatus()
   } else if (cmd === 'logout') {
-    await cmdLogout()
+    await cmdLogout(flags)
   } else if (cmd === 'encrypt') {
     if (!folder) throw new Error('encrypt needs a <folder>')
     await cmdEncrypt(folder)
@@ -473,6 +545,9 @@ async function main() {
     await cmdPush(folder)
   } else if (cmd === 'sync') {
     if (!folder) throw new Error('sync needs a <folder>')
+    // `--interval 10` (space-separated) would otherwise parse as a bare flag and
+    // quietly become a one-second interval.
+    if (flags.interval === true) throw new Error('--interval needs a value: --interval=<seconds>')
     const intervalSec = flags.interval ? Number(flags.interval) : 5
     if (!Number.isFinite(intervalSec) || intervalSec <= 0) {
       throw new Error('--interval must be a positive number of seconds')

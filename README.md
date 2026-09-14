@@ -71,7 +71,7 @@ trust it):
 git clone https://github.com/shieldfive/cli.git
 cd cli
 npm install     # @shieldfive/crypto (+ libsodium), @supabase/supabase-js, @noble/*
-npm test        # 89 tests
+npm test        # 107 tests
 ```
 
 ## Commands
@@ -79,7 +79,7 @@ npm test        # 89 tests
 ```
 sf login [--idle=<hours>]                    sign in once; an agent holds the session in memory (locks after 8 h idle)
 sf status                                    is an agent running, and for which account
-sf logout                                    revoke the session on the server and stop the agent
+sf logout [--everywhere]                     revoke the session and stop the agent; --everywhere signs out every device
 sf push <folder>                             encrypt and upload every file once
 sf sync <folder> [--watch] [--interval=N]    upload new/changed files; --watch keeps a poll loop (N seconds, default 5)
 sf verify <file>...                          report whether each file is safely stored in your vault
@@ -112,6 +112,12 @@ sf logout
 password. It never reads them from the environment and there is no flag for
 them. It then starts an agent in the background and exits; every later command
 talks to that agent and needs nothing exported.
+
+If `SF_EMAIL` and `SF_PASSWORD` are also set, `sf push` and `sf sync` sign in
+with those instead and tell you an agent is running, so a script written for one
+account is never sent to another. `sf push` exits 2 if a file changed while it
+was being uploaded: the vault then holds the version that was read, not the file
+as it is now.
 
 ### Without an agent
 
@@ -153,10 +159,10 @@ agent locks or you log out.
 ## What the agent can and cannot do
 
 The agent keeps two things in memory: your signed-in session and your unlocked
-vault key. Neither is written to disk. It listens on a Unix socket inside a
-directory only your user can enter (`$XDG_RUNTIME_DIR/shieldfive` on Linux,
-`$TMPDIR/shieldfive-agent` on macOS), and refuses to start if that directory is
-owned by someone else or open to other users.
+vault key. Neither is written to disk. It listens on a Unix socket in
+`~/.shieldfive/run`, a directory only your user can enter, and refuses to start
+if that directory is a symlink, owned by someone else or open to other users.
+Only one agent runs at a time.
 
 It accepts six requests: `status`, `upload`, `sync`, `verify`, `lock` and
 `logout`. It cannot list what is in your vault, download a file, decrypt
@@ -165,9 +171,12 @@ process that reaches the socket can put files into your vault and ask whether
 files are backed up. It cannot read your vault through the agent.
 
 Uploads are recorded in `~/.shieldfive/ledger/<account>.jsonl`: the path, size,
-time, vault file id, and an HMAC of the file's contents under a key derived from
-your vault key. A plain hash would let anyone holding the ledger confirm whether
-you have a particular known document; the HMAC does not, without your vault key.
+time, vault file id, and an HMAC of the bytes that were actually encrypted, under
+a key derived from your vault key. A plain hash would let anyone holding the
+ledger confirm whether you have a particular known document; the HMAC does not,
+without your vault key. Each record also carries a tag under that key, so a line
+added to the ledger by anything other than the agent is ignored, and records
+made on another machine do not count on this one.
 
 `sf verify` reports a file as **backed up** only when the bytes on disk now
 match an upload in the ledger and the server confirms, at that moment, that the
@@ -184,11 +193,13 @@ or size. The other answers:
 `no upload record` does not mean the file is missing from your vault. Do not
 delete anything on the strength of that answer.
 
-The agent locks itself after 8 hours without a request (`sf login --idle=<hours>`
-to change it). Locking and `sf logout` both sign the session out on the server
-and overwrite the key in memory. Sessions on ShieldFive do not expire on their
-own, so a session that is forgotten rather than signed out would stay valid;
-if you are offline when you log out, `sf logout` says so.
+The agent locks itself after 8 hours without an upload, sync or verify
+(`sf login --idle=<hours>` to change it; `sf status` does not count). Locking and
+`sf logout` both overwrite the key in memory first and then sign the session out
+on the server. Sessions on ShieldFive do not expire on their own, so a session
+that is forgotten rather than signed out would stay valid. If the server cannot
+be reached when you log out, `sf logout` says the session is still valid and
+exits 1; run `sf login` and then `sf logout --everywhere` once you are online.
 
 Limits:
 

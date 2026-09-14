@@ -133,6 +133,7 @@ export async function refreshAccessToken({
   anonKey,
   refreshToken,
   fetchImpl = fetch,
+  signal,
 }) {
   if (!refreshToken) {
     throw new Error('No refresh token is held. Run sf login again.')
@@ -141,6 +142,7 @@ export async function refreshAccessToken({
     method: 'POST',
     headers: { apikey: anonKey, 'Content-Type': 'application/json' },
     body: JSON.stringify({ refresh_token: refreshToken }),
+    signal,
   })
   const body = await res.json().catch(() => ({}))
   if (!res.ok || !body.access_token || !body.refresh_token) {
@@ -157,15 +159,26 @@ export async function refreshAccessToken({
   }
 }
 
-// Sign this session out on the server. Sessions on the production project are
-// not time-boxed, so a refresh token that is merely forgotten stays valid until
-// someone revokes it; this is that revocation. `scope=local` ends only this
-// session, not the user's browser or phone.
-export async function revokeSession({ supabaseUrl, anonKey, accessToken, fetchImpl = fetch }) {
+// Sign a session out on the server. Sessions on the production project are not
+// time-boxed, so a refresh token that is merely forgotten stays valid until
+// someone revokes it; this is that revocation. `scope: 'local'` ends only this
+// session. `scope: 'global'` ends every session on the account, including the
+// user's browser and phone, and is the only way to end a session this client no
+// longer holds a token for.
+export async function revokeSession({
+  supabaseUrl,
+  anonKey,
+  accessToken,
+  scope = 'local',
+  fetchImpl = fetch,
+  signal,
+}) {
+  if (scope !== 'local' && scope !== 'global') throw new Error(`Unknown sign-out scope ${scope}`)
   if (!accessToken) return { revoked: false, status: 0 }
-  const res = await fetchImpl(new URL('/auth/v1/logout?scope=local', supabaseUrl), {
+  const res = await fetchImpl(new URL(`/auth/v1/logout?scope=${scope}`, supabaseUrl), {
     method: 'POST',
     headers: { apikey: anonKey, Authorization: `Bearer ${accessToken}` },
+    signal,
   })
   return { revoked: res.status === 204 || res.status === 200, status: res.status }
 }

@@ -5,7 +5,7 @@
 
 import assert from 'node:assert/strict'
 import { createHmac, webcrypto } from 'node:crypto'
-import { mkdtemp, readFile, stat, writeFile } from 'node:fs/promises'
+import { appendFile, mkdir, mkdtemp, readFile, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -21,11 +21,23 @@ import {
 } from '../src/agent/ledger.mjs'
 
 const ACCOUNT = '3f0b2c9e-1d4a-4b6f-9c2e-7a8d5e6f1a2b'
+const DEVICE = '11111111-1111-4111-8111-111111111111'
 const rootKey = () => webcrypto.getRandomValues(new Uint8Array(32))
 
 async function tmp() {
   return mkdtemp(join(tmpdir(), 'sf-cli-ledger-'))
 }
+
+const record = (over = {}) => ({
+  path: '/x',
+  size: 1,
+  mtimeMs: 1,
+  mac: 'a'.repeat(64),
+  fileId: 'f1',
+  uploadedAt: '2026-09-14T00:00:00.000Z',
+  device: DEVICE,
+  ...over,
+})
 
 test('deriveLedgerKey is deterministic per root key and differs across root keys', () => {
   const rk = rootKey()
@@ -55,23 +67,70 @@ test('ledgerPath refuses anything that is not a UUID account id', () => {
   }
 })
 
-test('appendEntry writes a 0600 file; readEntries skips malformed lines and counts them', async () => {
-  const dir = await tmp()
-  const file = ledgerPath(join(dir, 'ledger'), ACCOUNT)
-  const mac = 'a'.repeat(64)
-  await appendEntry(file, { path: '/x', size: 1, mtimeMs: 1, mac, fileId: 'f1', uploadedAt: 'now', device: 'd' })
-  await writeFile(file, (await readFile(file, 'utf8')) + 'not json\n{"v":1,"path":"/y"}\n', { flag: 'w' })
-  await appendEntry(file, { path: '/z', size: 1, mtimeMs: 1, mac, fileId: 'f2', uploadedAt: 'now', device: 'd' })
+test('reading and writing the ledger both require the key', async () => {
+  const file = join(await tmp(), 'l.jsonl')
+  await assert.rejects(() => appendEntry(file, record()), /needs the ledger key/)
+  await assert.rejects(() => readEntries(file), /needs the ledger key/)
+})
+
+test('tagged records round-trip; the file is 0600; malformed lines are counted and skipped', async () => {
+  const key = deriveLedgerKey(rootKey())
+  const file = ledgerPath(join(await tmp(), 'ledger'), ACCOUNT)
+  await appendEntry(file, record({ fileId: 'f1' }), { ledgerKey: key })
+  await appendFile(file, 'not json\n{"v":1,"path":"/y"}\n')
+  await appendEntry(file, record({ fileId: 'f2', path: '/z' }), { ledgerKey: key })
 
   assert.equal((await stat(file)).mode & 0o777, 0o600)
-  const { entries, malformed } = await readEntries(file)
+  const { entries, malformed, unauthenticated } = await readEntries(file, { ledgerKey: key })
   assert.deepEqual(entries.map((e) => e.fileId), ['f1', 'f2'])
   assert.equal(malformed, 2)
+  assert.equal(unauthenticated, 0)
+})
+
+test('a forged or edited record is dropped: its tag does not verify', async () => {
+  // The ledger is a file any of the user's processes can write. Without a tag,
+  // appending a line with a missing file's MAC and a real fileId would make that
+  // file report as backed up.
+  const key = deriveLedgerKey(rootKey())
+  const file = ledgerPath(join(await tmp(), 'ledger'), ACCOUNT)
+  await appendEntry(file, record({ fileId: 'honest' }), { ledgerKey: key })
+
+  await appendFile(file, JSON.stringify({ v: 1, ...record({ fileId: 'forged-no-real-tag' }), tag: 'f'.repeat(64) }) + '\n')
+
+  const otherKey = deriveLedgerKey(rootKey())
+  const underOtherKey = join(await tmp(), 'other.jsonl')
+  await appendEntry(underOtherKey, record({ fileId: 'wrong-key' }), { ledgerKey: otherKey })
+  await appendFile(file, await readFile(underOtherKey, 'utf8'))
+
+  const raw = (await readFile(file, 'utf8')).split('\n')
+  const edited = JSON.parse(raw[0])
+  edited.fileId = 'swapped'
+  await appendFile(file, JSON.stringify(edited) + '\n')
+
+  const { entries, unauthenticated } = await readEntries(file, { ledgerKey: key })
+  assert.deepEqual(entries.map((e) => e.fileId), ['honest'])
+  assert.equal(unauthenticated, 3)
+})
+
+test('a torn last line does not swallow the next record', async () => {
+  const key = deriveLedgerKey(rootKey())
+  const file = ledgerPath(join(await tmp(), 'ledger'), ACCOUNT)
+  await appendEntry(file, record({ fileId: 'before' }), { ledgerKey: key })
+  await appendFile(file, '{"v":1,"path":"/half-writ')
+  await appendEntry(file, record({ fileId: 'after' }), { ledgerKey: key })
+
+  const { entries, malformed } = await readEntries(file, { ledgerKey: key })
+  assert.deepEqual(entries.map((e) => e.fileId), ['before', 'after'])
+  assert.equal(malformed, 1)
 })
 
 test('readEntries on a ledger that does not exist yet is empty, not an error', async () => {
-  const dir = await tmp()
-  assert.deepEqual(await readEntries(join(dir, 'nope.jsonl')), { entries: [], malformed: 0 })
+  const key = deriveLedgerKey(rootKey())
+  assert.deepEqual(await readEntries(join(await tmp(), 'nope.jsonl'), { ledgerKey: key }), {
+    entries: [],
+    malformed: 0,
+    unauthenticated: 0,
+  })
 })
 
 async function fixture() {
@@ -100,8 +159,7 @@ test('classify: uploaded bytes that the server confirms are verified', async () 
   const { key, write } = await fixture()
   const p = await write('a.txt', 'alpha')
   const entries = [{ v: 1, path: p, mac: await macFile(p, key), fileId: 'f-a' }]
-  const v = verifier(['f-a'])
-  const [r] = await classify([p], { entries, ledgerKey: key, verifyFileIds: v.fn })
+  const [r] = await classify([p], { entries, ledgerKey: key, verifyFileIds: verifier(['f-a']).fn })
   assert.equal(r.state, 'verified')
   assert.equal(r.fileId, 'f-a')
 })
@@ -124,15 +182,13 @@ test('classify: a file edited after upload is changed_since_upload, not verified
 })
 
 test('classify: SAME NAME AND SIZE with different bytes is not treated as backed up', async () => {
-  // The inference this ledger exists to avoid. Both files are "invoice.pdf" and
-  // both are 8 bytes; only one was uploaded.
   const { dir, key } = await fixture()
   const uploaded = join(dir, 'invoice.pdf')
   await writeFile(uploaded, 'AAAAAAAA')
   const entries = [{ v: 1, path: uploaded, mac: await macFile(uploaded, key), fileId: 'f-1' }]
 
+  await mkdir(join(dir, 'other'))
   const other = join(dir, 'other', 'invoice.pdf')
-  await (await import('node:fs/promises')).mkdir(join(dir, 'other'))
   await writeFile(other, 'BBBBBBBB')
 
   const [r] = await classify([other], { entries, ledgerKey: key, verifyFileIds: verifier(['f-1']).fn })
@@ -147,6 +203,15 @@ test('classify: a copy of uploaded bytes at another path is verified, and says w
   const [r] = await classify([copy], { entries, ledgerKey: key, verifyFileIds: verifier(['f-o']).fn })
   assert.equal(r.state, 'verified')
   assert.equal(r.matchedPath, original)
+})
+
+test('classify: with a device given, records from other devices do not count', async () => {
+  const { key, write } = await fixture()
+  const p = await write('a.txt', 'alpha')
+  const mac = await macFile(p, key)
+  const entries = [{ v: 1, path: p, mac, fileId: 'f-a', device: 'somewhere-else' }]
+  const [r] = await classify([p], { entries, ledgerKey: key, verifyFileIds: verifier(['f-a']).fn, device: DEVICE })
+  assert.equal(r.state, 'not_in_ledger')
 })
 
 test('classify: unreadable inputs never reach the server', async () => {
@@ -174,4 +239,24 @@ test(`classify: server verification is batched at ${VERIFY_BATCH}`, async () => 
   const results = await classify(paths, { entries, ledgerKey: key, verifyFileIds: v.fn })
   assert.equal(results.every((r) => r.state === 'verified'), true)
   assert.deepEqual(v.calls.map((c) => c.length), [VERIFY_BATCH, 50])
+})
+
+test('classify: an id the server volunteers outside the batch that asked is not counted', async () => {
+  const { key, write } = await fixture()
+  const paths = []
+  const entries = []
+  for (let i = 0; i < VERIFY_BATCH + 50; i++) {
+    const p = await write(`g${i}.txt`, `content ${i}`)
+    paths.push(p)
+    entries.push({ v: 1, path: p, mac: await macFile(p, key), fileId: `id-${i}` })
+  }
+  // Batch one answers with an id from batch two; batch two answers with nothing.
+  let call = 0
+  const results = await classify(paths, {
+    entries,
+    ledgerKey: key,
+    verifyFileIds: async () => (call++ === 0 ? ['id-120'] : []),
+  })
+  const target = results.find((r) => r.path.endsWith('g120.txt'))
+  assert.equal(target.state, 'missing')
 })

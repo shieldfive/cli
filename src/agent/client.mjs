@@ -27,10 +27,20 @@ export class AgentRequestError extends Error {
  * `timeoutMs: 0` disables the timeout, which uploads and syncs need: a large
  * file can take longer than any fixed number.
  */
-export function request(op, args = {}, { path = socketPath(), timeoutMs = 10_000 } = {}) {
+export function request(op, args = {}, { path, timeoutMs = 10_000 } = {}) {
   return new Promise((resolve, reject) => {
+    // Resolved here rather than as a default parameter, so a platform the agent
+    // does not support rejects this promise instead of throwing out of it.
+    let socketFile
+    try {
+      socketFile = path ?? socketPath()
+    } catch (err) {
+      reject(err)
+      return
+    }
+
     let settled = false
-    const socket = connect({ path })
+    const socket = connect({ path: socketFile })
 
     const settle = (fn, value) => {
       if (settled) return
@@ -77,12 +87,16 @@ export function request(op, args = {}, { path = socketPath(), timeoutMs = 10_000
   })
 }
 
-/** The agent's status, or null when no agent is listening. */
+/**
+ * The agent's status, or null when no agent is listening or the agent cannot
+ * run on this platform. Callers fall back to environment credentials on null,
+ * so an unsupported platform must answer null, not throw.
+ */
 export async function agentStatus(options = {}) {
   try {
     return await request('status', {}, { timeoutMs: 2_000, ...options })
   } catch (err) {
-    if (err instanceof AgentUnavailableError) return null
+    if (err instanceof AgentUnavailableError || err.code === 'unsupported_platform') return null
     throw err
   }
 }

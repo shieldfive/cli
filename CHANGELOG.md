@@ -23,6 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   enough: the agent refreshes the session without prompting again until it locks
   or you log out.
 
+- **`sf logout --everywhere`** signs out every session on the account, including
+  the browser and phone.
+
 ### Security
 
 - The agent's socket accepts six operations: `status`, `upload`, `sync`,
@@ -35,6 +38,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   each file's contents under a key derived from the vault key rather than a
   plain hash, so the ledger cannot confirm which documents you hold to anyone
   without that key.
+- Hardened before release after a security review:
+  - The ledger records the MAC of the bytes actually encrypted, read in the
+    same pass as the upload. Hashing the file before and after could not see a
+    change made and undone mid-upload, and `sf verify` would then have called a
+    file backed up that the vault did not hold.
+  - Ledger records carry a tag under the vault-derived key and a device id;
+    forged lines, and lines copied from another machine, are ignored.
+  - `SF_EMAIL` and `SF_PASSWORD` take precedence over a running agent, so a
+    script cannot be redirected to a different account.
+  - A lock file stops two agents from starting at once, and an agent that is
+    still revoking its session cannot delete the socket of the one that replaced
+    it.
+  - `sf status` no longer postpones the idle lock.
+  - Stopping wipes keys before touching the network, and its token refresh and
+    revoke share a 5 second budget, so an unreachable server cannot keep the
+    agent alive. An upload already running keeps its own copy of the key.
+  - The socket lives in `~/.shieldfive/run` everywhere, so cron jobs and other
+    minimal environments find the agent.
 
 ### Notes
 

@@ -114,6 +114,11 @@ export function parseRequest(line) {
       }
       return { id, op, args: { paths: args.paths.map((p, i) => absolutePath(p, `paths[${i}]`)) } }
     }
+    case 'logout':
+      // `everywhere` signs out every session on the account, not just this one.
+      // It is how a session the agent could not revoke (offline, or already
+      // replaced) gets ended from a later login.
+      return { id, op, args: { everywhere: args.everywhere === true } }
     default:
       return { id, op, args: {} }
   }
