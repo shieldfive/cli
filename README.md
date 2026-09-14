@@ -27,9 +27,14 @@ size, uploading nothing.
 
 - The underlying cryptography ([`@shieldfive/crypto`](https://github.com/shieldfive/crypto))
   has **not** undergone an external audit yet. Treat this as early software.
-- The direct upload path (files up to one 5 MiB chunk) has been run end to end
-  against the production backend: files uploaded by this CLI appear in the web
-  app with their real names and decrypt correctly.
+- **Neither upload path has been exercised against production since 2026-09-03.**
+  The direct (≤ 5 MiB) path was validated end to end against the backend as it
+  stood at 0.1.0, but the server then moved that path to a presigned S3 PUT and
+  stopped issuing an upload token. 0.2.0 hard-required that token, so it could
+  not upload any file of 5 MiB or less at all. This release rewrites the direct
+  path to the presigned PUT. It is covered by the offline mock test in
+  [`test/upload.flow.test.mjs`](test/upload.flow.test.mjs) and sends byte-for-byte
+  the request the web app sends, but it has not been run live.
 - The **multipart** path (files larger than 5 MiB) is covered by a byte-for-byte
   review against the server contract and a mock end-to-end test that decrypts
   every part, but has not yet been exercised against production with a real
@@ -61,7 +66,7 @@ trust it):
 git clone https://github.com/shieldfive/cli.git
 cd cli
 npm install     # @shieldfive/crypto (+ libsodium), @supabase/supabase-js, @noble/*
-npm test        # 27/27
+npm test        # 40/40
 ```
 
 ## Commands
@@ -131,6 +136,15 @@ protocol and server-side proof expect.)
   The server issues `proofKey` when it creates the session and verifies the proof
   when finalizing. It ties the stored ciphertext to the session without the
   server ever seeing plaintext.
+- **Direct** (≤ 5 MiB) — the single encrypted chunk is `PUT` at a presigned S3
+  URL the server issues with the session. The URL's SigV4 signature is the only
+  credential and it authorises exactly one object key, so the request carries no
+  `Authorization` header and no `X-Bz-*` headers; the client sends no storage id
+  at finalize, because the server reads the real one off the stored object.
+  Because the signature covers `host` only, nothing on this path binds the body:
+  the server compares the client's `ciphertextHash` against the client's own
+  `partSha1Array[0]`, so they always agree. Integrity here rests on the upload
+  proof and on AES-GCM's tag at download, not on a wire checksum.
 - **Multipart** (> 5 MiB) — the file is streamed one 5 MiB chunk at a time (never
   loaded whole into memory), each chunk uploaded as a Backblaze part. The
   ciphertext hash the server checks is SHA-1 over the concatenated raw part
