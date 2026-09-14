@@ -1,10 +1,16 @@
 // VERIFIED (offline): the full `sf push` upload protocol, driven against a
-// mocked backend + Backblaze. These assert the exact wire contract the live
-// server checks in web/app/api/files/{create-upload-session,upload-part-url,
+// mocked backend + storage. These assert the wire contract the live server
+// checks in web/app/api/files/{create-upload-session,upload-part-url,
 // complete-upload} — part numbering, per-chunk nonce sequencing, the
 // first-chunk-only upload proof, the multipart ciphertextHash, part-URL refresh
 // on an expired token, and the finalize payload. A drift here is a silent
 // live-upload failure, so we reproduce the server's own checks locally.
+//
+// Offline is the limit, and it has already cost one release. These mocks are
+// written from the server's source, not from a live response, so a fixture that
+// supplies a field the server stopped sending will keep passing while every
+// real upload fails — which is what happened to the direct path between
+// 2026-09-03 and this change. The fixtures are the assertion; keep them honest.
 
 import assert from 'node:assert/strict'
 import { createHash, webcrypto } from 'node:crypto'
@@ -441,13 +447,14 @@ test('multipart push: a 5xx on a part is retried with a fresh URL and succeeds',
   assert.equal(finalizeBody.fileId, 'file-abc')
 })
 
-test('direct push: single chunk, storage id from PUT, single-part ciphertextHash', async () => {
+test('direct push: presigned PUT, no Authorization, no b2FileId at finalize', async () => {
   const content = webcrypto.getRandomValues(new Uint8Array(64)) // <= chunkSize -> direct
   const rootKey = webcrypto.getRandomValues(new Uint8Array(32))
 
   let createBody = null
   let putBody = null
-  let putSha1 = null
+  let putMethod = null
+  let putHeaders = null
   let finalizeBody = null
 
   const originalFetch = globalThis.fetch
@@ -455,20 +462,27 @@ test('direct push: single chunk, storage id from PUT, single-part ciphertextHash
     const url = typeof input === 'string' ? input : input.toString()
     if (url === `${API}/api/files/create-upload-session`) {
       createBody = JSON.parse(init.body)
+      // No authToken and no storagePath: this is the live direct-branch shape
+      // since web b52b4c8 (PR #726). The old fixture supplied both, which is
+      // exactly why the suite stayed green while every real <= 5 MiB upload
+      // threw 'Direct upload session is missing credentials.'
       return jsonResponse(200, {
         uploadKind: 'direct',
         fileId: 'file-direct',
         uploadUrl: 'https://b2.test/direct',
-        authToken: 'tok-direct',
-        storagePath: 'storage/uuid',
         chunkSize: 5 * 1024 * 1024,
+        contentType: 'application/octet-stream',
         proofKey: PROOF_KEY,
       })
     }
     if (url === 'https://b2.test/direct') {
       putBody = new Uint8Array(init.body)
-      putSha1 = init.headers['X-Bz-Content-Sha1']
-      return jsonResponse(200, { fileId: 'b2-direct-storage-id' })
+      putMethod = init.method
+      putHeaders = init.headers
+      // A presigned S3 PUT answers with an ETag header and an empty body --
+      // no JSON, and in particular no fileId. Returning one here would let a
+      // client that still reads body.fileId pass.
+      return jsonResponse(200, {})
     }
     if (url === `${API}/api/files/complete-upload`) {
       finalizeBody = JSON.parse(init.body)
@@ -493,7 +507,23 @@ test('direct push: single chunk, storage id from PUT, single-part ciphertextHash
   }
 
   assert.equal(createBody.sizeBytes, 64)
-  assert.equal(putSha1, sha1HexOf(putBody))
+
+  // The wire contract of the direct path. None of this was asserted before,
+  // which is how the POST/b2_upload_file shape survived the server's move to a
+  // presigned PUT.
+  const putSha1 = sha1HexOf(putBody)
+  assert.equal(putMethod, 'PUT')
+  assert.equal(putHeaders.Authorization, undefined)
+  assert.deepEqual(
+    Object.keys(putHeaders).filter((k) => k.toLowerCase().startsWith('x-bz-')),
+    [],
+    'presigned PUT is signed for host only; X-Bz-* headers are not signed',
+  )
+  assert.deepEqual(
+    Object.keys(putHeaders).map((k) => k.toLowerCase()),
+    ['content-type'],
+    'Content-Type is the only header the presigned PUT may carry',
+  )
 
   const cskB64 = unwrapKeyB64({
     wrappingKeyB64: bytesToBase64(rootKey),
@@ -506,7 +536,13 @@ test('direct push: single chunk, storage id from PUT, single-part ciphertextHash
   ).decrypt(putBody)
   assert.deepEqual(plain, content)
 
-  assert.equal(finalizeBody.b2FileId, 'b2-direct-storage-id') // from the PUT, not the session
+  // A presigned PUT returns an ETag, not a Backblaze file id. Forwarding it
+  // would be persisted verbatim into files.b2_file_id; the server HEADs the
+  // stored object for the real one instead.
+  assert.ok(
+    !('b2FileId' in finalizeBody),
+    'direct finalize must send no b2FileId',
+  )
   assert.deepEqual(finalizeBody.partSha1Array, [putSha1])
   assert.equal(finalizeBody.ciphertextHash, putSha1) // single part
 })

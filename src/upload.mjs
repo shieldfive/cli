@@ -1,10 +1,13 @@
-// ShieldFive CLI — upload: create-session -> chunk-encrypt -> Backblaze PUT ->
-// finalize. Ported from the apps (mobile cloudApi.ts + syncService.ts).
+// ShieldFive CLI — upload: create-session -> chunk-encrypt -> upload -> finalize.
+// Ported from the apps (mobile cloudApi.ts + syncService.ts).
 //
-// Two paths, chosen by the server:
-//   direct  — a single-chunk file (<= chunkSize). One b2_upload_file POST.
-//   large   — a multipart file (> chunkSize). b2_upload_part per chunk, then
-//             b2_finish_large_file (server-side) at finalize.
+// Two paths, chosen by the server, and they no longer share a wire protocol:
+//   direct  — a single-chunk file (<= chunkSize). One presigned S3 PUT, no
+//             Authorization header and no storage id at finalize. The server
+//             moved this path off b2_upload_file in web b52b4c8 (PR #726).
+//   large   — a multipart file (> chunkSize). b2_upload_part per chunk, with a
+//             Backblaze token and X-Bz-* headers, then b2_finish_large_file
+//             (server-side) at finalize. Unchanged.
 //
 // Chunks are read from disk one at a time (never the whole file into memory),
 // so a multi-gigabyte upload holds at most one chunk (~5 MiB) resident.
@@ -112,29 +115,33 @@ export async function createUploadSession({
   return { session: body, csk, noncePrefix }
 }
 
-// Direct upload: b2_upload_file. Returns the storage file id the server patches
-// into the row before verifying the proof.
-async function putDirectToBackblaze({ session, ciphertext, sha1 }) {
+// Direct upload: a presigned S3 PUT (web b52b4c8 / PR #726), not b2_upload_file.
+// The SigV4 signature in the URL IS the credential and it authorises exactly one
+// object key, so Authorization and X-Bz-* are neither required nor signed --
+// sending them would be noise, and an Authorization header would mislead the
+// next reader into thinking the token still matters here.
+//
+// Content-Type is sent so the stored object carries a sensible type. It is
+// currently unsigned, but only because the vault call site presigns without
+// ContentLength; if that ever changes, this header becomes load-bearing and a
+// mismatch 403s every direct upload. See the web repo's
+// tests/storage/presignedPutContract.test.ts, which pins the signed-header set.
+//
+// Returns nothing. A presigned PUT answers with an ETag, not a Backblaze file
+// id, so there is no storage id to hand to finalize.
+async function putDirectPresigned({ session, ciphertext }) {
   const res = await fetch(session.uploadUrl, {
-    method: 'POST', // Backblaze b2_upload_file is a POST
+    method: 'PUT',
     headers: {
-      Authorization: session.authToken,
-      'X-Bz-File-Name': encodeURIComponent(session.storagePath),
-      'X-Bz-Content-Sha1': sha1,
-      'Content-Type': 'application/octet-stream',
+      'Content-Type': session.contentType || 'application/octet-stream',
     },
     body: ciphertext,
   })
   if (!res.ok) {
     throw new Error(
-      `Backblaze upload failed (HTTP ${res.status}): ${await res.text().catch(() => '')}`,
+      `Direct upload failed (HTTP ${res.status}): ${await res.text().catch(() => '')}`,
     )
   }
-  const body = await res.json().catch(() => ({}))
-  if (!body.fileId) {
-    throw new Error(`Backblaze response missing fileId: ${JSON.stringify(body)}`)
-  }
-  return body.fileId
 }
 
 // Ask the server for a fresh b2_upload_part URL + token when the current one
@@ -267,7 +274,8 @@ async function finalizeUpload({
 }
 
 // Single-chunk file: encrypt the one chunk (AES-GCM, suite 0x01) + SHA-1 +
-// proof, PUT it, finalize. b2FileId is the id Backblaze returns from the PUT.
+// proof, PUT it at the presigned URL, finalize. No b2FileId is sent -- the
+// server HEADs the stored object and derives the storage id itself.
 async function uploadDirect({ apiBaseUrl, accessToken, session, csk, noncePrefix, path }) {
   const chunkSize = session.chunkSize ?? CHUNK_SIZE
   let plaintext = null
@@ -288,13 +296,17 @@ async function uploadDirect({ apiBaseUrl, accessToken, session, csk, noncePrefix
     chunkSize,
   })
 
-  const b2FileId = await putDirectToBackblaze({ session, ciphertext, sha1: sha1Hex })
+  await putDirectPresigned({ session, ciphertext })
 
+  // b2FileId is deliberately omitted. JSON.stringify drops the undefined key,
+  // so complete-upload/finalize.ts takes its "no client-supplied id" branch and
+  // HEADs the object for the real version id. Forwarding the PUT's ETag instead
+  // would be persisted verbatim into files.b2_file_id with no format check --
+  // a bogus delete handle, permanently, which is worse than failing.
   return finalizeUpload({
     apiBaseUrl,
     accessToken,
     fileId: session.fileId,
-    b2FileId,
     partSha1Array: [sha1Hex],
     proof: proofHex,
     ciphertextHash: sha1Hex,
@@ -436,8 +448,13 @@ export async function uploadFile({ apiBaseUrl, accessToken, rootKey, name, path,
   })
 
   if (session.uploadKind === 'direct') {
-    if (!session.uploadUrl || !session.authToken || !session.storagePath) {
-      throw new Error('Direct upload session is missing credentials.')
+    // No authToken and no storagePath check: since web b52b4c8 (PR #726) the
+    // direct path is a presigned S3 PUT, so the signature inside uploadUrl is
+    // the only credential and it already binds the object key. Requiring the
+    // token the server stopped issuing is what made every <= 5 MiB upload fail
+    // from 2026-09-03. The 'large' branch below still needs both.
+    if (!session.uploadUrl) {
+      throw new Error('Direct upload session is missing an upload URL.')
     }
     await uploadDirect({ apiBaseUrl, accessToken, session, csk, noncePrefix, path })
   } else if (session.uploadKind === 'large') {
