@@ -5,6 +5,69 @@ All notable changes to `@shieldfive/cli` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+
+- **`sf login`, `sf status`, `sf logout`.** `sf login` prompts for your password
+  and, if two-factor is enabled, a code, then starts an agent that holds the
+  signed-in session and the unlocked vault key in memory only. `sf push` and
+  `sf sync` use it when it is running and need nothing in the environment. The
+  agent locks itself after 8 hours without use (`--idle=<hours>` to change it),
+  and `sf logout` revokes the session on the server.
+- **`sf verify <file>...`** reports whether each file is safely stored in your
+  vault. The bytes on disk now must match an upload the agent performed, and the
+  server must confirm that upload at the moment of asking. Names and sizes play
+  no part. Exits 0 only when every file is confirmed, so a script can gate on it.
+- **Unattended sync on two-factor accounts.** One interactive `sf login` is
+  enough: the agent refreshes the session without prompting again until it locks
+  or you log out.
+
+- **`sf logout --everywhere`** signs out every session on the account, including
+  the browser and phone.
+
+### Security
+
+- The agent's socket accepts six operations: `status`, `upload`, `sync`,
+  `verify`, `lock`, `logout`. None lists, downloads or decrypts vault contents,
+  or returns key material, and a test pins the list.
+- `sf login` never reads `SF_PASSWORD`. The agent is started with an explicit
+  environment allowlist, so a password exported for the older flow does not
+  reach it.
+- Uploads are recorded in `~/.shieldfive/ledger/<account>.jsonl` with an HMAC of
+  each file's contents under a key derived from the vault key rather than a
+  plain hash, so the ledger cannot confirm which documents you hold to anyone
+  without that key.
+- Hardened before release after a security review:
+  - The ledger records the MAC of the bytes actually encrypted, read in the
+    same pass as the upload. Hashing the file before and after could not see a
+    change made and undone mid-upload, and `sf verify` would then have called a
+    file backed up that the vault did not hold.
+  - Ledger records carry a tag under the vault-derived key and a device id;
+    forged lines, and lines copied from another machine, are ignored.
+  - `SF_EMAIL` and `SF_PASSWORD` take precedence over a running agent, so a
+    script cannot be redirected to a different account.
+  - A lock file stops two agents from starting at once, and an agent that is
+    still revoking its session cannot delete the socket of the one that replaced
+    it.
+  - `sf status` no longer postpones the idle lock.
+  - Stopping wipes keys before touching the network, and its token refresh and
+    revoke share a 5 second budget, so an unreachable server cannot keep the
+    agent alive. An upload already running keeps its own copy of the key.
+  - The socket lives in `~/.shieldfive/run` everywhere, so cron jobs and other
+    minimal environments find the agent.
+
+### Notes
+
+- `sf login` has not been run against production. The pieces are covered by
+  offline tests, including one that runs the agent as its own process against a
+  local stub of the auth and verify endpoints. Sign-in, unlock and session
+  refresh against the live backend are not.
+- The agent does not run on Windows. `SF_EMAIL` and `SF_PASSWORD` keep working
+  there, and everywhere, exactly as before.
+- The ledger starts empty. Existing `.shieldfive-sync.json` manifests are not
+  imported: they hold no content hash to check a claim against.
+
 ## 0.2.1 - 2026-09-14
 
 ### Fixed

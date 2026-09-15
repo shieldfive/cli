@@ -102,5 +102,83 @@ export async function signIn({
   }
 
   const aal2Token = await stepUpMfaIfRequired({ supabase, getTotpCode })
-  return { accessToken: aal2Token ?? aal1Token }
+
+  // The refresh token has to come from the session that was stepped up.
+  // Refreshing the pre-step-up session mints aal1 tokens, and every upload
+  // route would start answering 403 once the first access token expired.
+  // supabase-js replaces its in-memory session on mfa.verify, so read it back
+  // and only trust it if it is the session that produced the aal2 token. If it
+  // is not, return no refresh token: the agent refuses to start rather than
+  // running on a credential that will fail an hour later.
+  let session = data.session
+  if (aal2Token) {
+    const { data: current } = await supabase.auth.getSession()
+    session = current?.session?.access_token === aal2Token ? current.session : null
+  }
+
+  return {
+    accessToken: aal2Token ?? aal1Token,
+    refreshToken: session?.refresh_token ?? null,
+    expiresAt: session?.expires_at ?? null,
+    userId: session?.user?.id ?? data.user?.id ?? null,
+  }
+}
+
+// Exchange a refresh token for a new session. Supabase rotates refresh tokens,
+// so the caller must replace the one it holds with the one returned, and must
+// never run two refreshes with the same token at once: reuse outside the
+// server's short grace window revokes the whole session.
+export async function refreshAccessToken({
+  supabaseUrl,
+  anonKey,
+  refreshToken,
+  fetchImpl = fetch,
+  signal,
+}) {
+  if (!refreshToken) {
+    throw new Error('No refresh token is held. Run sf login again.')
+  }
+  const res = await fetchImpl(new URL('/auth/v1/token?grant_type=refresh_token', supabaseUrl), {
+    method: 'POST',
+    headers: { apikey: anonKey, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ refresh_token: refreshToken }),
+    signal,
+  })
+  const body = await res.json().catch(() => ({}))
+  if (!res.ok || !body.access_token || !body.refresh_token) {
+    const reason = body.error_description ?? body.msg ?? body.error ?? 'no session returned'
+    const err = new Error(`Session refresh failed (HTTP ${res.status}): ${reason}`)
+    err.status = res.status
+    throw err
+  }
+  return {
+    accessToken: body.access_token,
+    refreshToken: body.refresh_token,
+    expiresAt: body.expires_at ?? Math.floor(Date.now() / 1000) + (body.expires_in ?? 3600),
+    userId: body.user?.id ?? null,
+  }
+}
+
+// Sign a session out on the server. Sessions on the production project are not
+// time-boxed, so a refresh token that is merely forgotten stays valid until
+// someone revokes it; this is that revocation. `scope: 'local'` ends only this
+// session. `scope: 'global'` ends every session on the account, including the
+// user's browser and phone, and is the only way to end a session this client no
+// longer holds a token for.
+export async function revokeSession({
+  supabaseUrl,
+  anonKey,
+  accessToken,
+  scope = 'local',
+  fetchImpl = fetch,
+  signal,
+}) {
+  if (scope !== 'local' && scope !== 'global') throw new Error(`Unknown sign-out scope ${scope}`)
+  if (!accessToken) return { revoked: false, status: 0 }
+  const res = await fetchImpl(new URL(`/auth/v1/logout?scope=${scope}`, supabaseUrl), {
+    method: 'POST',
+    headers: { apikey: anonKey, Authorization: `Bearer ${accessToken}` },
+    signal,
+  })
+  return { revoked: res.status === 204 || res.status === 200, status: res.status }
 }

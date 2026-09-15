@@ -276,7 +276,7 @@ async function finalizeUpload({
 // Single-chunk file: encrypt the one chunk (AES-GCM, suite 0x01) + SHA-1 +
 // proof, PUT it at the presigned URL, finalize. No b2FileId is sent -- the
 // server HEADs the stored object and derives the storage id itself.
-async function uploadDirect({ apiBaseUrl, accessToken, session, csk, noncePrefix, path }) {
+async function uploadDirect({ apiBaseUrl, accessToken, session, csk, noncePrefix, path, onPlaintextChunk }) {
   const chunkSize = session.chunkSize ?? CHUNK_SIZE
   let plaintext = null
   for await (const chunk of readFileChunks(path, chunkSize)) {
@@ -284,6 +284,7 @@ async function uploadDirect({ apiBaseUrl, accessToken, session, csk, noncePrefix
       throw new Error('Direct upload session is larger than a single chunk.')
     }
     plaintext = chunk
+    onPlaintextChunk?.(chunk)
   }
   if (plaintext === null) plaintext = new Uint8Array(0)
 
@@ -336,7 +337,7 @@ function resolveUploadConcurrency() {
   return DEFAULT_UPLOAD_CONCURRENCY
 }
 
-async function uploadMultipart({ apiBaseUrl, accessToken, session, csk, noncePrefix, path }) {
+async function uploadMultipart({ apiBaseUrl, accessToken, session, csk, noncePrefix, path, onPlaintextChunk }) {
   if (!session.b2FileId) {
     throw new Error('Multipart upload session is missing storage id (b2FileId).')
   }
@@ -397,6 +398,7 @@ async function uploadMultipart({ apiBaseUrl, accessToken, session, csk, noncePre
 
   let chunkIndex = 0
   for await (const plaintext of readFileChunks(path, chunkSize)) {
+    onPlaintextChunk?.(plaintext)
     if (firstError) break
     // Backpressure: hold at most `concurrency` parts in flight. inFlight is
     // non-empty when this runs (size >= concurrency >= 1), so race never hangs.
@@ -438,7 +440,11 @@ async function uploadMultipart({ apiBaseUrl, accessToken, session, csk, noncePre
   })
 }
 
-export async function uploadFile({ apiBaseUrl, accessToken, rootKey, name, path, size }) {
+// `onPlaintextChunk`, when given, is called with every plaintext chunk in file
+// order, from the same read that feeds encryption. The agent hashes those
+// chunks to record what was actually uploaded; hashing the file separately,
+// before or after, cannot see a change made and undone while it was being read.
+export async function uploadFile({ apiBaseUrl, accessToken, rootKey, name, path, size, onPlaintextChunk }) {
   const { session, csk, noncePrefix } = await createUploadSession({
     apiBaseUrl,
     accessToken,
@@ -456,12 +462,12 @@ export async function uploadFile({ apiBaseUrl, accessToken, rootKey, name, path,
     if (!session.uploadUrl) {
       throw new Error('Direct upload session is missing an upload URL.')
     }
-    await uploadDirect({ apiBaseUrl, accessToken, session, csk, noncePrefix, path })
+    await uploadDirect({ apiBaseUrl, accessToken, session, csk, noncePrefix, path, onPlaintextChunk })
   } else if (session.uploadKind === 'large') {
     if (!session.uploadUrl || !session.authToken) {
       throw new Error('Multipart upload session is missing credentials.')
     }
-    await uploadMultipart({ apiBaseUrl, accessToken, session, csk, noncePrefix, path })
+    await uploadMultipart({ apiBaseUrl, accessToken, session, csk, noncePrefix, path, onPlaintextChunk })
   } else {
     throw new Error(`Unknown uploadKind "${session.uploadKind}" for "${name}".`)
   }

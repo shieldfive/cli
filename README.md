@@ -41,6 +41,11 @@ size, uploading nothing.
   large file.
 - `sf sync` is **append-only**: it uploads new and changed files; it does not
   yet mirror local deletions or renames into the vault.
+- **`sf login` and the agent have not been run against production.** They are
+  covered by offline tests, including one that runs the agent as its own process
+  and reaches it from separate `sf` processes against a local stub of the auth
+  and verify endpoints. Sign-in, unlock and session refresh against the live
+  backend are not covered.
 
 ## Requirements
 
@@ -66,27 +71,58 @@ trust it):
 git clone https://github.com/shieldfive/cli.git
 cd cli
 npm install     # @shieldfive/crypto (+ libsodium), @supabase/supabase-js, @noble/*
-npm test        # 40/40
+npm test        # 107 tests
 ```
 
 ## Commands
 
 ```
-sf encrypt <folder>                          encrypt each file locally, upload nothing (no account needed)
-sf push <folder>                             sign in, unlock, encrypt, upload every file once
+sf login [--idle=<hours>]                    sign in once; an agent holds the session in memory (locks after 8 h idle)
+sf status                                    is an agent running, and for which account
+sf logout [--everywhere]                     revoke the session and stop the agent; --everywhere signs out every device
+sf push <folder>                             encrypt and upload every file once
 sf sync <folder> [--watch] [--interval=N]    upload new/changed files; --watch keeps a poll loop (N seconds, default 5)
+sf verify <file>...                          report whether each file is safely stored in your vault
+sf encrypt <folder>                          encrypt each file locally, upload nothing (no account needed)
 ```
 
 `sf push` and `sf sync` pick the direct or multipart upload path automatically
-from the file size. `sf sync` writes a `.shieldfive-sync.json` manifest in the
-target folder that records what has already been uploaded (by size and mtime),
-so unchanged files are skipped and an interrupted run does not re-upload
-everything.
+from the file size.
+
+With an agent running, `sf sync` records uploads in the agent's ledger (see
+[What the agent can and cannot do](#what-the-agent-can-and-cannot-do)) and
+`sf verify` works. Without one, `sf sync` writes a `.shieldfive-sync.json`
+manifest in the target folder that records what has already been uploaded (by
+size and mtime), so unchanged files are skipped and an interrupted run does not
+re-upload everything; `sf verify` needs the agent.
 
 ## Running the live commands
 
-`sf push` and `sf sync` need only your ShieldFive account. Your password is
-typed, never passed on the command line:
+### With `sf login`
+
+```sh
+sf login
+sf push ./my-folder
+sf sync ./my-folder --watch
+sf verify ./my-folder/tax-return-2025.pdf
+sf logout
+```
+
+`sf login` prompts for your email, your password and, if it differs, your vault
+password. It never reads them from the environment and there is no flag for
+them. It then starts an agent in the background and exits; every later command
+talks to that agent and needs nothing exported.
+
+If `SF_EMAIL` and `SF_PASSWORD` are also set, `sf push` and `sf sync` sign in
+with those instead and tell you an agent is running, so a script written for one
+account is never sent to another. `sf push` exits 2 if a file changed while it
+was being uploaded: the vault then holds the version that was read, not the file
+as it is now.
+
+### Without an agent
+
+`sf push` and `sf sync` still work from environment variables, exactly as
+before. Your password is typed, never passed on the command line:
 
 ```sh
 export SF_EMAIL=you@example.com
@@ -115,6 +151,68 @@ Two-factor code (6 digits):
 Enter the current code from your authenticator. In a non-interactive context
 (scripts, CI) set `SF_TOTP_CODE` to the current code instead of being prompted.
 Only TOTP is supported; SMS and other factors are not.
+
+With `sf login` you are asked once. The agent refreshes the stepped-up session
+on its own, so `sf sync --watch` keeps working on a two-factor account until the
+agent locks or you log out.
+
+## What the agent can and cannot do
+
+The agent keeps two things in memory: your signed-in session and your unlocked
+vault key. Neither is written to disk. It listens on a Unix socket in
+`~/.shieldfive/run`, a directory only your user can enter, and refuses to start
+if that directory is a symlink, owned by someone else or open to other users.
+Only one agent runs at a time.
+
+It accepts six requests: `status`, `upload`, `sync`, `verify`, `lock` and
+`logout`. It cannot list what is in your vault, download a file, decrypt
+anything, or hand out the key, because there is no request for any of those. A
+process that reaches the socket can put files into your vault and ask whether
+files are backed up. It cannot read your vault through the agent.
+
+Uploads are recorded in `~/.shieldfive/ledger/<account>.jsonl`: the path, size,
+time, vault file id, and an HMAC of the bytes that were actually encrypted, under
+a key derived from your vault key. A plain hash would let anyone holding the
+ledger confirm whether you have a particular known document; the HMAC does not,
+without your vault key. Each record also carries a tag under that key, so a line
+added to the ledger by anything other than the agent is ignored, and records
+made on another machine do not count on this one.
+
+`sf verify` reports a file as **backed up** only when the bytes on disk now
+match an upload in the ledger and the server confirms, at that moment, that the
+upload is stored, complete, intact and not in your Bin. It never decides by name
+or size. The other answers:
+
+| Answer | Meaning |
+|---|---|
+| `NOT confirmed` | these bytes were uploaded, but the server cannot confirm they are still safely stored |
+| `changed since upload` | this path was uploaded, but the file has changed since |
+| `no upload record` | this agent never uploaded these bytes; they may still be in your vault from another device |
+| `unreadable` | the local file could not be read |
+
+`no upload record` does not mean the file is missing from your vault. Do not
+delete anything on the strength of that answer.
+
+The agent locks itself after 8 hours without an upload, sync or verify
+(`sf login --idle=<hours>` to change it; `sf status` does not count). Locking and
+`sf logout` both overwrite the key in memory first and then sign the session out
+on the server. Sessions on ShieldFive do not expire on their own, so a session
+that is forgotten rather than signed out would stay valid. If the server cannot
+be reached when you log out, `sf logout` says the session is still valid and
+exits 1; run `sf login` and then `sf logout --everywhere` once you are online.
+
+Limits:
+
+- Windows is not supported. Use `SF_EMAIL` and `SF_PASSWORD` there.
+- Node cannot see which process connected to the socket, so directory
+  permissions are the only gate. This is also how `ssh-agent` works on macOS.
+- Overwriting the key in memory is best-effort. A garbage-collected runtime can
+  copy key material during crypto operations.
+- The ledger is per device. A file uploaded from another machine shows as
+  `no upload record` here.
+
+The full design, including the threat model, is in
+[`docs/agent-design.md`](docs/agent-design.md).
 
 ## How the upload works (for auditors)
 
@@ -167,6 +265,12 @@ file — a machine-checked demonstration that only ciphertext is uploaded.
   finalize; the streaming chunk reader
 - `src/sync.mjs` — `sf sync`: manifest, change detection, reconcile pass, watch
   loop (reuses `upload.mjs`)
+- `src/prompt.mjs` — terminal prompts; the password prompt echoes nothing
+- `src/agent/` — `sf login`'s agent: `server.mjs` (the process and its six
+  requests), `client.mjs`, `protocol.mjs` (the request allowlist), `ledger.mjs`
+  (HMAC upload ledger and `verify` classification), `paths.mjs` (socket
+  directory checks), `main.mjs` (entry point and session handoff)
+- `docs/agent-design.md` — design record and threat model for the agent
 - `src/sfCrypto.mjs` — the post-quantum hybrid encrypt/decrypt used by the
   `sf encrypt` demo
 - `test/*.test.mjs` — round-trip guarantees plus the mock end-to-end upload and
