@@ -85,10 +85,17 @@ sf push <folder>                             encrypt and upload every file once
 sf sync <folder> [--watch] [--interval=N]    upload new/changed files; --watch keeps a poll loop (N seconds, default 5)
 sf verify <file>...                          report whether each file is safely stored in your vault
 sf encrypt <folder>                          encrypt each file locally, upload nothing (no account needed)
+sf inspect <folder>                          read-only recursive migration inventory; upload nothing
 ```
 
 `sf push` and `sf sync` pick the direct or multipart upload path automatically
 from the file size.
+
+`sf inspect` reports JSON counts of files, directories, bytes and skipped entries.
+It includes nested/hidden files and empty folders, reads metadata only, and
+does not follow symbolic links. Exit code 2 means entries were skipped. It does
+not upload anything or prove that a migration has completed. Current push/sync
+remain top-level only; do not use their completion as proof of a whole-tree copy.
 
 With an agent running, `sf sync` records uploads in the agent's ledger (see
 [What the agent can and cannot do](#what-the-agent-can-and-cannot-do)) and
