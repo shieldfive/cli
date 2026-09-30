@@ -88,11 +88,22 @@ export async function signIn({
   fetchImpl = fetch,
   createClientImpl = createClient,
 }) {
+  // The raw password is never handed to Supabase directly. The salt lookup
+  // decides what the version-aware login route receives: only the derived
+  // login secret for a version-2 account; the password only for an account the
+  // server affirmatively reported as version 1. test/auth.noPasswordLeak.test.mjs
+  // pins this across every path.
+  email = String(email ?? '').trim().toLowerCase()
   const credentials = await buildSignInCredentials({ apiBaseUrl, email, password, fetchImpl })
-  const response = await fetchImpl(new URL('/api/mobile/auth/login', apiBaseUrl), {
-    method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-    body: JSON.stringify({ email, ...credentials }), signal: AbortSignal.timeout(30_000),
-  })
+  let response
+  try {
+    response = await fetchImpl(new URL('/api/mobile/auth/login', apiBaseUrl), {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({ email, ...credentials }), signal: AbortSignal.timeout(30_000),
+    })
+  } catch {
+    throw new Error('Sign-in failed: could not reach ShieldFive. Check your connection and try again.')
+  }
   const payload = await response.json().catch(() => null)
   if (!response.ok || typeof payload?.accessToken !== 'string' || !payload.accessToken ||
       typeof payload?.refreshToken !== 'string' || !payload.refreshToken) {

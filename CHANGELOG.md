@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Fixed
+
+- **Sign-in works for accounts on ShieldFive's current sign-in scheme.** 0.3.0
+  posted your password straight to Supabase, which fails for every account that
+  signs in with a client-derived login secret (all new accounts, and every
+  account migrated on its next web or app sign-in), and sent the password to
+  the server on each failed attempt. `sf login`, `sf push` and `sf sync` now ask
+  ShieldFive how the account signs in, derive the login secret locally
+  (Argon2id, the same parameters and bytes as the web and Android apps) and
+  send only that. The raw password is sent only for an account the server
+  reports as not yet migrated, and only to ShieldFive's sign-in route. If that
+  lookup fails for any reason, sign-in stops before anything is sent.
+- A vault password typed with leading or trailing spaces now unlocks a vault
+  created on the web, which trims them.
+
+### Changed
+
+- Argon2id runs natively (the `argon2` package, off the main thread) when it
+  installs, and falls back to the bundled WebAssembly implementation when it
+  does not, so installation never fails on a platform without a prebuilt
+  binary. Both produce identical keys; parameters are unchanged.
+
 ## 0.3.0 - 2026-09-16
 
 ### Added
