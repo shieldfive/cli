@@ -1,6 +1,7 @@
 // ShieldFive CLI — authentication.
 //
-// Signs in via Supabase to obtain a Bearer access token, elevating to AAL2 when
+// Signs in through ShieldFive's version-aware login route to obtain a Bearer
+// session, then installs it in Supabase and elevates to AAL2 when
 // the account has two-factor authentication (TOTP) enabled. The upload routes
 // accept this token, and their server-side MFA gate requires an AAL2 token for
 // enrolled accounts — so the step-up here is what makes `sf push` / `sf sync`
@@ -11,6 +12,7 @@
 // via getAuthenticatorAssuranceLevel.
 
 import { createClient } from '@supabase/supabase-js'
+import { buildSignInCredentials } from './loginSecret.mjs'
 
 // If the account requires an AAL2 step-up, run the TOTP challenge/verify flow
 // and return the elevated access token. Returns null when no step-up is needed
@@ -77,24 +79,37 @@ export async function stepUpMfaIfRequired({ supabase, getTotpCode }) {
 }
 
 export async function signIn({
+  apiBaseUrl,
   supabaseUrl,
   anonKey,
   email,
   password,
   getTotpCode,
+  fetchImpl = fetch,
+  createClientImpl = createClient,
 }) {
-  const supabase = createClient(supabaseUrl, anonKey, {
+  const credentials = await buildSignInCredentials({ apiBaseUrl, email, password, fetchImpl })
+  const response = await fetchImpl(new URL('/api/mobile/auth/login', apiBaseUrl), {
+    method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: JSON.stringify({ email, ...credentials }), signal: AbortSignal.timeout(30_000),
+  })
+  const payload = await response.json().catch(() => null)
+  if (!response.ok || typeof payload?.accessToken !== 'string' || !payload.accessToken ||
+      typeof payload?.refreshToken !== 'string' || !payload.refreshToken) {
+    throw new Error(response.status === 429 ? 'Too many sign-in attempts. Try again shortly.' : 'Sign-in failed. Check your credentials and try again.')
+  }
+  const supabase = createClientImpl(supabaseUrl, anonKey, {
     auth: {
       persistSession: false,
       autoRefreshToken: false,
       detectSessionInUrl: false,
     },
   })
-  const { data, error } = await supabase.auth.signInWithPassword({
-    email,
-    password,
+  const { data, error } = await supabase.auth.setSession({
+    access_token: payload.accessToken,
+    refresh_token: payload.refreshToken,
   })
-  if (error) throw new Error(`Sign-in failed: ${error.message}`)
+  if (error) throw new Error('Could not establish the sign-in session. Please try again.')
 
   const aal1Token = data.session?.access_token
   if (!aal1Token) {

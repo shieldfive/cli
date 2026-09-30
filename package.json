@@ -48,6 +48,7 @@
     "@noble/hashes": "^2.0.1",
     "@shieldfive/crypto": "^1.0.0-beta.1",
     "@supabase/supabase-js": "^2",
+    "argon2": "0.45.1",
     "libsodium-wrappers-sumo": "^0.8.2"
   }
 }

@@ -10,7 +10,7 @@
 
 import { webcrypto } from 'node:crypto'
 
-import { deriveMasterSecret } from '@shieldfive/crypto/kdf/argon2id'
+import { deriveMasterSecret } from './argon2.mjs'
 
 const subtle = webcrypto.subtle
 
@@ -62,9 +62,9 @@ export async function deriveUserKey({
       salt,
       preset: argon2Preset,
     })
-    return subtle.importKey('raw', masterSecret, { name: 'AES-GCM' }, false, [
-      'decrypt',
-    ])
+    try {
+      return await subtle.importKey('raw', masterSecret, { name: 'AES-GCM' }, false, ['decrypt'])
+    } finally { masterSecret.fill(0) }
   }
   throw new Error(`Unsupported vault KDF: ${kdf}`)
 }
