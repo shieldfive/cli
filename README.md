@@ -256,7 +256,11 @@ file — a machine-checked demonstration that only ciphertext is uploaded.
 ## Layout
 
 - `src/cli.mjs` — the `sf` entry point (argument parsing, command dispatch)
-- `src/auth.mjs` — Supabase sign-in to a Bearer token
+- `src/auth.mjs` — sign-in to a Bearer token through ShieldFive's sign-in route,
+  with two-factor step-up
+- `src/loginSecret.mjs` — the login secret derived from your password; for
+  accounts on the current scheme the password itself is never sent
+- `src/argon2.mjs` — Argon2id, native when available, WebAssembly otherwise
 - `src/vault.mjs` / `src/unlock.mjs` — fetch the wrapped vault key, unwrap the
   root key from your password (Argon2id / PBKDF2)
 - `src/uploadCrypto.mjs` — filename and chunk encryption, upload proof, multipart

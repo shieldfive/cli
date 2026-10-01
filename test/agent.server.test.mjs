@@ -378,19 +378,22 @@ test('status probes do not count as use: polling cannot keep the agent unlocked'
 })
 
 test('logout during a sync stops it, and the upload in flight keeps an intact key', async () => {
+  let uploadStarted
+  const started = new Promise((resolve) => { uploadStarted = resolve })
   const h = await harness({
     uploadHook: async ({ phase }) => {
-      if (phase === 'after-read') await sleep(150)
+      if (phase === 'after-read') { uploadStarted(); await sleep(150) }
     },
   })
   const folder = await mkdtemp('/tmp/sfa-sync-')
   for (let i = 0; i < 5; i++) await writeFile(join(folder, `f${i}.txt`), `file ${i}`)
 
   const syncing = h.call('sync', { folder }, { timeoutMs: 0 })
-  await sleep(80)
+  const rejected = assert.rejects(syncing, (e) => e.code === 'locked')
+  await started
   await h.call('logout')
 
-  await assert.rejects(syncing, (e) => e.code === 'locked')
+  await rejected
   assert.ok(h.calls.uploads.length >= 1)
   assert.ok(
     h.calls.uploads.every((u) => u.keyIntactAtEnd),

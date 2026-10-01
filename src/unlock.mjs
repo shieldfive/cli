@@ -10,7 +10,7 @@
 
 import { webcrypto } from 'node:crypto'
 
-import { deriveMasterSecret } from '@shieldfive/crypto/kdf/argon2id'
+import { deriveMasterSecret } from './argon2.mjs'
 
 const subtle = webcrypto.subtle
 
@@ -62,9 +62,9 @@ export async function deriveUserKey({
       salt,
       preset: argon2Preset,
     })
-    return subtle.importKey('raw', masterSecret, { name: 'AES-GCM' }, false, [
-      'decrypt',
-    ])
+    try {
+      return await subtle.importKey('raw', masterSecret, { name: 'AES-GCM' }, false, ['decrypt'])
+    } finally { masterSecret.fill(0) }
   }
   throw new Error(`Unsupported vault KDF: ${kdf}`)
 }
@@ -73,21 +73,37 @@ export async function deriveUserKey({
  * Unwrap the vault root key from the password. `vaultKey` carries the base64
  * fields of the server's vault_keys row (same shape as the export bundle's
  * vault.json): ukSalt, ukIv, ukKdf, ukIterations?, ukArgon2Preset?, rkWrappedByUk.
+ *
+ * The web keyring (utils/keyring.ts) TRIMS the vault password before every
+ * wrap and unwrap, so a vault created or re-keyed on the web was wrapped under
+ * the trimmed password. That is tried first. Only if it fails AES-GCM
+ * authentication, and the password actually has surrounding whitespace, is the
+ * password tried exactly as typed (a vault wrapped by a client that does not
+ * trim). Nothing here is sent anywhere.
  * @returns {Promise<Uint8Array>} the 32-byte root key
  */
 export async function unlockRootKey({ password, vaultKey }) {
-  const uk = await deriveUserKey({
-    password,
-    salt: base64ToBytes(vaultKey.ukSalt),
-    kdf: vaultKey.ukKdf,
-    iterations: vaultKey.ukIterations,
-    argon2Preset: vaultKey.ukArgon2Preset,
-  })
-  return aesGcmDecrypt(
-    uk,
-    base64ToBytes(vaultKey.ukIv),
-    base64ToBytes(vaultKey.rkWrappedByUk),
-  )
+  if (typeof password !== 'string' || !password) throw new Error('Vault password is required')
+  const trimmed = password.trim()
+  const candidates = trimmed && trimmed !== password ? [trimmed, password] : [password]
+  for (let i = 0; i < candidates.length; i++) {
+    const uk = await deriveUserKey({
+      password: candidates[i],
+      salt: base64ToBytes(vaultKey.ukSalt),
+      kdf: vaultKey.ukKdf,
+      iterations: vaultKey.ukIterations,
+      argon2Preset: vaultKey.ukArgon2Preset,
+    })
+    try {
+      return await aesGcmDecrypt(
+        uk,
+        base64ToBytes(vaultKey.ukIv),
+        base64ToBytes(vaultKey.rkWrappedByUk),
+      )
+    } catch (err) {
+      if (i === candidates.length - 1 || err?.name !== 'OperationError') throw err
+    }
+  }
 }
 
 /** Recovery-key path: unwrap the root key with the base64 recovery key. */

@@ -63,3 +63,18 @@ test('a wrong password fails to unlock', async () => {
     unlockRootKey({ password: 'the-wrong-password', vaultKey }),
   )
 })
+
+// The web keyring trims the vault password before wrapping, so a vault created
+// on the web with "  pw  " typed is wrapped under "pw". The CLI must open it
+// with the password as typed.
+test('a vault wrapped under the trimmed password (the web keyring) unlocks with surrounding whitespace typed', async () => {
+  const rootKey = webcrypto.getRandomValues(new Uint8Array(32))
+  const vaultKey = await wrapRootKeyUnderPassword({ password: 'spaced pw', preset: 'moderate', rootKey })
+  assert.deepEqual(await unlockRootKey({ password: '  spaced pw \t', vaultKey }), rootKey)
+})
+
+test('a vault wrapped under the untrimmed password still unlocks (fallback)', async () => {
+  const rootKey = webcrypto.getRandomValues(new Uint8Array(32))
+  const vaultKey = await wrapRootKeyUnderPassword({ password: ' spaced pw ', preset: 'moderate', rootKey })
+  assert.deepEqual(await unlockRootKey({ password: ' spaced pw ', vaultKey }), rootKey)
+})

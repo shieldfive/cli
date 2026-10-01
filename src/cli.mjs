@@ -144,6 +144,7 @@ async function authAndUnlock(cfg) {
 
   process.stderr.write('signing in…\n')
   const { accessToken } = await signIn({
+    apiBaseUrl: cfg.apiBaseUrl,
     supabaseUrl: cfg.supabaseUrl,
     anonKey: cfg.anonKey,
     email: cfg.email,

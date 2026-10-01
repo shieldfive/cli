@@ -49,5 +49,8 @@
     "@shieldfive/crypto": "^1.0.0-beta.1",
     "@supabase/supabase-js": "^2",
     "libsodium-wrappers-sumo": "^0.8.2"
+  },
+  "optionalDependencies": {
+    "argon2": "0.45.1"
   }
 }
