@@ -1,0 +1,22 @@
+{
+  "description": "sf push output (cipher_version 3, suite 0x03, v1 wire format) for a vault-root upload. Decrypt with the root key only: unwrap csk_wrapped under the root key (AES-GCM), derive the ML-KEM secret key with createIdentity({ masterSecret: rootKey }), decrypt the concatenated parts. The header file_id must equal rowId. Names: name_encrypted (v4) opens without a row id; nameEncryptedV6 only with rowId.",
+  "generatedBy": "@shieldfive/cli scripts/generate-vectors.mjs",
+  "rootKey": "AwoRGB8mLTQ7QklQV15lbHN6gYiPlp2kq7K5wMfO1dw=",
+  "rowId": "6b1d3f2a-9c4e-4a7b-8e2d-1f0c5a9b3e74",
+  "name": "Q3 tax return – signed.pdf",
+  "chunkSize": 16,
+  "plaintext": "U2hpZWxkRml2ZSBDTEkgdjMgdmVjdG9yOiBmb3VyIGNodW5rcywgbGFzdCBvbmUgc2hvcnQu",
+  "mlKemPublicKeySha256": "a8879204e83b0668f05df1a48be2e926d76a6458fe0db29a5925a2417285fe5e",
+  "cipherVersion": 3,
+  "cskWrapped": "mB5W9t/NcfwOhlV/KtQFccvKOSNeL9TcaBoIFE+Xsw1snPYWejjp/kzGN/nT78b8",
+  "cskIv": "E8JF+nAOxsIinzCY",
+  "parts": [
+    "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",
+    "AAAAFiwzA6/IbrDc7b8vMr31ooDpOYf5+kc="
+  ],
+  "nameEncrypted": "{\"v\":4,\"ct\":\"FOwLuoQ1BhjAxJ1qPum3rHUXvvq/vYyvF37/cA==\",\"iv\":\"225Eui/ydJ5UW8A4\",\"tag\":\"zllAb/5YyrHP/Uzu37zqVw==\",\"salt\":\"fw1jRU85fGX/8Rj4Xwo2ug==\",\"kdf\":\"interactive\"}",
+  "nameEncryptedV6": "{\"v\":6,\"ct\":\"Bc9cEE+w3pOwTMIyXISE4fqgTP0ObLLHSEo3eQ==\",\"iv\":\"Ec/6viNuYvEtWRkA\",\"tag\":\"IXrRhjYMcbSsoMgs4FZERQ==\",\"salt\":\"OGXsLy16wIYJLAwRNp7ZOw==\",\"kdf\":\"interactive\"}",
+  "nameHash": "v4:6ab8c9d47c1c0130eafbd3431e078d12f495351f50ad73478d3243e637f186ad"
+}

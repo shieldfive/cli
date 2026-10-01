@@ -235,3 +235,110 @@ test('syncOnce isolates a failed upload: it is not recorded and others still syn
     await rm(dir, { recursive: true, force: true })
   }
 })
+
+test('runSync --watch refreshes the session before the access token expires', async () => {
+  const dir = await tmp()
+  try {
+    await writeFile(join(dir, 'a.txt'), 'a')
+    let clock = 1_700_000_000_000
+    const t0 = clock / 1000
+    const refreshes = []
+    const used = []
+    await runSync({
+      cfg: { apiBaseUrl: 'https://api.test' },
+      folder: dir,
+      watch: true,
+      intervalMs: 1,
+      now: () => clock,
+      authAndUnlock: async () => ({
+        accessToken: 'tok-1',
+        refreshToken: 'refresh-1',
+        expiresAt: t0 + 3600,
+        refreshSession: async (token) => {
+          refreshes.push(token)
+          return { accessToken: 'tok-2', refreshToken: 'refresh-2', expiresAt: t0 + 7200 }
+        },
+        rootKey: new Uint8Array(32),
+      }),
+      uploadFn: async ({ name, accessToken }) => {
+        used.push([name, accessToken])
+        if (name === 'a.txt') {
+          // An hour goes by; a new file appears for the next pass.
+          clock += 3590 * 1000
+          await writeFile(join(dir, 'b.txt'), 'b')
+        } else {
+          process.emit('SIGINT')
+        }
+        return { fileId: `id-${name}` }
+      },
+      log: () => {},
+      status: () => {},
+    })
+    assert.deepEqual(used, [
+      ['a.txt', 'tok-1'],
+      ['b.txt', 'tok-2'],
+    ])
+    assert.deepEqual(refreshes, ['refresh-1'], 'one refresh, with the token held')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('runSync --watch stops with an error when the session cannot be refreshed', async () => {
+  const dir = await tmp()
+  try {
+    await writeFile(join(dir, 'a.txt'), 'a')
+    const clock = 1_700_000_000_000
+    const used = []
+    await assert.rejects(
+      runSync({
+        cfg: { apiBaseUrl: 'https://api.test' },
+        folder: dir,
+        watch: true,
+        intervalMs: 1,
+        now: () => clock,
+        authAndUnlock: async () => ({
+          accessToken: 'tok-1',
+          refreshToken: 'refresh-1',
+          expiresAt: clock / 1000 + 30, // already inside the refresh margin
+          refreshSession: async () => {
+            throw new Error('Session refresh failed (HTTP 400): Invalid Refresh Token')
+          },
+          rootKey: new Uint8Array(32),
+        }),
+        uploadFn: async ({ name, accessToken }) => {
+          used.push([name, accessToken])
+          return { fileId: 'x' }
+        },
+        log: () => {},
+        status: () => {},
+      }),
+      /Session refresh failed/,
+    )
+    assert.deepEqual(used, [], 'nothing is attempted with a token about to expire')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('runSync (single pass) exits with an error when a file failed', async () => {
+  const dir = await tmp()
+  try {
+    await writeFile(join(dir, 'bad.txt'), 'x')
+    await assert.rejects(
+      runSync({
+        cfg: { apiBaseUrl: 'https://api.test' },
+        folder: dir,
+        authAndUnlock: async () => ({ accessToken: 'tok', rootKey: new Uint8Array(32) }),
+        uploadFn: async () => {
+          throw new Error('server said no')
+        },
+        log: () => {},
+        status: () => {},
+      }),
+      /1 file\(s\) failed/,
+    )
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})

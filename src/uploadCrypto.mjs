@@ -1,7 +1,7 @@
-// ShieldFive CLI — upload field crypto, ported byte-for-byte from the apps
-// (mobile/src/features/crypto/encryptionCompat.ts). These produce the fields the
-// `create-upload-session` endpoint expects: the wrapped content key, the v4
-// filename envelope, and the keyed name hash. Same @noble versions as the apps
+// ShieldFive CLI — upload field crypto. The key wrap, v4 filename envelope and
+// keyed name hash are ported byte-for-byte from the apps
+// (mobile/src/features/crypto/encryptionCompat.ts); the file body is the web's
+// default format, written by @shieldfive/crypto (see the end of this file). Same @noble versions as the apps
 // (@noble/ciphers@2, @noble/hashes@2) so the bytes match.
 
 import { webcrypto } from 'node:crypto'
@@ -11,6 +11,11 @@ import { argon2id } from '@noble/hashes/argon2.js'
 import { hmac } from '@noble/hashes/hmac.js'
 import { sha256 } from '@noble/hashes/sha2.js'
 import sodium from 'libsodium-wrappers-sumo'
+
+import { parseHeader } from '@shieldfive/crypto/format'
+import { createIdentity } from '@shieldfive/crypto/identity'
+import { encryptStreamPqHybridV1 } from '@shieldfive/crypto/streams/pq-hybrid-v1'
+import { buildUploadProofV3 } from '@shieldfive/crypto/vault'
 
 // libsodium's Argon2id (crypto_pwhash) is byte-identical to @noble's at the same
 // params but ~15x faster (native/WASM vs pure JS). It is used for the ENCRYPT
@@ -43,36 +48,8 @@ export function aesGcmEncrypt(key, iv, plaintext) {
   return gcm(key, iv).encrypt(plaintext)
 }
 
-// WebCrypto AES-GCM. Its output is ciphertext||tag with a 16-byte (128-bit)
-// tag — byte-identical to @noble's gcm().encrypt for the same key, 12-byte
-// nonce and no additional data — so ciphertexts, the SHA-1 digests Backblaze
-// checks, and the HMAC upload proof are all unchanged. Native WebCrypto runs
-// at ~5 GiB/s versus @noble's ~70 MiB/s, so it is used for the per-chunk file
-// encryption (the throughput-bound path). @noble stays for the once-per-file
-// key wrap and filename metadata, and for all decryption. It is async because
-// subtle.encrypt is; the chunk path (encryptChunkWithDigest) is already async.
-async function aesGcmEncryptSubtle(key, iv, plaintext) {
-  const cryptoKey = await webcrypto.subtle.importKey(
-    'raw',
-    key,
-    { name: 'AES-GCM' },
-    false,
-    ['encrypt'],
-  )
-  const ciphertext = await webcrypto.subtle.encrypt(
-    { name: 'AES-GCM', iv },
-    cryptoKey,
-    plaintext,
-  )
-  return new Uint8Array(ciphertext)
-}
-
 export function generateRandomKeyB64(bytes = 32) {
   return bytesToBase64(randomBytes(bytes))
-}
-
-export function generateNoncePrefixB64() {
-  return bytesToBase64(randomBytes(4))
 }
 
 export function wrapKeyB64({ wrappingKeyB64, keyToWrapB64 }) {
@@ -148,9 +125,7 @@ export function decryptMetadataV4(payload, rootKeySecret) {
   return new TextDecoder().decode(plaintext)
 }
 
-// ── File chunk encryption (suite 0x01 AES-GCM) + Backblaze upload proof ───────
-
-const UPLOAD_PROOF_VERSION = 1
+// ── Storage-part digests ────────────────────────────────────────────────────
 
 function hexToBytes(hex) {
   const out = new Uint8Array(hex.length / 2)
@@ -160,87 +135,9 @@ function hexToBytes(hex) {
   return out
 }
 
-// nonce = 4-byte random prefix || 8-byte big-endian chunk counter.
-export async function encryptFileChunk({ cskB64, noncePrefixB64, chunkIndex, plaintext }) {
-  const noncePrefix = base64ToBytes(noncePrefixB64)
-  if (noncePrefix.length !== 4) throw new Error('Invalid nonce prefix')
-  const nonce = new Uint8Array(12)
-  nonce.set(noncePrefix, 0)
-  let counter = BigInt(chunkIndex)
-  for (let i = 0; i < 8; i += 1) {
-    nonce[11 - i] = Number(counter & 0xffn)
-    counter >>= 8n
-  }
-  return aesGcmEncryptSubtle(base64ToBytes(cskB64), nonce, plaintext)
-}
-
-function buildUploadProofPrefix({ cipherVersion, chunkSize, noncePrefixBytes }) {
-  const size = Math.floor(chunkSize)
-  if (!Number.isFinite(size) || size <= 0) {
-    throw new Error('Invalid chunk size for upload proof')
-  }
-  if (noncePrefixBytes.length !== 4) {
-    throw new Error('Invalid nonce prefix length for upload proof')
-  }
-  const prefix = new Uint8Array(1 + 1 + 4 + 4)
-  prefix[0] = UPLOAD_PROOF_VERSION
-  prefix[1] = cipherVersion
-  new DataView(prefix.buffer).setUint32(2, size, false)
-  prefix.set(noncePrefixBytes, 6)
-  return prefix
-}
-
-export function computeAesGcmUploadProof({
-  proofKeyHex,
-  cipherVersion,
-  chunkSize,
-  noncePrefixB64,
-  ciphertextChunk,
-}) {
-  const proofKey = hexToBytes(proofKeyHex)
-  const prefix = buildUploadProofPrefix({
-    cipherVersion,
-    chunkSize,
-    noncePrefixBytes: base64ToBytes(noncePrefixB64),
-  })
-  const payload = new Uint8Array(prefix.length + ciphertextChunk.length)
-  payload.set(prefix, 0)
-  payload.set(ciphertextChunk, prefix.length)
-  return bytesToHex(hmac(sha256, proofKey, payload))
-}
-
 export async function sha1Hex(bytes) {
   const digest = await webcrypto.subtle.digest('SHA-1', bytes)
   return bytesToHex(new Uint8Array(digest))
-}
-
-// Encrypt one chunk and produce its SHA-1 (for Backblaze) and the upload proof.
-export async function encryptChunkWithDigest({
-  cskB64,
-  noncePrefixB64,
-  chunkIndex,
-  plaintext,
-  proofKeyHex,
-  chunkSize,
-}) {
-  const ciphertext = await encryptFileChunk({
-    cskB64,
-    noncePrefixB64,
-    chunkIndex,
-    plaintext,
-  })
-  const digest = await sha1Hex(ciphertext)
-  const proofHex =
-    proofKeyHex && chunkSize
-      ? computeAesGcmUploadProof({
-          proofKeyHex,
-          cipherVersion: 1,
-          chunkSize,
-          noncePrefixB64,
-          ciphertextChunk: ciphertext,
-        })
-      : undefined
-  return { ciphertext, sha1Hex: digest, proofHex }
 }
 
 // Multipart ciphertextHash — the value `complete-upload` checks against the
@@ -261,4 +158,147 @@ export async function getCiphertextHashFromParts(partSha1Array) {
     offset += 20
   }
   return sha1Hex(bytes)
+}
+
+// ── File encryption, v1 wire format, suite 0x03 (cipher_version 3) ───────────
+//
+// What the web app writes by default (encryptModal.tsx, `v1-pq-hybrid`), using
+// the same @shieldfive/crypto stream encoder: a MAC'd header carrying
+// plaintext_size and total_chunks, chunk AAD binding index/total/is_final (so a
+// dropped or reordered chunk fails to decrypt), file_id = the server row id (so
+// the blob cannot be moved onto another row), and ML-KEM-1024 + X25519 hybrid
+// key encapsulation to the owner's vault identity.
+//
+// This replaces the legacy v0 writer (suite 0x01 chunks under a random 4-byte
+// nonce prefix, no header): no truncation detection, no file binding, no PQ.
+// The spec (crypto spec/format-v0.md) forbids new v0 writes.
+
+export const V1_CHUNK_SIZE = 5 * 1024 * 1024
+export const CIPHER_VERSION_PQ = 3
+const FRAME_LENGTH_BYTES = 4
+
+export function uuidToBytes(id) {
+  const hex = String(id).replace(/-/g, '')
+  if (!/^[0-9a-f]{32}$/i.test(hex)) throw new Error(`Not a UUID: ${id}`)
+  return hexToBytes(hex.toLowerCase())
+}
+
+// The owner's ML-KEM public key, derived from the root key exactly as the web
+// keyring does (utils/pqIdentity.ts: createIdentity with the root key as the
+// master secret; userId does not affect the key bytes). Derived locally, never
+// taken from the server, so a server cannot substitute a recipient. Cached by a
+// hash of the root key: the public key is not secret, the derivation is not free.
+const identityCache = new Map()
+export async function vaultMlKemPublicKey(rootKey) {
+  const id = bytesToHex(sha256(rootKey))
+  let pk = identityCache.get(id)
+  if (!pk) {
+    const identity = await createIdentity({ userId: 'shieldfive-cli', masterSecret: rootKey })
+    identity.mlKemSecretKey?.fill?.(0)
+    pk = identity.publicBundle.mlKemPublicKey
+    identityCache.set(id, pk)
+  }
+  return pk
+}
+
+function toReadableStream(iterable) {
+  const it = iterable[Symbol.asyncIterator]()
+  return new ReadableStream({
+    async pull(controller) {
+      const { value, done } = await it.next()
+      if (done) controller.close()
+      else controller.enqueue(value)
+    },
+    async cancel() {
+      await it.return?.()
+    },
+  })
+}
+
+/**
+ * Encrypt a plaintext chunk stream as one suite-0x03 object and yield it as
+ * storage parts: part 0 is `header || frame_0`, part i is `frame_i`. That is the
+ * layout the server's proof verifier and the web uploader use (one encrypted
+ * chunk per storage part). The split is made from the bytes themselves (header
+ * length, then each frame's length prefix), not from how the encoder happens
+ * to enqueue its output.
+ */
+export async function* encryptPartsV3({
+  plaintextChunks,
+  plaintextSize,
+  chunkSize,
+  envelopeKey,
+  fileId,
+  recipientPublicKey,
+}) {
+  const { ciphertext, combinedKey } = await encryptStreamPqHybridV1(toReadableStream(plaintextChunks), {
+    recipientPublicKey,
+    envelopeKey,
+    plaintextSize,
+    chunkSize,
+    fileId,
+  })
+  // combinedKey is used by the stream while it runs; wiped in the finally below.
+
+  const reader = ciphertext.getReader()
+  let buf = new Uint8Array(0)
+  let done = false
+  const pull = async () => {
+    const r = await reader.read()
+    if (r.done) {
+      done = true
+      return
+    }
+    const next = new Uint8Array(buf.length + r.value.length)
+    next.set(buf, 0)
+    next.set(r.value, buf.length)
+    buf = next
+  }
+  const take = (n) => {
+    const out = buf.slice(0, n)
+    buf = buf.slice(n)
+    return out
+  }
+  const readFrame = async () => {
+    while (buf.length < FRAME_LENGTH_BYTES && !done) await pull()
+    if (buf.length === 0 && done) return null
+    if (buf.length < FRAME_LENGTH_BYTES) throw new Error('Encrypted stream ended inside a chunk frame.')
+    const len = new DataView(buf.buffer, buf.byteOffset, buf.byteLength).getUint32(0, false)
+    while (buf.length < FRAME_LENGTH_BYTES + len && !done) await pull()
+    if (buf.length < FRAME_LENGTH_BYTES + len) throw new Error('Encrypted stream ended inside a chunk frame.')
+    return take(FRAME_LENGTH_BYTES + len)
+  }
+
+  try {
+    // Header: parse as soon as enough bytes are buffered.
+    let headerLength = null
+    while (headerLength === null) {
+      try {
+        headerLength = parseHeader(buf).headerLength
+      } catch (err) {
+        if (done) throw err
+        await pull()
+      }
+    }
+    const header = take(headerLength)
+    const first = await readFrame()
+    if (!first) throw new Error('Encrypted stream has no chunks.')
+    const part0 = new Uint8Array(header.length + first.length)
+    part0.set(header, 0)
+    part0.set(first, header.length)
+    yield part0
+    for (;;) {
+      const frame = await readFrame()
+      if (!frame) break
+      yield frame
+    }
+  } finally {
+    reader.releaseLock()
+    combinedKey.fill(0)
+  }
+}
+
+/** The suite-0x03 upload proof, from the library both other writers use. */
+export function computeV3UploadProof({ proofKeyHex, part0 }) {
+  return buildUploadProofV3({ proofKeyHex, ciphertext: part0 })
 }

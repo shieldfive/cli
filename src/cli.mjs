@@ -143,7 +143,7 @@ async function authAndUnlock(cfg) {
   const { fetchAndUnlockVault } = await import('./vault.mjs')
 
   process.stderr.write('signing in…\n')
-  const { accessToken } = await signIn({
+  const { accessToken, refreshToken, expiresAt } = await signIn({
     apiBaseUrl: cfg.apiBaseUrl,
     supabaseUrl: cfg.supabaseUrl,
     anonKey: cfg.anonKey,
@@ -158,7 +158,13 @@ async function authAndUnlock(cfg) {
     accessToken,
     password: cfg.vaultPassword,
   })
-  return { accessToken, rootKey }
+  // `sf sync --watch` outlives the access token (about an hour); it refreshes
+  // through this, the same exchange the agent uses.
+  const refreshSession = async (token) => {
+    const { refreshAccessToken } = await import('./auth.mjs')
+    return refreshAccessToken({ supabaseUrl: cfg.supabaseUrl, anonKey: cfg.anonKey, refreshToken: token })
+  }
+  return { accessToken, refreshToken, expiresAt, refreshSession, rootKey }
 }
 
 async function runningAgent() {
