@@ -35,6 +35,7 @@ function usage() {
       '                              [--interval=<seconds>]  poll interval for --watch (default 5)',
       '  verify <file>...            report whether each file is safely in your vault',
       '  encrypt <folder>            encrypt each file locally, upload nothing',
+      '  inspect <folder>            count a migration source recursively; upload nothing',
       '  --help',
       '',
       'After sf login, push / sync / verify go through the agent and need nothing',
@@ -547,6 +548,12 @@ async function main() {
   } else if (cmd === 'encrypt') {
     if (!folder) throw new Error('encrypt needs a <folder>')
     await cmdEncrypt(folder)
+  } else if (cmd === 'inspect') {
+    if (!folder) throw new Error('inspect needs a <folder>')
+    const { inspectMigrationSource } = await import('./migrationInventory.mjs')
+    const result = await inspectMigrationSource(folder)
+    process.stdout.write(JSON.stringify(result) + '\n')
+    if (result.skipped) process.exitCode = 2
   } else if (cmd === 'push') {
     if (!folder) throw new Error('push needs a <folder>')
     await cmdPush(folder)
