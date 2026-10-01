@@ -7,7 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Security
+
+- **`sf push` and `sf sync` write the web's default format.** They wrote the
+  deprecated v0 format (AES-GCM chunks, no header), which the format spec
+  forbids for new writes: a server could drop trailing chunks and the file
+  still decrypted, could move a file's bytes onto another row, and there was no
+  post-quantum layer despite the description. Uploads are now `cipher_version`
+  3 (suite 0x03, ML-KEM-1024 + X25519 hybrid, v1 wire format) written by
+  `@shieldfive/crypto`'s stream encoder, with the row id as the header's
+  `file_id` and the filename re-sealed bound to the row (v6) at finalize. The
+  recipient key is derived locally from the root key, never fetched. Files
+  uploaded by earlier versions still open in the apps. Shared decrypt vectors:
+  `test/vectors/v3-upload.json`.
+- `@shieldfive/crypto` is pinned to `~1.0.1` (was `^1.0.0-beta.1`, which a
+  global install could float to any 1.x).
+
 ### Fixed
+
+- `sf sync --watch` refreshes its session before the access token expires.
+  It signed in once, so after about an hour every pass failed every changed
+  file while the process kept running. If the session cannot be refreshed, sync
+  now stops with an error. A single `sf sync` pass with failed files exits
+  non-zero.
 
 - **Sign-in works for accounts on ShieldFive's current sign-in scheme.** 0.3.0
   posted your password straight to Supabase, which fails for every account that

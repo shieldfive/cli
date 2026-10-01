@@ -10,25 +10,37 @@
 //             (server-side) at finalize. Unchanged.
 //
 // Chunks are read from disk one at a time (never the whole file into memory),
-// so a multi-gigabyte upload holds at most one chunk (~5 MiB) resident.
+// so a multi-gigabyte upload holds at most a few chunks (~5 MiB each) resident.
+//
+// Format: cipher_version 3, the web's default (suite 0x03, v1 wire format; see
+// uploadCrypto.mjs). Every storage part is one encrypted chunk frame; part 1
+// also carries the header. The header's file_id is the row id the server
+// assigned at create-upload-session, so the stored object is bound to its row.
 
 import { open } from 'node:fs/promises'
 
+import { encryptNameV6 } from '@shieldfive/crypto/vault'
+
 import {
+  base64ToBytes,
   bytesToBase64,
-  encryptChunkWithDigest,
+  CIPHER_VERSION_PQ,
+  computeV3UploadProof,
   encryptMetadataV4,
-  generateNoncePrefixB64,
+  encryptPartsV3,
   generateRandomKeyB64,
   getCiphertextHashFromParts,
   hashMetadataV4,
+  sha1Hex,
+  uuidToBytes,
+  V1_CHUNK_SIZE,
+  vaultMlKemPublicKey,
   wrapKeyB64,
 } from './uploadCrypto.mjs'
 
 const CREATE_SESSION_PATH = '/api/files/create-upload-session'
 const COMPLETE_PATH = '/api/files/complete-upload'
 const PART_URL_PATH = '/api/files/upload-part-url'
-const CHUNK_SIZE = 5 * 1024 * 1024
 
 // Backblaze documents retrying b2_upload_part on 5xx / network failures, and a
 // part upload is idempotent by (part number, SHA-1) — retrying overwrites the
@@ -81,10 +93,14 @@ export async function createUploadSession({
   size,
 }) {
   const rootKeyB64 = bytesToBase64(rootKey)
+  // The row id does not exist yet, so the first name is the row-unbound v4
+  // envelope (as on the web). finalizeUpload replaces it with a v6 envelope
+  // bound to the row id.
   const nameEnvelope = await encryptMetadataV4(name, rootKeyB64)
+  // For suite 0x03 this is the classical envelope key; csk_wrapped holds it
+  // under the parent key (the root key: sf uploads to the vault root).
   const csk = generateRandomKeyB64()
   const cskEnvelope = wrapKeyB64({ wrappingKeyB64: rootKeyB64, keyToWrapB64: csk })
-  const noncePrefix = generateNoncePrefixB64()
 
   const res = await fetch(new URL(CREATE_SESSION_PATH, apiBaseUrl), {
     method: 'POST',
@@ -92,14 +108,15 @@ export async function createUploadSession({
       Authorization: `Bearer ${accessToken}`,
       'Content-Type': 'application/json',
     },
+    // v1 wire format: no cipher_nonce_prefix and no chunkSize (the server
+    // rejects both; they live in the header).
     body: JSON.stringify({
       name_encrypted: JSON.stringify(nameEnvelope),
       nameHash: hashMetadataV4(name.toLowerCase(), rootKeyB64),
       csk_wrapped: cskEnvelope.wrapped,
       csk_iv: cskEnvelope.iv,
-      cipher_nonce_prefix: noncePrefix,
+      cipherVersion: CIPHER_VERSION_PQ,
       sizeBytes: size,
-      chunkSize: CHUNK_SIZE,
       folderId: null,
       contentType: 'application/octet-stream',
       thumbnail_ciphertext_b64: null,
@@ -112,7 +129,7 @@ export async function createUploadSession({
       `create-upload-session failed (HTTP ${res.status}): ${JSON.stringify(body)}`,
     )
   }
-  return { session: body, csk, noncePrefix }
+  return { session: body, csk }
 }
 
 // Direct upload: a presigned S3 PUT (web b52b4c8 / PR #726), not b2_upload_file.
@@ -255,6 +272,7 @@ async function finalizeUpload({
   partSha1Array,
   proof,
   ciphertextHash,
+  nameEncryptedV6,
 }) {
   const res = await fetch(new URL(COMPLETE_PATH, apiBaseUrl), {
     method: 'POST',
@@ -262,7 +280,7 @@ async function finalizeUpload({
       Authorization: `Bearer ${accessToken}`,
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({ fileId, b2FileId, partSha1Array, proof, ciphertextHash }),
+    body: JSON.stringify({ fileId, b2FileId, partSha1Array, proof, ciphertextHash, nameEncryptedV6 }),
   })
   const body = await res.json().catch(() => ({}))
   if (!res.ok) {
@@ -273,29 +291,20 @@ async function finalizeUpload({
   return body
 }
 
-// Single-chunk file: encrypt the one chunk (AES-GCM, suite 0x01) + SHA-1 +
-// proof, PUT it at the presigned URL, finalize. No b2FileId is sent -- the
-// server HEADs the stored object and derives the storage id itself.
-async function uploadDirect({ apiBaseUrl, accessToken, session, csk, noncePrefix, path, onPlaintextChunk }) {
-  const chunkSize = session.chunkSize ?? CHUNK_SIZE
-  let plaintext = null
-  for await (const chunk of readFileChunks(path, chunkSize)) {
-    if (plaintext !== null) {
+// Single-chunk file: one part (header || frame_0), SHA-1 + proof, PUT it at
+// the presigned URL, finalize. No b2FileId is sent -- the server HEADs the
+// stored object and derives the storage id itself.
+async function uploadDirect({ apiBaseUrl, accessToken, session, parts, nameEncryptedV6 }) {
+  let ciphertext = null
+  for await (const part of parts) {
+    if (ciphertext !== null) {
       throw new Error('Direct upload session is larger than a single chunk.')
     }
-    plaintext = chunk
-    onPlaintextChunk?.(chunk)
+    ciphertext = part
   }
-  if (plaintext === null) plaintext = new Uint8Array(0)
-
-  const { ciphertext, sha1Hex, proofHex } = await encryptChunkWithDigest({
-    cskB64: csk,
-    noncePrefixB64: noncePrefix,
-    chunkIndex: 0,
-    plaintext,
-    proofKeyHex: session.proofKey,
-    chunkSize,
-  })
+  if (ciphertext === null) throw new Error('Direct upload produced no ciphertext.')
+  const sha1 = await sha1Hex(ciphertext)
+  const proof = await computeV3UploadProof({ proofKeyHex: session.proofKey, part0: ciphertext })
 
   await putDirectPresigned({ session, ciphertext })
 
@@ -308,16 +317,17 @@ async function uploadDirect({ apiBaseUrl, accessToken, session, csk, noncePrefix
     apiBaseUrl,
     accessToken,
     fileId: session.fileId,
-    partSha1Array: [sha1Hex],
-    proof: proofHex,
-    ciphertextHash: sha1Hex,
+    partSha1Array: [sha1],
+    proof,
+    ciphertextHash: sha1,
+    nameEncryptedV6,
   })
 }
 
-// Multipart file: stream each chunk, encrypt (per-chunk nonce via chunkIndex),
-// b2_upload_part, collect part SHA-1s. The upload proof is computed from the
-// FIRST chunk only — the server re-derives it from the first chunkSize+tag
-// bytes of the stored object, which is exactly part 1. b2FileId is the
+// Multipart file: stream each encrypted part (one chunk frame each; part 1
+// also carries the header), b2_upload_part, collect part SHA-1s. The upload
+// proof covers the header and the first frame only — the server re-derives it
+// from the start of the stored object, which is exactly part 1. b2FileId is the
 // large-file id from the session; the server calls b2_finish_large_file with
 // the ordered part hashes at finalize.
 // Bounded concurrency for multipart part uploads. The serial version left the
@@ -337,11 +347,10 @@ function resolveUploadConcurrency() {
   return DEFAULT_UPLOAD_CONCURRENCY
 }
 
-async function uploadMultipart({ apiBaseUrl, accessToken, session, csk, noncePrefix, path, onPlaintextChunk }) {
+async function uploadMultipart({ apiBaseUrl, accessToken, session, parts, nameEncryptedV6 }) {
   if (!session.b2FileId) {
     throw new Error('Multipart upload session is missing storage id (b2FileId).')
   }
-  const chunkSize = session.chunkSize ?? CHUNK_SIZE
   const concurrency = resolveUploadConcurrency()
 
   // Part SHA-1s keyed by chunkIndex, NOT push order, so parts finishing out of
@@ -360,18 +369,13 @@ async function uploadMultipart({ apiBaseUrl, accessToken, session, csk, noncePre
     (await refreshUploadPartUrl({ apiBaseUrl, accessToken, fileId: session.fileId }))
 
   const inFlight = new Set()
-  const dispatch = (chunkIndex, plaintext) => {
+  const dispatch = (chunkIndex, ciphertext) => {
     const run = (async () => {
       try {
-        const encrypted = await encryptChunkWithDigest({
-          cskB64: csk,
-          noncePrefixB64: noncePrefix,
-          chunkIndex,
-          plaintext,
-          proofKeyHex: chunkIndex === 0 ? session.proofKey : undefined,
-          chunkSize: chunkIndex === 0 ? chunkSize : undefined,
-        })
-        if (chunkIndex === 0) proof = encrypted.proofHex
+        const encrypted = { ciphertext, sha1Hex: await sha1Hex(ciphertext) }
+        if (chunkIndex === 0) {
+          proof = await computeV3UploadProof({ proofKeyHex: session.proofKey, part0: ciphertext })
+        }
 
         const slot = await acquireUrl()
         const updated = await putPartToBackblaze({
@@ -397,8 +401,7 @@ async function uploadMultipart({ apiBaseUrl, accessToken, session, csk, noncePre
   }
 
   let chunkIndex = 0
-  for await (const plaintext of readFileChunks(path, chunkSize)) {
-    onPlaintextChunk?.(plaintext)
+  for await (const ciphertext of parts) {
     if (firstError) break
     // Backpressure: hold at most `concurrency` parts in flight. inFlight is
     // non-empty when this runs (size >= concurrency >= 1), so race never hangs.
@@ -407,7 +410,7 @@ async function uploadMultipart({ apiBaseUrl, accessToken, session, csk, noncePre
       if (firstError) break
     }
     if (firstError) break
-    dispatch(chunkIndex, plaintext)
+    dispatch(chunkIndex, ciphertext)
     chunkIndex += 1
   }
 
@@ -437,6 +440,7 @@ async function uploadMultipart({ apiBaseUrl, accessToken, session, csk, noncePre
     partSha1Array,
     proof,
     ciphertextHash,
+    nameEncryptedV6,
   })
 }
 
@@ -445,31 +449,62 @@ async function uploadMultipart({ apiBaseUrl, accessToken, session, csk, noncePre
 // chunks to record what was actually uploaded; hashing the file separately,
 // before or after, cannot see a change made and undone while it was being read.
 export async function uploadFile({ apiBaseUrl, accessToken, rootKey, name, path, size, onPlaintextChunk }) {
-  const { session, csk, noncePrefix } = await createUploadSession({
+  // Derived before anything is sent, so a vault whose identity cannot be
+  // derived fails before a session (and a pending row) exists.
+  const recipientPublicKey = await vaultMlKemPublicKey(rootKey)
+  const { session, csk } = await createUploadSession({
     apiBaseUrl,
     accessToken,
     rootKey,
     name,
     size,
   })
+  if (!session.proofKey) throw new Error('Upload session is missing its proof key.')
 
-  if (session.uploadKind === 'direct') {
-    // No authToken and no storagePath check: since web b52b4c8 (PR #726) the
-    // direct path is a presigned S3 PUT, so the signature inside uploadUrl is
-    // the only credential and it already binds the object key. Requiring the
-    // token the server stopped issuing is what made every <= 5 MiB upload fail
-    // from 2026-09-03. The 'large' branch below still needs both.
-    if (!session.uploadUrl) {
-      throw new Error('Direct upload session is missing an upload URL.')
+  // The server's v1 chunk size (5 MiB): each encrypted chunk is one storage part.
+  const chunkSize = session.chunkSize ?? V1_CHUNK_SIZE
+  async function* plaintextChunks() {
+    for await (const chunk of readFileChunks(path, chunkSize)) {
+      onPlaintextChunk?.(chunk)
+      yield chunk
     }
-    await uploadDirect({ apiBaseUrl, accessToken, session, csk, noncePrefix, path, onPlaintextChunk })
-  } else if (session.uploadKind === 'large') {
-    if (!session.uploadUrl || !session.authToken) {
-      throw new Error('Multipart upload session is missing credentials.')
+  }
+  const envelopeKey = base64ToBytes(csk)
+  const parts = encryptPartsV3({
+    plaintextChunks: plaintextChunks(),
+    plaintextSize: size,
+    chunkSize,
+    envelopeKey,
+    fileId: uuidToBytes(session.fileId),
+    recipientPublicKey,
+  })
+  // The name, re-sealed with the row id as AAD (v6), replaces the v4 one at
+  // finalize, so the backend cannot relabel this row with another file's name.
+  const nameEncryptedV6 = JSON.stringify(
+    await encryptNameV6({ name, folderKey: rootKey, rowId: session.fileId }),
+  )
+
+  try {
+    if (session.uploadKind === 'direct') {
+      // No authToken and no storagePath check: since web b52b4c8 (PR #726) the
+      // direct path is a presigned S3 PUT, so the signature inside uploadUrl is
+      // the only credential and it already binds the object key. Requiring the
+      // token the server stopped issuing is what made every <= 5 MiB upload fail
+      // from 2026-09-03. The 'large' branch below still needs both.
+      if (!session.uploadUrl) {
+        throw new Error('Direct upload session is missing an upload URL.')
+      }
+      await uploadDirect({ apiBaseUrl, accessToken, session, parts, nameEncryptedV6 })
+    } else if (session.uploadKind === 'large') {
+      if (!session.uploadUrl || !session.authToken) {
+        throw new Error('Multipart upload session is missing credentials.')
+      }
+      await uploadMultipart({ apiBaseUrl, accessToken, session, parts, nameEncryptedV6 })
+    } else {
+      throw new Error(`Unknown uploadKind "${session.uploadKind}" for "${name}".`)
     }
-    await uploadMultipart({ apiBaseUrl, accessToken, session, csk, noncePrefix, path, onPlaintextChunk })
-  } else {
-    throw new Error(`Unknown uploadKind "${session.uploadKind}" for "${name}".`)
+  } finally {
+    envelopeKey.fill(0)
   }
 
   return { fileId: session.fileId }

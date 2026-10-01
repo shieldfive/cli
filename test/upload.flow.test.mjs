@@ -19,16 +19,11 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 
-import { gcm } from '@noble/ciphers/aes.js'
+import { decryptName, parseNameEnvelope } from '@shieldfive/crypto/vault'
 
 import { uploadFile } from '../src/upload.mjs'
-import {
-  base64ToBytes,
-  bytesToBase64,
-  computeAesGcmUploadProof,
-  getCiphertextHashFromParts,
-  unwrapKeyB64,
-} from '../src/uploadCrypto.mjs'
+import { getCiphertextHashFromParts } from '../src/uploadCrypto.mjs'
+import { concat, independentV3Proof, referenceDecrypt, uuidBytes } from './v1Reference.mjs'
 
 const API = 'https://api.test'
 const PROOF_KEY = 'ab'.repeat(32) // 64 hex, shape the server issues
@@ -43,18 +38,9 @@ function jsonResponse(status, body) {
   }
 }
 
-// Rebuild the 12-byte nonce the way encryptFileChunk / the apps do:
-// 4-byte prefix || 8-byte big-endian chunk counter.
-function nonceFor(noncePrefixB64, chunkIndex) {
-  const nonce = new Uint8Array(12)
-  nonce.set(base64ToBytes(noncePrefixB64), 0)
-  let counter = BigInt(chunkIndex)
-  for (let i = 0; i < 8; i += 1) {
-    nonce[11 - i] = Number(counter & 0xffn)
-    counter >>= 8n
-  }
-  return nonce
-}
+// Row ids are UUIDs: the header's file_id is the row id's 16 bytes.
+const FILE_ID = '3f1c2a9e-7b4d-4c1e-9a2f-0d6e8b5c4a71'
+const DIRECT_FILE_ID = '9e2b7c4d-1a3f-4e8b-8c6d-5f0a2b9e7d13'
 
 async function withTempFile(content, fn) {
   const dir = await mkdtemp(join(tmpdir(), 'sf-cli-flow-'))
@@ -91,7 +77,7 @@ test('multipart push: parts, nonce sequencing, first-chunk proof, ciphertextHash
       createBody = JSON.parse(init.body)
       return jsonResponse(200, {
         uploadKind: 'large',
-        fileId: 'file-abc',
+        fileId: FILE_ID,
         uploadUrl: 'https://b2.test/part',
         authToken: 'tok-initial',
         chunkSize,
@@ -164,48 +150,50 @@ test('multipart push: parts, nonce sequencing, first-chunk proof, ciphertextHash
   assert.equal(parts[0].authToken, 'tok-refreshed')
   assert.equal(parts[1].authToken, 'tok-refreshed')
 
-  // Recover the content key from the create-session envelope (the server can't,
-  // but we hold the rootKey) and decrypt each part with its per-chunk nonce.
-  const cskB64 = unwrapKeyB64({
-    wrappingKeyB64: bytesToBase64(rootKey),
-    wrappedKeyB64: createBody.csk_wrapped,
-    ivB64: createBody.csk_iv,
-  })
-  const noncePrefixB64 = createBody.cipher_nonce_prefix
-  const decrypted = []
+  // The web's default format, not v0: cipher_version 3 and none of the v0-only
+  // fields (the server rejects them for the v1 wire format).
+  assert.equal(createBody.cipherVersion, 3)
+  assert.ok(!('cipher_nonce_prefix' in createBody), 'no v0 nonce prefix')
+  assert.ok(!('chunkSize' in createBody), 'no v0 chunk size')
+
   parts.forEach((part, i) => {
     // Each part body's SHA-1 must equal the header the client sent to Backblaze.
     assert.equal(part.sha1, sha1HexOf(part.body), `part ${i + 1} sha1`)
-    const plain = gcm(base64ToBytes(cskB64), nonceFor(noncePrefixB64, i)).decrypt(part.body)
-    decrypted.push(plain)
   })
-  const joined = new Uint8Array(20)
-  let off = 0
-  for (const c of decrypted) {
-    joined.set(c, off)
-    off += c.length
-  }
-  assert.deepEqual(joined, content, 'reassembled plaintext == original file')
+  // The stored object (parts in order) opens through the reference decryptor
+  // with only the owner's root key, and is bound to its row.
+  const stored = concat(parts.map((p) => p.body))
+  const { plaintext, header } = await referenceDecrypt({
+    stored,
+    rootKey,
+    cskWrapped: createBody.csk_wrapped,
+    cskIv: createBody.csk_iv,
+  })
+  assert.deepEqual(plaintext, content, 'reassembled plaintext == original file')
+  assert.equal(header.suite, 3)
+  assert.deepEqual(header.fileId, uuidBytes(FILE_ID), 'header file_id is the row id')
+  assert.equal(header.totalChunks, 3)
+  assert.equal(header.plaintextSize, 20)
 
   // Finalize payload matches the server's expectations exactly.
   const partSha1Array = parts.map((p) => p.sha1)
-  assert.equal(finalizeBody.fileId, 'file-abc')
+  assert.equal(finalizeBody.fileId, FILE_ID)
   assert.equal(finalizeBody.b2FileId, 'b2-large-1') // the large-file id, not a part id
   assert.deepEqual(finalizeBody.partSha1Array, partSha1Array)
   assert.equal(
     finalizeBody.ciphertextHash,
     await getCiphertextHashFromParts(partSha1Array),
   )
-  // Proof is computed from the FIRST chunk only (server re-reads chunkSize+tag).
-  assert.equal(
-    finalizeBody.proof,
-    computeAesGcmUploadProof({
-      proofKeyHex: PROOF_KEY,
-      cipherVersion: 1,
-      chunkSize,
-      noncePrefixB64,
-      ciphertextChunk: parts[0].body,
-    }),
+  // Proof covers header || frame_0, which is exactly part 1.
+  assert.equal(finalizeBody.proof, independentV3Proof(PROOF_KEY, parts[0].body))
+
+  // The name is re-sealed bound to the row (v6) at finalize.
+  const v6 = parseNameEnvelope(finalizeBody.nameEncryptedV6)
+  assert.equal(v6.v, 6)
+  assert.equal(await decryptName({ envelope: v6, folderKey: rootKey, rowId: FILE_ID }), 'Secret Q3.pdf')
+  await assert.rejects(
+    decryptName({ envelope: v6, folderKey: rootKey, rowId: DIRECT_FILE_ID }),
+    'a v6 name does not open for another row',
   )
 })
 
@@ -238,7 +226,7 @@ test('multipart push: parts completing OUT OF ORDER still finalize in chunk orde
       createBody = JSON.parse(init.body)
       return jsonResponse(200, {
         uploadKind: 'large',
-        fileId: 'file-abc',
+        fileId: FILE_ID,
         uploadUrl: 'https://b2.test/part-seed',
         authToken: 'tok-seed',
         chunkSize,
@@ -329,35 +317,23 @@ test('multipart push: parts completing OUT OF ORDER still finalize in chunk orde
   )
 
   // Reassemble in chunk order and decrypt: the plaintext must equal the file.
-  const cskB64 = unwrapKeyB64({
-    wrappingKeyB64: bytesToBase64(rootKey),
-    wrappedKeyB64: createBody.csk_wrapped,
-    ivB64: createBody.csk_iv,
-  })
-  const noncePrefixB64 = createBody.cipher_nonce_prefix
   const bodyByPart = new Map(parts.map((p) => [p.partNumber, p.body]))
-  const joined = new Uint8Array(content.length)
-  let off = 0
+  const ordered = []
   for (let i = 0; i < partCount; i += 1) {
     const body = bodyByPart.get(i + 1)
     assert.equal(sha1ByPart.get(i + 1), sha1HexOf(body), `part ${i + 1} sha1`)
-    const plain = gcm(base64ToBytes(cskB64), nonceFor(noncePrefixB64, i)).decrypt(body)
-    joined.set(plain, off)
-    off += plain.length
+    ordered.push(body)
   }
-  assert.deepEqual(joined, content, 'reassembled plaintext == original file')
+  const { plaintext } = await referenceDecrypt({
+    stored: concat(ordered),
+    rootKey,
+    cskWrapped: createBody.csk_wrapped,
+    cskIv: createBody.csk_iv,
+  })
+  assert.deepEqual(plaintext, content, 'reassembled plaintext == original file')
 
-  // Proof is still computed from chunk 0 (part 1), regardless of completion order.
-  assert.equal(
-    finalizeBody.proof,
-    computeAesGcmUploadProof({
-      proofKeyHex: PROOF_KEY,
-      cipherVersion: 1,
-      chunkSize,
-      noncePrefixB64,
-      ciphertextChunk: bodyByPart.get(1),
-    }),
-  )
+  // Proof is still computed from part 1, regardless of completion order.
+  assert.equal(finalizeBody.proof, independentV3Proof(PROOF_KEY, bodyByPart.get(1)))
 })
 
 test('multipart push: a 5xx on a part is retried with a fresh URL and succeeds', async () => {
@@ -381,7 +357,7 @@ test('multipart push: a 5xx on a part is retried with a fresh URL and succeeds',
     if (url === `${API}/api/files/create-upload-session`) {
       return jsonResponse(200, {
         uploadKind: 'large',
-        fileId: 'file-abc',
+        fileId: FILE_ID,
         uploadUrl: 'https://b2.test/part',
         authToken: 'tok-initial',
         chunkSize,
@@ -444,7 +420,7 @@ test('multipart push: a 5xx on a part is retried with a fresh URL and succeeds',
     parts.map((p) => p.partNumber),
     [1, 2],
   )
-  assert.equal(finalizeBody.fileId, 'file-abc')
+  assert.equal(finalizeBody.fileId, FILE_ID)
 })
 
 test('direct push: presigned PUT, no Authorization, no b2FileId at finalize', async () => {
@@ -468,7 +444,7 @@ test('direct push: presigned PUT, no Authorization, no b2FileId at finalize', as
       // threw 'Direct upload session is missing credentials.'
       return jsonResponse(200, {
         uploadKind: 'direct',
-        fileId: 'file-direct',
+        fileId: DIRECT_FILE_ID,
         uploadUrl: 'https://b2.test/direct',
         chunkSize: 5 * 1024 * 1024,
         contentType: 'application/octet-stream',
@@ -525,16 +501,16 @@ test('direct push: presigned PUT, no Authorization, no b2FileId at finalize', as
     'Content-Type is the only header the presigned PUT may carry',
   )
 
-  const cskB64 = unwrapKeyB64({
-    wrappingKeyB64: bytesToBase64(rootKey),
-    wrappedKeyB64: createBody.csk_wrapped,
-    ivB64: createBody.csk_iv,
+  assert.equal(createBody.cipherVersion, 3)
+  const { plaintext, header } = await referenceDecrypt({
+    stored: putBody,
+    rootKey,
+    cskWrapped: createBody.csk_wrapped,
+    cskIv: createBody.csk_iv,
   })
-  const plain = gcm(
-    base64ToBytes(cskB64),
-    nonceFor(createBody.cipher_nonce_prefix, 0),
-  ).decrypt(putBody)
-  assert.deepEqual(plain, content)
+  assert.deepEqual(plaintext, content)
+  assert.deepEqual(header.fileId, uuidBytes(DIRECT_FILE_ID), 'header file_id is the row id')
+  assert.equal(finalizeBody.proof, independentV3Proof(PROOF_KEY, putBody))
 
   // A presigned PUT returns an ETag, not a Backblaze file id. Forwarding it
   // would be persisted verbatim into files.b2_file_id; the server HEADs the

@@ -11,8 +11,9 @@
 
 The point of this tool being open source is that you do not have to trust a
 marketing claim. The plaintext of your files is never sent to a ShieldFive
-server. The only bytes that leave your machine are AES-GCM ciphertext and a
-short cryptographic proof. Two files carry the whole story:
+server. The only bytes that leave your machine are ciphertext (post-quantum
+hybrid: ML-KEM-1024 + X25519 key encapsulation, AES-256-GCM chunks) and a short
+cryptographic proof. Two files carry the whole story:
 
 - [`src/uploadCrypto.mjs`](src/uploadCrypto.mjs) — the encryption applied to
   every chunk and to the filename.
@@ -216,24 +217,36 @@ The full design, including the threat model, is in
 
 ## How the upload works (for auditors)
 
-The upload uses **chunked AES-GCM** for file content and issues a
-server-verified HMAC proof. (The `sf encrypt` demo uses the post-quantum hybrid
-suite; the sync/push path uses AES-GCM, which is what the vault's upload
-protocol and server-side proof expect.)
+Uploads are written in the format the web app writes by default:
+`cipher_version` 3, suite `0x03` (post-quantum hybrid) in the v1 wire format
+(`@shieldfive/crypto` `spec/format-v1.md`), using the library's own stream
+encoder.
 
 - **Filename** — encrypted with AES-GCM under a key derived from your vault root
-  key via Argon2id (`encryptMetadataV4`). The server stores ciphertext; it never
-  sees the name. A keyed HMAC of the lowercased name (`hashMetadataV4`) lets the
-  server deduplicate without learning the name.
-- **File content** — each chunk is AES-GCM encrypted under a per-file content
-  key (itself wrapped by your root key). The nonce is a 4-byte random prefix
-  followed by an 8-byte big-endian chunk counter, so every chunk has a distinct
-  nonce.
-- **Upload proof** — `HMAC-SHA256(proofKey, prefix || ciphertext)` over the first
-  chunk, where `prefix = [version=1][cipherVersion=1][chunkSize u32 BE][noncePrefix 4]`.
-  The server issues `proofKey` when it creates the session and verifies the proof
-  when finalizing. It ties the stored ciphertext to the session without the
-  server ever seeing plaintext.
+  key via Argon2id (`encryptMetadataV4`), then, at finalize, re-sealed with the
+  file's row id as additional data (v6, `encryptNameV6`), so the server cannot
+  move one file's name onto another row. A keyed HMAC of the lowercased name
+  (`hashMetadataV4`) lets the server deduplicate without learning the name.
+- **File content** — a MAC'd header carries the file's `file_id` (the row id the
+  server assigned, so the stored object is bound to its row), the plaintext size
+  and the chunk count. The content key combines a per-file envelope key (wrapped
+  by your root key in `csk_wrapped`) with an ML-KEM-1024 + X25519 encapsulation
+  to your vault identity, which is derived on this machine from your root key,
+  as the web app derives it; the server cannot substitute a recipient. Each 5 MiB
+  chunk is AES-256-GCM with its index, the total and an is-final flag in the
+  additional data, so a dropped, reordered or truncated chunk fails to decrypt.
+- **Upload proof** — base64 of `[3][3] || HMAC-SHA256(proofKey, [3][3] || header
+  || frame_0)` (`buildUploadProofV3` in `@shieldfive/crypto`, the same function
+  the web and the MCP server use). The server issues `proofKey` when it creates
+  the session and verifies the proof against the stored object when finalizing.
+- **Parts** — each storage part is exactly one encrypted chunk frame; part 1 also
+  carries the header.
+
+Versions up to 0.3.0 wrote the legacy v0 format (AES-GCM chunks under a random
+nonce prefix, no header): no truncation detection, no row binding and no
+post-quantum layer. Files already uploaded that way still open in the apps;
+this client no longer writes it.
+
 - **Direct** (≤ 5 MiB) — the single encrypted chunk is `PUT` at a presigned S3
   URL the server issues with the session. The URL's SigV4 signature is the only
   credential and it authorises exactly one object key, so the request carries no
@@ -242,16 +255,20 @@ protocol and server-side proof expect.)
   Because the signature covers `host` only, nothing on this path binds the body:
   the server compares the client's `ciphertextHash` against the client's own
   `partSha1Array[0]`, so they always agree. Integrity here rests on the upload
-  proof and on AES-GCM's tag at download, not on a wire checksum.
+  proof and on the header MAC and chunk tags at download, not on a wire checksum.
 - **Multipart** (> 5 MiB) — the file is streamed one 5 MiB chunk at a time (never
   loaded whole into memory), each chunk uploaded as a Backblaze part. The
   ciphertext hash the server checks is SHA-1 over the concatenated raw part
   digests; the server finishes the large file with the ordered part list.
 
 The mock end-to-end test in [`test/upload.flow.test.mjs`](test/upload.flow.test.mjs)
-captures every byte this client would send, decrypts each part with the key
-recovered from the session envelope, and asserts the result equals the original
-file — a machine-checked demonstration that only ciphertext is uploaded.
+captures every byte this client would send, opens the stored object with
+`@shieldfive/crypto`'s reference reader from nothing but the session fields and
+the root key, and asserts the result equals the original file and the header's
+`file_id` equals the row id. [`test/v1Format.test.mjs`](test/v1Format.test.mjs)
+checks the shared vectors in [`test/vectors/v3-upload.json`](test/vectors/v3-upload.json)
+(regenerate with `node scripts/generate-vectors.mjs`) against the library's
+blob and streaming readers.
 
 ## Layout
 
@@ -263,8 +280,8 @@ file — a machine-checked demonstration that only ciphertext is uploaded.
 - `src/argon2.mjs` — Argon2id, native when available, WebAssembly otherwise
 - `src/vault.mjs` / `src/unlock.mjs` — fetch the wrapped vault key, unwrap the
   root key from your password (Argon2id / PBKDF2)
-- `src/uploadCrypto.mjs` — filename and chunk encryption, upload proof, multipart
-  ciphertext hash
+- `src/uploadCrypto.mjs` — filename encryption, the suite-0x03 part writer,
+  upload proof, multipart ciphertext hash
 - `src/upload.mjs` — create session, encrypt, upload (direct + multipart),
   finalize; the streaming chunk reader
 - `src/sync.mjs` — `sf sync`: manifest, change detection, reconcile pass, watch

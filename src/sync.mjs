@@ -11,9 +11,11 @@
 // Scope notes: change is detected by (size, mtimeMs) — the rsync default, cheap
 // and good enough; a same-size same-mtime edit is not re-uploaded. Deletions
 // and renames are NOT mirrored (a file removed locally stays in the vault); sync
-// is append-only for now. Each changed file becomes a new vault upload (the
-// server does not overwrite by name), which is the intended versioning
-// behaviour.
+// is append-only for now. Each changed file becomes a new vault upload at the
+// vault root (the server does not overwrite by name); earlier versions are kept,
+// not replaced or trashed, so they count against storage until removed in the
+// app. Replacing the previous fileId needs the Bin's folder key to re-wrap it,
+// which this client does not hold yet.
 
 import { open, readFile, readdir, rename, stat } from 'node:fs/promises'
 import { join } from 'node:path'
@@ -95,6 +97,11 @@ export function planSync(entries, manifest) {
 // One reconcile pass. uploadFn is injected (defaults to the real uploadFile) so
 // the pass is unit-testable without a network. Returns a summary and mutates
 // `manifest` in place, persisting after each successful upload.
+//
+// `accessToken` is a string, or a function returning one; the function is
+// called before every upload, so a long pass picks up a refreshed session. If
+// it throws (the session cannot be refreshed) the pass stops and the error
+// propagates: nothing after it could succeed.
 export async function syncOnce({
   apiBaseUrl,
   accessToken,
@@ -112,11 +119,13 @@ export async function syncOnce({
   let failed = 0
   const errors = []
 
+  const tokenFor = typeof accessToken === 'function' ? accessToken : async () => accessToken
   for (const entry of toUpload) {
+    const token = await tokenFor()
     try {
       const { fileId } = await uploadFn({
         apiBaseUrl,
-        accessToken,
+        accessToken: token,
         rootKey,
         name: entry.name,
         path: entry.path,
@@ -156,9 +165,47 @@ function sleep(ms, signal) {
   })
 }
 
+// Refresh this long before the access token expires (seconds).
+const REFRESH_MARGIN_S = 120
+
+/**
+ * The access token for the next request: the current one while it has more
+ * than REFRESH_MARGIN_S left, otherwise a refreshed one. Supabase rotates
+ * refresh tokens and revokes the session if one is presented twice, so the
+ * refresh is single-flight and the rotated token replaces the old one.
+ * Without an expiry or a refresh function (tests, old callers) the token is
+ * used as is.
+ */
+export function createSessionTokens({ accessToken, refreshToken, expiresAt, refresh, now = () => Date.now() }) {
+  let tokens = { access: accessToken, refresh: refreshToken, expiresAt }
+  let inflight = null
+  return async function current() {
+    if (!refresh || !tokens.expiresAt || now() / 1000 < tokens.expiresAt - REFRESH_MARGIN_S) {
+      return tokens.access
+    }
+    inflight ??= refresh(tokens.refresh)
+      .then((s) => {
+        tokens = { access: s.accessToken, refresh: s.refreshToken, expiresAt: s.expiresAt }
+        return tokens.access
+      })
+      .finally(() => {
+        inflight = null
+      })
+    return inflight
+  }
+}
+
 // Orchestrates a real sync: sign in + unlock once, then run one pass (or loop on
 // an interval under --watch). authAndUnlock is injected so the CLI can share its
-// sign-in/unlock path and tests can stub it.
+// sign-in/unlock path and tests can stub it. It may also return refreshToken,
+// expiresAt (unix seconds) and refreshSession(refreshToken); with them the
+// session is refreshed before it expires, so `--watch` keeps working past the
+// access token's lifetime (about an hour). A refresh that fails ends the sync
+// with an error (non-zero exit) instead of failing every file on every pass
+// while looking healthy to a supervisor.
+//
+// Returns the last pass's summary. A single pass with failed files rejects, so
+// `sf sync` exits non-zero; under --watch failed files are retried next pass.
 export async function runSync({
   cfg,
   folder,
@@ -168,8 +215,17 @@ export async function runSync({
   uploadFn,
   log = (m) => process.stdout.write(`${m}\n`),
   status = (m) => process.stderr.write(`${m}\n`),
+  now = () => Date.now(),
 }) {
-  const { accessToken, rootKey } = await authAndUnlock(cfg)
+  const session = await authAndUnlock(cfg)
+  const { rootKey } = session
+  const accessToken = createSessionTokens({
+    accessToken: session.accessToken,
+    refreshToken: session.refreshToken,
+    expiresAt: session.expiresAt,
+    refresh: session.refreshSession,
+    now,
+  })
   const manifestPath = join(folder, MANIFEST_NAME)
   const manifest = await loadManifest(manifestPath)
 
@@ -180,9 +236,10 @@ export async function runSync({
   }
   if (watch) process.on('SIGINT', onSigint)
 
+  let summary
   try {
     do {
-      const summary = await syncOnce({
+      summary = await syncOnce({
         apiBaseUrl: cfg.apiBaseUrl,
         accessToken,
         rootKey,
@@ -202,4 +259,8 @@ export async function runSync({
   } finally {
     if (watch) process.off('SIGINT', onSigint)
   }
+  if (!watch && summary?.failed) {
+    throw new Error(`${summary.failed} file(s) failed to sync.`)
+  }
+  return summary
 }

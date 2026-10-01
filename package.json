@@ -2,7 +2,7 @@
   "name": "@shieldfive/cli",
   "version": "0.3.0",
   "type": "module",
-  "description": "Open-source command-line client for ShieldFive: encrypt a folder on your machine and sync it to your EU-hosted, post-quantum vault. Read the code; it encrypts before upload.",
+  "description": "Open-source command-line client for ShieldFive: encrypt a folder on your machine and sync it to your EU-hosted vault with post-quantum hybrid encryption (ML-KEM-1024 + X25519). Read the code; it encrypts before upload.",
   "license": "Apache-2.0",
   "author": "Cho Garcia <security@shieldfive.com>",
   "homepage": "https://github.com/shieldfive/cli",
@@ -46,7 +46,7 @@
   "dependencies": {
     "@noble/ciphers": "^2.1.1",
     "@noble/hashes": "^2.0.1",
-    "@shieldfive/crypto": "^1.0.0-beta.1",
+    "@shieldfive/crypto": "~1.0.1",
     "@supabase/supabase-js": "^2",
     "libsodium-wrappers-sumo": "^0.8.2"
   },
