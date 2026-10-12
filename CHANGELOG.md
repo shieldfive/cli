@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## 0.4.0 — 2026-10-12
+
+### Behaviour changes
+
+- `sf push` now skips dotfiles (`.env`, `.git`, ...) by default; pass
+  `--include-dotfiles` to upload them as before.
+- Sign-in refuses a server answer of auth version 1 for an account previously
+  signed in with version 2; pass `--allow-legacy-login` to override.
+- Symlinks are skipped instead of followed.
+
 ### Security
 
 - **Symlinks are not followed.** `push`, `sync` and the agent list files with
@@ -28,7 +38,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - 0-byte files: uploaded as a header-only cipher-v3 object with the server's
   empty-file proof when `/api/files/upload-capabilities` says `emptyCipherV3`;
   otherwise skipped with a clear message (exit code 2) before any session.
-
+- New uploads send a v6 row-bound encrypted name from upload start (#14).
 - **Downgrade pin for sign-in.** After a sign-in with a login secret (auth
   version 2), the CLI records the account (a SHA-256 of the email) in
   `~/.shieldfive/auth-pins.json` (mode 0600). A later server answer of
