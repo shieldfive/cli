@@ -87,6 +87,10 @@ export async function signIn({
   getTotpCode,
   fetchImpl = fetch,
   createClientImpl = createClient,
+  // { isPinned(email), pin(email) } -- src/authPin.mjs fileAuthPin(). Null
+  // means no pin (tests, embedders); the sf commands always pass one.
+  authPin = null,
+  allowLegacyLogin = false,
 }) {
   // The raw password is never handed to Supabase directly. The salt lookup
   // decides what the version-aware login route receives: only the derived
@@ -94,7 +98,10 @@ export async function signIn({
   // server affirmatively reported as version 1. test/auth.noPasswordLeak.test.mjs
   // pins this across every path.
   email = String(email ?? '').trim().toLowerCase()
-  const credentials = await buildSignInCredentials({ apiBaseUrl, email, password, fetchImpl })
+  const pinnedV2 = authPin ? await authPin.isPinned(email) : false
+  const credentials = await buildSignInCredentials({
+    apiBaseUrl, email, password, fetchImpl, pinnedV2, allowLegacyLogin,
+  })
   let response
   try {
     response = await fetchImpl(new URL('/api/mobile/auth/login', apiBaseUrl), {
@@ -125,6 +132,13 @@ export async function signIn({
   const aal1Token = data.session?.access_token
   if (!aal1Token) {
     throw new Error('Sign-in returned no access token.')
+  }
+
+  // Signed in with only the login secret: the account is version 2. Remember
+  // it so a later version-1 answer is refused (src/authPin.mjs). A failed
+  // write does not fail the sign-in; the next one retries it.
+  if (authPin && !('password' in credentials)) {
+    try { await authPin.pin(email) } catch { /* retried on the next sign-in */ }
   }
 
   const aal2Token = await stepUpMfaIfRequired({ supabase, getTotpCode })

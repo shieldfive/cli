@@ -5,6 +5,16 @@ All notable changes to `@shieldfive/cli` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Security
+
+- **Downgrade pin for sign-in.** After a sign-in with a login secret (auth
+  version 2), the CLI records the account (a SHA-256 of the email) in
+  `~/.shieldfive/auth-pins.json` (mode 0600). A later server answer of
+  version 1 for that account is refused before the raw password is sent.
+  `--allow-legacy-login` on `sf login`, `sf push` or `sf sync` overrides it.
+
 ## 0.3.1 - 2026-10-01
 
 ### Security
