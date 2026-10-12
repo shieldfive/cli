@@ -15,7 +15,7 @@
 // signed in as another. See docs/agent-design.md.
 
 import { webcrypto } from 'node:crypto'
-import { readFile, readdir, stat } from 'node:fs/promises'
+import { lstat, readFile, readdir } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 
 import { promptHidden, promptLine } from './prompt.mjs'
@@ -31,6 +31,8 @@ function usage() {
       '  logout [--everywhere]       revoke the session and stop the agent',
       '                              --everywhere also signs out your browser and phone',
       '  push <folder>               encrypt and upload every file in <folder>',
+      '                              [--include-dotfiles]  also upload names starting with "."',
+      '                              (symlinks are never followed)',
       '  sync <folder> [--watch]     upload new and changed files',
       '                              [--interval=<seconds>]  poll interval for --watch (default 5)',
       '  verify <file>...            report whether each file is safely in your vault',
@@ -52,10 +54,15 @@ function usage() {
   )
 }
 
-async function* filesIn(folder) {
+// Regular files directly in `folder`. lstat, not stat: a symlink is skipped
+// rather than followed, so `sf push ~/project` cannot upload ~/.ssh/id_ed25519
+// through a link that points out of the folder. Dotfiles (.env, .git, .DS_Store,
+// sync's own manifest) are skipped unless includeDotfiles is set, matching sync.
+async function* filesIn(folder, { includeDotfiles = false } = {}) {
   for (const name of await readdir(folder)) {
+    if (!includeDotfiles && name.startsWith('.')) continue
     const path = join(folder, name)
-    const info = await stat(path)
+    const info = await lstat(path)
     if (info.isFile()) yield { name, path, size: info.size }
   }
 }
@@ -397,8 +404,16 @@ async function cmdPush(folder, flags) {
     const { request } = await import('./agent/client.mjs')
     process.stderr.write(`pushing to account ${agent.account} through the agent\n`)
     let differs = 0
-    for await (const { name, path } of filesIn(resolve(folder))) {
-      const result = await request('upload', { path }, { timeoutMs: 0 })
+    for await (const { name, path } of filesIn(resolve(folder), pushListOptions(flags))) {
+      let result
+      try {
+        result = await request('upload', { path }, { timeoutMs: 0 })
+      } catch (err) {
+        if (err.code !== 'empty_file_unsupported') throw err
+        process.stdout.write(`skipped ${name}: ${err.message}\n`)
+        differs++
+        continue
+      }
       if (result.matchesFileNow) {
         process.stdout.write(`pushed ${name}\n`)
       } else {
@@ -419,17 +434,30 @@ async function cmdPush(folder, flags) {
   const { uploadFile } = await import('./upload.mjs')
   const { accessToken, rootKey } = await authAndUnlock(cfg)
 
-  for await (const { name, path, size } of filesIn(folder)) {
-    await uploadFile({
-      apiBaseUrl: cfg.apiBaseUrl,
-      accessToken,
-      rootKey,
-      name,
-      path,
-      size,
-    })
+  let skipped = 0
+  for await (const { name, path, size } of filesIn(folder, pushListOptions(flags))) {
+    try {
+      await uploadFile({
+        apiBaseUrl: cfg.apiBaseUrl,
+        accessToken,
+        rootKey,
+        name,
+        path,
+        size,
+      })
+    } catch (err) {
+      if (err.code !== 'empty_file_unsupported') throw err
+      process.stdout.write(`skipped ${name}: ${err.message}\n`)
+      skipped++
+      continue
+    }
     process.stdout.write(`pushed ${name}\n`)
   }
+  if (skipped) process.exitCode = 2
+}
+
+function pushListOptions(flags) {
+  return { includeDotfiles: flags['include-dotfiles'] === true }
 }
 
 async function syncViaAgent(folder, { watch, intervalMs }, agent) {

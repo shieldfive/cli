@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Symlinks are not followed.** `push`, `sync` and the agent list files with
+  `lstat` and skip symlinks, and files are opened with `O_NOFOLLOW`, so a link
+  inside the folder can no longer upload a file from outside it.
+- **`push` skips dotfiles by default** (`.env`, `.git`, ...), as `sync` already
+  did. `sf push --include-dotfiles` restores the old behaviour.
+- **Sync manifest written 0600.** `.shieldfive-sync.json` lists file names and
+  vault ids; it is no longer world-readable.
+- **README and npm description** now state the scheme precisely: contents are
+  AES-256-GCM under a post-quantum hybrid key, names are AES-256-GCM under the
+  vault key, and size, part hashes and timestamps are visible to the server.
+
+### Fixed
+
+- A failed upload cancels its pending session (`POST /api/files/delete`, as the
+  web app does) instead of leaving a row holding quota until the reaper runs.
+  Not done when only the finalize answer was lost, since the file may be in.
+- 0-byte files: uploaded as a header-only cipher-v3 object with the server's
+  empty-file proof when `/api/files/upload-capabilities` says `emptyCipherV3`;
+  otherwise skipped with a clear message (exit code 2) before any session.
+
 - **Downgrade pin for sign-in.** After a sign-in with a login secret (auth
   version 2), the CLI records the account (a SHA-256 of the email) in
   `~/.shieldfive/auth-pins.json` (mode 0600). A later server answer of

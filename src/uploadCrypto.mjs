@@ -4,7 +4,7 @@
 // default format, written by @shieldfive/crypto (see the end of this file). Same @noble versions as the apps
 // (@noble/ciphers@2, @noble/hashes@2) so the bytes match.
 
-import { webcrypto } from 'node:crypto'
+import { createHmac, webcrypto } from 'node:crypto'
 
 import { gcm } from '@noble/ciphers/aes.js'
 import { argon2id } from '@noble/hashes/argon2.js'
@@ -282,7 +282,13 @@ export async function* encryptPartsV3({
     }
     const header = take(headerLength)
     const first = await readFrame()
-    if (!first) throw new Error('Encrypted stream has no chunks.')
+    if (!first) {
+      // A 0-byte file is a header with no chunk frames (total_chunks 0); it is
+      // uploaded as a single header-only part. Anything else is a bug.
+      if (plaintextSize !== 0) throw new Error('Encrypted stream has no chunks.')
+      yield header
+      return
+    }
     const part0 = new Uint8Array(header.length + first.length)
     part0.set(header, 0)
     part0.set(first, header.length)
@@ -301,4 +307,22 @@ export async function* encryptPartsV3({
 /** The suite-0x03 upload proof, from the library both other writers use. */
 export function computeV3UploadProof({ proofKeyHex, part0 }) {
   return buildUploadProofV3({ proofKeyHex, ciphertext: part0 })
+}
+
+/**
+ * Upload proof for a 0-byte file, whose only part is the header. The library's
+ * buildUploadProofV3 requires a first chunk frame, which an empty file does not
+ * have; the server's empty-file contract (web docs/desktop-empty-file-contract.md,
+ * emptyFileUploadProof) is base64([3][3] || HMAC-SHA256(proofKey, [3][3] || header)).
+ */
+export function computeV3EmptyUploadProof({ proofKeyHex, header }) {
+  if (typeof proofKeyHex !== 'string' || !/^[0-9a-f]{64}$/i.test(proofKeyHex)) {
+    throw new Error('Upload session proof key is not 32 bytes of hex.')
+  }
+  const prefix = Buffer.from([3, 3])
+  const mac = createHmac('sha256', Buffer.from(proofKeyHex, 'hex'))
+    .update(prefix)
+    .update(header)
+    .digest()
+  return Buffer.concat([prefix, mac]).toString('base64')
 }
