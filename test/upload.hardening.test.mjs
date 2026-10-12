@@ -18,7 +18,7 @@ import { saveManifest, scanFiles } from '../src/sync.mjs'
 
 const API = 'https://api.test'
 const PROOF_KEY = 'cd'.repeat(32)
-const FILE_ID = '5a1c2a9e-7b4d-4c1e-9a2f-0d6e8b5c4a72'
+const FILE_ID = '01928c3a-1b2c-7d3e-af40-123456789abd'
 
 function jsonResponse(status, body) {
   return { ok: status >= 200 && status < 300, status, json: async () => body, text: async () => JSON.stringify(body) }
@@ -64,7 +64,7 @@ test('a failed upload cancels its pending session', async () => {
       },
       () =>
         assert.rejects(
-          uploadFile({ apiBaseUrl: API, accessToken: 'tok', rootKey: rootKey(), name: 'a.bin', path, size: 5 }),
+          uploadFile({ apiBaseUrl: API, accessToken: 'tok', rootKey: rootKey(), name: 'a.bin', path, size: 5, rowId: FILE_ID }),
           /Direct upload failed \(HTTP 500\)/,
         ),
     )
@@ -90,7 +90,7 @@ test('a lost finalize answer does NOT cancel (the file may already be in the vau
         }
         throw new Error(`unexpected fetch: ${url}`)
       },
-      () => assert.rejects(uploadFile({ apiBaseUrl: API, accessToken: 'tok', rootKey: rootKey(), name: 'a.bin', path, size: 5 })),
+      () => assert.rejects(uploadFile({ apiBaseUrl: API, accessToken: 'tok', rootKey: rootKey(), name: 'a.bin', path, size: 5, rowId: FILE_ID })),
     )
   })
   assert.equal(deleted, false)
@@ -109,7 +109,7 @@ test('0-byte file: refused before any session when the server lacks the capabili
       },
       () =>
         assert.rejects(
-          uploadFile({ apiBaseUrl: API, accessToken: 'tok', rootKey: rootKey(), name: 'empty', path, size: 0 }),
+          uploadFile({ apiBaseUrl: API, accessToken: 'tok', rootKey: rootKey(), name: 'empty', path, size: 0, rowId: FILE_ID }),
           (err) => err.code === 'empty_file_unsupported',
         ),
     )
@@ -141,7 +141,7 @@ test('0-byte file: header-only part and the server empty-file proof', async () =
         }
         throw new Error(`unexpected fetch: ${url}`)
       },
-      () => uploadFile({ apiBaseUrl: API, accessToken: 'tok', rootKey: rootKey(), name: 'empty', path, size: 0 }),
+      () => uploadFile({ apiBaseUrl: API, accessToken: 'tok', rootKey: rootKey(), name: 'empty', path, size: 0, rowId: FILE_ID }),
     )
   })
   assert.equal(createBody.sizeBytes, 0)
@@ -193,4 +193,30 @@ test('push/encrypt listing skips dotfiles and symlinks', async () => {
     assert.match(stdout, /encrypted doc\.txt/)
     assert.doesNotMatch(stdout, /\.env|alias\.txt/)
   })
+})
+
+test('a server that ignores clientUploadId is refused and its row cancelled', async () => {
+  const deletes = []
+  await tempDir(async (dir) => {
+    const path = join(dir, 'a.bin')
+    await writeFile(path, 'hello')
+    await withFetch(
+      (url, init) => {
+        if (url === `${API}/api/files/create-upload-session`) {
+          return jsonResponse(200, { uploadKind: 'direct', fileId: '957a1070-c734-4d7b-9430-27df8de29d58', uploadUrl: 'https://s3.test/put', proofKey: PROOF_KEY })
+        }
+        if (url === `${API}/api/files/delete`) {
+          deletes.push(JSON.parse(init.body))
+          return jsonResponse(200, { ok: true })
+        }
+        throw new Error(`unexpected fetch ${url}`)
+      },
+      () =>
+        assert.rejects(
+          uploadFile({ apiBaseUrl: API, accessToken: 'tok', rootKey: rootKey(), name: 'a.bin', path, size: 5, rowId: FILE_ID }),
+          /too old/,
+        ),
+    )
+  })
+  assert.deepEqual(deletes, [{ ids: ['957a1070-c734-4d7b-9430-27df8de29d58'] }])
 })

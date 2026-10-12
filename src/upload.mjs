@@ -19,6 +19,7 @@
 
 import { constants as fsConstants } from 'node:fs'
 import { open } from 'node:fs/promises'
+import { webcrypto } from 'node:crypto'
 
 import { encryptNameV6 } from '@shieldfive/crypto/vault'
 
@@ -28,7 +29,6 @@ import {
   CIPHER_VERSION_PQ,
   computeV3EmptyUploadProof,
   computeV3UploadProof,
-  encryptMetadataV4,
   encryptPartsV3,
   generateRandomKeyB64,
   getCiphertextHashFromParts,
@@ -97,18 +97,36 @@ export async function* readFileChunks(path, chunkSize) {
   }
 }
 
+// A fresh UUIDv7 (RFC 9562): 48-bit ms timestamp, version 7, variant 10.
+// The web app's newRowBoundId (utils/fileRowBinding.ts) builds the same shape;
+// the server's create-upload-session takes it as clientUploadId.
+export function newRowBoundId(now = Date.now()) {
+  const bytes = webcrypto.getRandomValues(new Uint8Array(16))
+  let ts = BigInt(now)
+  for (let i = 5; i >= 0; i -= 1) {
+    bytes[i] = Number(ts & 0xffn)
+    ts >>= 8n
+  }
+  bytes[6] = (bytes[6] & 0x0f) | 0x70
+  bytes[8] = (bytes[8] & 0x3f) | 0x80
+  const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('')
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
+}
+
 export async function createUploadSession({
   apiBaseUrl,
   accessToken,
   rootKey,
   name,
   size,
+  rowId,
 }) {
   const rootKeyB64 = bytesToBase64(rootKey)
-  // The row id does not exist yet, so the first name is the row-unbound v4
-  // envelope (as on the web). finalizeUpload replaces it with a v6 envelope
-  // bound to the row id.
-  const nameEnvelope = await encryptMetadataV4(name, rootKeyB64)
+  // The client picks the row id (UUIDv7, sent as clientUploadId), so the very
+  // first stored name is already the v6 envelope bound to that row. No v4
+  // (row-unbound) name is ever written, even for an upload that fails before
+  // finalize.
+  const nameEnvelopeV6 = await encryptNameV6({ name, folderKey: rootKey, rowId })
   // For suite 0x03 this is the classical envelope key; csk_wrapped holds it
   // under the parent key (the root key: sf uploads to the vault root).
   const csk = generateRandomKeyB64()
@@ -123,7 +141,8 @@ export async function createUploadSession({
     // v1 wire format: no cipher_nonce_prefix and no chunkSize (the server
     // rejects both; they live in the header).
     body: JSON.stringify({
-      name_encrypted: JSON.stringify(nameEnvelope),
+      clientUploadId: rowId,
+      name_encrypted: JSON.stringify(nameEnvelopeV6),
       nameHash: hashMetadataV4(name.toLowerCase(), rootKeyB64),
       csk_wrapped: cskEnvelope.wrapped,
       csk_iv: cskEnvelope.iv,
@@ -141,7 +160,7 @@ export async function createUploadSession({
       `create-upload-session failed (HTTP ${res.status}): ${JSON.stringify(body)}`,
     )
   }
-  return { session: body, csk }
+  return { session: body, csk, nameEncryptedV6: JSON.stringify(nameEnvelopeV6) }
 }
 
 // Direct upload: a presigned S3 PUT (web b52b4c8 / PR #726), not b2_upload_file.
@@ -521,25 +540,36 @@ async function serverAcceptsEmptyFiles({ apiBaseUrl, accessToken }) {
 // order, from the same read that feeds encryption. The agent hashes those
 // chunks to record what was actually uploaded; hashing the file separately,
 // before or after, cannot see a change made and undone while it was being read.
-export async function uploadFile({ apiBaseUrl, accessToken, rootKey, name, path, size, onPlaintextChunk }) {
+// `rowId` is for tests only; callers let it default to a fresh UUIDv7.
+export async function uploadFile({ apiBaseUrl, accessToken, rootKey, name, path, size, onPlaintextChunk, rowId = newRowBoundId() }) {
   // Derived before anything is sent, so a vault whose identity cannot be
   // derived fails before a session (and a pending row) exists.
   const recipientPublicKey = await vaultMlKemPublicKey(rootKey)
   if (size === 0 && !(await serverAcceptsEmptyFiles({ apiBaseUrl, accessToken }))) {
     throw new EmptyFileUnsupportedError(name)
   }
-  const { session, csk } = await createUploadSession({
+  const { session, csk, nameEncryptedV6 } = await createUploadSession({
     apiBaseUrl,
     accessToken,
     rootKey,
     name,
     size,
+    rowId,
   })
   // From here on a pending row exists. Any failure before finalize answers
   // cancels it (see cancelUploadSession).
   const envelopeKey = base64ToBytes(csk)
   try {
-    await sendUpload({ apiBaseUrl, accessToken, name, path, size, onPlaintextChunk, session, envelopeKey, rootKey, recipientPublicKey })
+    // The name and the file header are bound to rowId. A server that ignored
+    // clientUploadId would hand back another id; refuse it (and cancel the
+    // row it made) rather than upload under a mismatched binding.
+    if (session?.fileId !== rowId) {
+      throw new Error(
+        `create-upload-session returned file id ${session?.fileId} for requested ${rowId}; ` +
+          'this ShieldFive server is too old for this client.',
+      )
+    }
+    await sendUpload({ apiBaseUrl, accessToken, name, path, size, onPlaintextChunk, session, envelopeKey, recipientPublicKey, nameEncryptedV6 })
   } catch (err) {
     if (!err?.finalizeOutcomeUnknown && session?.fileId) {
       await cancelUploadSession({ apiBaseUrl, accessToken, fileId: session.fileId })
@@ -552,7 +582,7 @@ export async function uploadFile({ apiBaseUrl, accessToken, rootKey, name, path,
   return { fileId: session.fileId }
 }
 
-async function sendUpload({ apiBaseUrl, accessToken, name, path, size, onPlaintextChunk, session, envelopeKey, rootKey, recipientPublicKey }) {
+async function sendUpload({ apiBaseUrl, accessToken, name, path, size, onPlaintextChunk, session, envelopeKey, recipientPublicKey, nameEncryptedV6 }) {
   if (!session.proofKey) throw new Error('Upload session is missing its proof key.')
 
   // The server's v1 chunk size (5 MiB): each encrypted chunk is one storage part.
@@ -571,12 +601,8 @@ async function sendUpload({ apiBaseUrl, accessToken, name, path, size, onPlainte
     fileId: uuidToBytes(session.fileId),
     recipientPublicKey,
   })
-  // The name, re-sealed with the row id as AAD (v6), replaces the v4 one at
-  // finalize, so the backend cannot relabel this row with another file's name.
-  const nameEncryptedV6 = JSON.stringify(
-    await encryptNameV6({ name, folderKey: rootKey, rowId: session.fileId }),
-  )
-
+  // The same v6 name sent at create (bound to the row id) is sent again at
+  // finalize, which still expects it.
   if (session.uploadKind === 'direct') {
     // No authToken and no storagePath check: since web b52b4c8 (PR #726) the
     // direct path is a presigned S3 PUT, so the signature inside uploadUrl is
