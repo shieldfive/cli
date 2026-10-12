@@ -38,6 +38,10 @@ function usage() {
       '  inspect <folder>            count a migration source recursively; upload nothing',
       '  --help',
       '',
+      'login, push and sync accept --allow-legacy-login: sign in even though the',
+      'server asks for the raw password (auth version 1) for an account this',
+      'computer has signed in to with a login secret. Refused by default.',
+      '',
       'After sf login, push / sync / verify go through the agent and need nothing',
       'in the environment. Without an agent, or when SF_EMAIL and SF_PASSWORD are',
       'set, push and sync sign in from those [SF_VAULT_PASSWORD if your vault',
@@ -99,7 +103,7 @@ function envCredentialsSet() {
   return Boolean(process.env.SF_EMAIL && process.env.SF_PASSWORD)
 }
 
-function readLiveConfig() {
+function readLiveConfig(flags = {}) {
   const e = process.env
   const email = e.SF_EMAIL
   const password = e.SF_PASSWORD
@@ -119,6 +123,7 @@ function readLiveConfig() {
     email,
     password,
     vaultPassword: e.SF_VAULT_PASSWORD || password,
+    allowLegacyLogin: flags['allow-legacy-login'] === true,
   }
 }
 
@@ -141,6 +146,7 @@ async function readTotpCode() {
 // lazily so `sf encrypt` runs without @supabase/supabase-js.
 async function authAndUnlock(cfg) {
   const { signIn } = await import('./auth.mjs')
+  const { fileAuthPin } = await import('./authPin.mjs')
   const { fetchAndUnlockVault } = await import('./vault.mjs')
 
   process.stderr.write('signing in…\n')
@@ -151,6 +157,8 @@ async function authAndUnlock(cfg) {
     email: cfg.email,
     password: cfg.password,
     getTotpCode: readTotpCode,
+    authPin: fileAuthPin(),
+    allowLegacyLogin: cfg.allowLegacyLogin === true,
   })
 
   process.stderr.write('unlocking vault…\n')
@@ -298,10 +306,15 @@ async function cmdLogin(flags) {
     (await promptHidden('Vault password (press Enter if it is the same): ')) || password
 
   const { signIn } = await import('./auth.mjs')
+  const { fileAuthPin } = await import('./authPin.mjs')
   const { fetchAndUnlockVault } = await import('./vault.mjs')
 
   process.stderr.write('signing in…\n')
-  const session = await signIn({ ...cfg, email, password, getTotpCode: readTotpCode })
+  const session = await signIn({
+    ...cfg, email, password, getTotpCode: readTotpCode,
+    authPin: fileAuthPin(),
+    allowLegacyLogin: flags['allow-legacy-login'] === true,
+  })
 
   process.stderr.write('unlocking vault…\n')
   const rootKey = await fetchAndUnlockVault({
@@ -378,7 +391,7 @@ async function cmdLogout(flags) {
 }
 
 // login -> unlock -> encrypt -> upload every file in the folder, once.
-async function cmdPush(folder) {
+async function cmdPush(folder, flags) {
   const { agent } = await chooseAuth()
   if (agent) {
     const { request } = await import('./agent/client.mjs')
@@ -402,7 +415,7 @@ async function cmdPush(folder) {
     return
   }
 
-  const cfg = readLiveConfig()
+  const cfg = readLiveConfig(flags)
   const { uploadFile } = await import('./upload.mjs')
   const { accessToken, rootKey } = await authAndUnlock(cfg)
 
@@ -466,11 +479,11 @@ async function syncViaAgent(folder, { watch, intervalMs }, agent) {
 }
 
 // login -> unlock -> mirror new/changed files into the vault, once or on a loop.
-async function cmdSync(folder, { watch, intervalMs }) {
+async function cmdSync(folder, { watch, intervalMs }, flags) {
   const { agent } = await chooseAuth()
   if (agent) return syncViaAgent(resolve(folder), { watch, intervalMs }, agent)
 
-  const cfg = readLiveConfig()
+  const cfg = readLiveConfig(flags)
   const { uploadFile } = await import('./upload.mjs')
   const { runSync } = await import('./sync.mjs')
 
@@ -556,7 +569,7 @@ async function main() {
     if (result.skipped) process.exitCode = 2
   } else if (cmd === 'push') {
     if (!folder) throw new Error('push needs a <folder>')
-    await cmdPush(folder)
+    await cmdPush(folder, flags)
   } else if (cmd === 'sync') {
     if (!folder) throw new Error('sync needs a <folder>')
     // `--interval 10` (space-separated) would otherwise parse as a bare flag and
@@ -569,7 +582,7 @@ async function main() {
     await cmdSync(folder, {
       watch: Boolean(flags.watch),
       intervalMs: Math.round(intervalSec * 1000),
-    })
+    }, flags)
   } else if (cmd === 'verify') {
     await cmdVerify(positionals)
   } else {

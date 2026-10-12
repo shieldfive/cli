@@ -10,6 +10,7 @@
 // vault KDF is different: the web keyring trims the vault password. See
 // src/unlock.mjs.)
 import { deriveMasterSecret } from './argon2.mjs'
+import { LegacyLoginRefusedError } from './authPin.mjs'
 
 const DOMAIN = 'shieldfive/v1/auth/login-secret'
 
@@ -40,8 +41,15 @@ export async function deriveLoginSecret({ password, authSalt }) {
  * lookup never falls back to version 1: for a migrated account that would post
  * the password to the server and still not sign in. Throws before anything is
  * posted to the login route.
+ *
+ * `pinnedV2`: this computer has already signed in to the account as version 2
+ * (src/authPin.mjs). A version-1 answer for it is then refused with
+ * LegacyLoginRefusedError, before the password goes anywhere, unless
+ * `allowLegacyLogin` (the --allow-legacy-login flag) says the user expects it.
  */
-export async function buildSignInCredentials({ apiBaseUrl, email, password, fetchImpl = fetch }) {
+export async function buildSignInCredentials({
+  apiBaseUrl, email, password, fetchImpl = fetch, pinnedV2 = false, allowLegacyLogin = false,
+}) {
   let response
   try {
     response = await fetchImpl(new URL('/api/auth/salt', apiBaseUrl), {
@@ -57,6 +65,7 @@ export async function buildSignInCredentials({ apiBaseUrl, email, password, fetc
       typeof body.authSalt !== 'string' || !body.authSalt) {
     throw new Error('Unable to prepare secure sign-in. Please try again.')
   }
+  if (body.authVersion === 1 && pinnedV2 && !allowLegacyLogin) throw new LegacyLoginRefusedError()
   if (body.authVersion === 1 && body.migrationEnabled !== true) return { password }
   const loginSecret = await deriveLoginSecret({ password, authSalt: body.authSalt })
   return body.authVersion === 2 ? { loginSecret } : { password, loginSecret, authSalt: body.authSalt }
