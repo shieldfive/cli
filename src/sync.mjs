@@ -17,7 +17,7 @@
 // app. Replacing the previous fileId needs the Bin's folder key to re-wrap it,
 // which this client does not hold yet.
 
-import { open, readFile, readdir, rename, stat } from 'node:fs/promises'
+import { lstat, open, readFile, readdir, rename } from 'node:fs/promises'
 import { join } from 'node:path'
 
 export const MANIFEST_NAME = '.shieldfive-sync.json'
@@ -28,7 +28,8 @@ export function signatureOf({ size, mtimeMs }) {
   return `${size}:${mtimeMs}`
 }
 
-// List regular files to consider for sync: skips directories, dotfiles (which
+// List regular files to consider for sync: skips directories, symlinks (lstat,
+// so a link never pulls in a file from outside the folder), dotfiles (which
 // includes the manifest itself), and any explicitly excluded names.
 export async function scanFiles(folder, { exclude = [] } = {}) {
   const skip = new Set(exclude)
@@ -36,7 +37,7 @@ export async function scanFiles(folder, { exclude = [] } = {}) {
   for (const name of await readdir(folder)) {
     if (name.startsWith('.') || skip.has(name)) continue
     const path = join(folder, name)
-    const info = await stat(path)
+    const info = await lstat(path)
     if (info.isFile()) {
       entries.push({ name, path, size: info.size, mtimeMs: info.mtimeMs })
     }
@@ -60,7 +61,10 @@ export async function loadManifest(manifestPath) {
 }
 
 // Atomic-ish write: write a temp sibling then rename over the target, so a crash
-// during the write can't leave a half-written manifest.
+// during the write can't leave a half-written manifest. Mode 0600: the manifest
+// lists every synced file name with its vault file id, which is nobody else's
+// business on a shared machine. chmod as well as the open mode, because a temp
+// file left by a crashed run keeps whatever mode it had.
 export async function saveManifest(manifestPath, manifest) {
   const body = JSON.stringify(
     { version: MANIFEST_VERSION, files: manifest.files },
@@ -68,8 +72,9 @@ export async function saveManifest(manifestPath, manifest) {
     2,
   )
   const tmp = `${manifestPath}.tmp`
-  const handle = await open(tmp, 'w')
+  const handle = await open(tmp, 'w', 0o600)
   try {
+    await handle.chmod(0o600)
     await handle.writeFile(body)
     await handle.sync()
   } finally {

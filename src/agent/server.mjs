@@ -5,7 +5,7 @@
 // See docs/agent-design.md for why it exists and what it will never do.
 
 import { createHmac, randomUUID } from 'node:crypto'
-import { chmod, open, readFile, rm, stat } from 'node:fs/promises'
+import { chmod, lstat, open, readFile, rm, stat } from 'node:fs/promises'
 import { connect, createServer } from 'node:net'
 import { basename, dirname, join } from 'node:path'
 
@@ -189,7 +189,9 @@ export function createAgent({
   }
 
   async function upload(path) {
-    const before = await stat(path)
+    // lstat: a symlink is refused, not followed (and readFileChunks opens with
+    // O_NOFOLLOW, so a swap after this check fails too).
+    const before = await lstat(path)
     if (!before.isFile()) throw new AgentError('not_a_file', `${path} is not a regular file.`)
     const token = await accessToken()
 

@@ -1,24 +1,35 @@
 # @shieldfive/cli
 
 > Command-line client for [ShieldFive](https://shieldfive.com). Encrypt a folder
-> on your machine, then push or continuously sync it to your EU-hosted,
-> post-quantum vault. Everything is encrypted locally before it leaves your
-> machine. Read the code and verify that for yourself.
+> on your machine, then push or continuously sync it to your EU-hosted vault.
+> File contents and names are encrypted locally before they leave your machine
+> (contents with a post-quantum hybrid key). Read the code and verify that for
+> yourself.
 
 [![CI](https://github.com/shieldfive/cli/actions/workflows/ci.yml/badge.svg)](https://github.com/shieldfive/cli/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Status](https://img.shields.io/badge/status-early-yellow.svg)](#honest-scope)
 
 The point of this tool being open source is that you do not have to trust a
-marketing claim. The plaintext of your files is never sent to a ShieldFive
-server. The only bytes that leave your machine are ciphertext (post-quantum
-hybrid: ML-KEM-1024 + X25519 key encapsulation, AES-256-GCM chunks) and a short
-cryptographic proof. Two files carry the whole story:
+marketing claim. The plaintext of your files and their names is never sent to a
+ShieldFive server:
+
+- **File contents** — AES-256-GCM chunks under a per-file key that combines a
+  random envelope key (wrapped by your vault root key) with an ML-KEM-1024 +
+  X25519 hybrid encapsulation to your vault identity.
+- **File names** — AES-256-GCM under a key derived from your vault root key
+  (not the post-quantum layer), plus a keyed HMAC of the lowercased name so the
+  server can spot duplicates without reading it.
+
+What the server does see, by design: the plaintext size of each file, part
+hashes (SHA-1 of ciphertext), the wrapped keys, an upload proof, timestamps and
+your account. Sign-in sends a secret derived from your password, never the
+password itself. Two files carry the whole story:
 
 - [`src/uploadCrypto.mjs`](src/uploadCrypto.mjs) — the encryption applied to
   every chunk and to the filename.
-- [`src/upload.mjs`](src/upload.mjs) — the only place bytes are sent over the
-  network. Every request body is ciphertext.
+- [`src/upload.mjs`](src/upload.mjs) — the only place file bytes are sent over
+  the network. Every file body it sends is ciphertext.
 
 If you want to see encryption happen without an account at all, run
 `sf encrypt <folder>` — it encrypts each file locally and prints the ciphertext
@@ -81,7 +92,7 @@ npm test        # 107 tests
 sf login [--idle=<hours>]                    sign in once; an agent holds the session in memory (locks after 8 h idle)
 sf status                                    is an agent running, and for which account
 sf logout [--everywhere]                     revoke the session and stop the agent; --everywhere signs out every device
-sf push <folder>                             encrypt and upload every file once
+sf push <folder> [--include-dotfiles]        encrypt and upload every file once (skips dotfiles unless asked; never follows symlinks)
 sf sync <folder> [--watch] [--interval=N]    upload new/changed files; --watch keeps a poll loop (N seconds, default 5)
 sf verify <file>...                          report whether each file is safely stored in your vault
 sf encrypt <folder>                          encrypt each file locally, upload nothing (no account needed)
@@ -89,7 +100,14 @@ sf inspect <folder>                          read-only recursive migration inven
 ```
 
 `sf push` and `sf sync` pick the direct or multipart upload path automatically
-from the file size.
+from the file size. Both read only regular files directly inside the folder:
+symlinks are skipped (and files are opened with `O_NOFOLLOW`), and names
+starting with `.` are skipped unless you pass `sf push --include-dotfiles`.
+An empty (0-byte) file is uploaded only when the server says it accepts empty
+files; otherwise it is reported as skipped and the exit code is 2. If an upload
+fails after its session was created, the pending session is cancelled so it
+does not hold quota. `sf sync` writes its manifest (`.shieldfive-sync.json`)
+with mode 0600.
 
 `sf inspect` reports JSON counts of files, directories, bytes and skipped entries.
 It includes nested/hidden files and empty folders, reads metadata only, and

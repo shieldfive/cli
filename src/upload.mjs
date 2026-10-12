@@ -17,6 +17,7 @@
 // also carries the header. The header's file_id is the row id the server
 // assigned at create-upload-session, so the stored object is bound to its row.
 
+import { constants as fsConstants } from 'node:fs'
 import { open } from 'node:fs/promises'
 
 import { encryptNameV6 } from '@shieldfive/crypto/vault'
@@ -25,6 +26,7 @@ import {
   base64ToBytes,
   bytesToBase64,
   CIPHER_VERSION_PQ,
+  computeV3EmptyUploadProof,
   computeV3UploadProof,
   encryptMetadataV4,
   encryptPartsV3,
@@ -41,6 +43,8 @@ import {
 const CREATE_SESSION_PATH = '/api/files/create-upload-session'
 const COMPLETE_PATH = '/api/files/complete-upload'
 const PART_URL_PATH = '/api/files/upload-part-url'
+const DELETE_PATH = '/api/files/delete'
+const CAPABILITIES_PATH = '/api/files/upload-capabilities'
 
 // Backblaze documents retrying b2_upload_part on 5xx / network failures, and a
 // part upload is idempotent by (part number, SHA-1) — retrying overwrites the
@@ -56,8 +60,16 @@ const partRetryDelayMs = (attempt) =>
 // Read a file in fixed-size chunks without holding it all in memory. Each yield
 // is an independent copy (the read buffer is reused), so the caller may retain
 // or transform a chunk across the next read safely.
+//
+// O_NOFOLLOW: callers list files with lstat and skip symlinks, but a regular
+// file could be swapped for a symlink between that check and this open. With
+// O_NOFOLLOW the open fails (ELOOP) instead of uploading whatever the link
+// points at, possibly outside the folder being pushed. (Undefined on Windows,
+// where it is simply not applied.)
+const OPEN_READ_NOFOLLOW = fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0)
+
 export async function* readFileChunks(path, chunkSize) {
-  const handle = await open(path, 'r')
+  const handle = await open(path, OPEN_READ_NOFOLLOW)
   try {
     const buffer = Buffer.allocUnsafe(chunkSize)
     for (;;) {
@@ -274,14 +286,22 @@ async function finalizeUpload({
   ciphertextHash,
   nameEncryptedV6,
 }) {
-  const res = await fetch(new URL(COMPLETE_PATH, apiBaseUrl), {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ fileId, b2FileId, partSha1Array, proof, ciphertextHash, nameEncryptedV6 }),
-  })
+  let res
+  try {
+    res = await fetch(new URL(COMPLETE_PATH, apiBaseUrl), {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ fileId, b2FileId, partSha1Array, proof, ciphertextHash, nameEncryptedV6 }),
+    })
+  } catch (err) {
+    // The request may have reached the server and finalized the file; only the
+    // answer was lost. Cancelling now could bin a file that is in the vault.
+    err.finalizeOutcomeUnknown = true
+    throw err
+  }
   const body = await res.json().catch(() => ({}))
   if (!res.ok) {
     throw new Error(
@@ -294,7 +314,7 @@ async function finalizeUpload({
 // Single-chunk file: one part (header || frame_0), SHA-1 + proof, PUT it at
 // the presigned URL, finalize. No b2FileId is sent -- the server HEADs the
 // stored object and derives the storage id itself.
-async function uploadDirect({ apiBaseUrl, accessToken, session, parts, nameEncryptedV6 }) {
+async function uploadDirect({ apiBaseUrl, accessToken, session, parts, nameEncryptedV6, empty = false }) {
   let ciphertext = null
   for await (const part of parts) {
     if (ciphertext !== null) {
@@ -303,8 +323,12 @@ async function uploadDirect({ apiBaseUrl, accessToken, session, parts, nameEncry
     ciphertext = part
   }
   if (ciphertext === null) throw new Error('Direct upload produced no ciphertext.')
+  // For a 0-byte file part 1 is the header alone, and the proof covers it:
+  // the server's empty-file contract is HMAC(proofKey, [3][3] || header).
   const sha1 = await sha1Hex(ciphertext)
-  const proof = await computeV3UploadProof({ proofKeyHex: session.proofKey, part0: ciphertext })
+  const proof = empty
+    ? computeV3EmptyUploadProof({ proofKeyHex: session.proofKey, header: ciphertext })
+    : await computeV3UploadProof({ proofKeyHex: session.proofKey, part0: ciphertext })
 
   await putDirectPresigned({ session, ciphertext })
 
@@ -444,6 +468,55 @@ async function uploadMultipart({ apiBaseUrl, accessToken, session, parts, nameEn
   })
 }
 
+// Best-effort cancel of a session that will never finalize. The pending row
+// otherwise holds quota (and, for multipart, an unfinished Backblaze large
+// file) until the server's stale-upload reaper gets to it. POST
+// /api/files/delete with the row id is what the web app's cancel path uses:
+// for a non-ready row it cancels the large file and drops the metadata. Never
+// throws; a failure here must not hide the error that caused it.
+export async function cancelUploadSession({ apiBaseUrl, accessToken, fileId }) {
+  try {
+    const res = await fetch(new URL(DELETE_PATH, apiBaseUrl), {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ ids: [fileId] }),
+    })
+    return res.ok
+  } catch {
+    return false
+  }
+}
+
+export class EmptyFileUnsupportedError extends Error {
+  constructor(name) {
+    super(
+      `"${name}" is empty (0 bytes) and this ShieldFive server does not accept ` +
+        'empty files yet. Nothing was uploaded for it.',
+    )
+    this.name = 'EmptyFileUnsupportedError'
+    this.code = 'empty_file_unsupported'
+  }
+}
+
+// Zero-byte cipher-v3 uploads are behind a server capability (web
+// docs/desktop-empty-file-contract.md). Ask before creating a session, so an
+// older or flag-off server gets no pending row at all.
+async function serverAcceptsEmptyFiles({ apiBaseUrl, accessToken }) {
+  try {
+    const res = await fetch(new URL(CAPABILITIES_PATH, apiBaseUrl), {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    })
+    if (!res.ok) return false
+    const body = await res.json().catch(() => ({}))
+    return body?.emptyCipherV3 === true
+  } catch {
+    return false
+  }
+}
+
 // `onPlaintextChunk`, when given, is called with every plaintext chunk in file
 // order, from the same read that feeds encryption. The agent hashes those
 // chunks to record what was actually uploaded; hashing the file separately,
@@ -452,6 +525,9 @@ export async function uploadFile({ apiBaseUrl, accessToken, rootKey, name, path,
   // Derived before anything is sent, so a vault whose identity cannot be
   // derived fails before a session (and a pending row) exists.
   const recipientPublicKey = await vaultMlKemPublicKey(rootKey)
+  if (size === 0 && !(await serverAcceptsEmptyFiles({ apiBaseUrl, accessToken }))) {
+    throw new EmptyFileUnsupportedError(name)
+  }
   const { session, csk } = await createUploadSession({
     apiBaseUrl,
     accessToken,
@@ -459,6 +535,24 @@ export async function uploadFile({ apiBaseUrl, accessToken, rootKey, name, path,
     name,
     size,
   })
+  // From here on a pending row exists. Any failure before finalize answers
+  // cancels it (see cancelUploadSession).
+  const envelopeKey = base64ToBytes(csk)
+  try {
+    await sendUpload({ apiBaseUrl, accessToken, name, path, size, onPlaintextChunk, session, envelopeKey, rootKey, recipientPublicKey })
+  } catch (err) {
+    if (!err?.finalizeOutcomeUnknown && session?.fileId) {
+      await cancelUploadSession({ apiBaseUrl, accessToken, fileId: session.fileId })
+    }
+    throw err
+  } finally {
+    envelopeKey.fill(0)
+  }
+
+  return { fileId: session.fileId }
+}
+
+async function sendUpload({ apiBaseUrl, accessToken, name, path, size, onPlaintextChunk, session, envelopeKey, rootKey, recipientPublicKey }) {
   if (!session.proofKey) throw new Error('Upload session is missing its proof key.')
 
   // The server's v1 chunk size (5 MiB): each encrypted chunk is one storage part.
@@ -469,7 +563,6 @@ export async function uploadFile({ apiBaseUrl, accessToken, rootKey, name, path,
       yield chunk
     }
   }
-  const envelopeKey = base64ToBytes(csk)
   const parts = encryptPartsV3({
     plaintextChunks: plaintextChunks(),
     plaintextSize: size,
@@ -484,28 +577,22 @@ export async function uploadFile({ apiBaseUrl, accessToken, rootKey, name, path,
     await encryptNameV6({ name, folderKey: rootKey, rowId: session.fileId }),
   )
 
-  try {
-    if (session.uploadKind === 'direct') {
-      // No authToken and no storagePath check: since web b52b4c8 (PR #726) the
-      // direct path is a presigned S3 PUT, so the signature inside uploadUrl is
-      // the only credential and it already binds the object key. Requiring the
-      // token the server stopped issuing is what made every <= 5 MiB upload fail
-      // from 2026-09-03. The 'large' branch below still needs both.
-      if (!session.uploadUrl) {
-        throw new Error('Direct upload session is missing an upload URL.')
-      }
-      await uploadDirect({ apiBaseUrl, accessToken, session, parts, nameEncryptedV6 })
-    } else if (session.uploadKind === 'large') {
-      if (!session.uploadUrl || !session.authToken) {
-        throw new Error('Multipart upload session is missing credentials.')
-      }
-      await uploadMultipart({ apiBaseUrl, accessToken, session, parts, nameEncryptedV6 })
-    } else {
-      throw new Error(`Unknown uploadKind "${session.uploadKind}" for "${name}".`)
+  if (session.uploadKind === 'direct') {
+    // No authToken and no storagePath check: since web b52b4c8 (PR #726) the
+    // direct path is a presigned S3 PUT, so the signature inside uploadUrl is
+    // the only credential and it already binds the object key. Requiring the
+    // token the server stopped issuing is what made every <= 5 MiB upload fail
+    // from 2026-09-03. The 'large' branch below still needs both.
+    if (!session.uploadUrl) {
+      throw new Error('Direct upload session is missing an upload URL.')
     }
-  } finally {
-    envelopeKey.fill(0)
+    await uploadDirect({ apiBaseUrl, accessToken, session, parts, nameEncryptedV6, empty: size === 0 })
+  } else if (session.uploadKind === 'large') {
+    if (!session.uploadUrl || !session.authToken) {
+      throw new Error('Multipart upload session is missing credentials.')
+    }
+    await uploadMultipart({ apiBaseUrl, accessToken, session, parts, nameEncryptedV6 })
+  } else {
+    throw new Error(`Unknown uploadKind "${session.uploadKind}" for "${name}".`)
   }
-
-  return { fileId: session.fileId }
 }
