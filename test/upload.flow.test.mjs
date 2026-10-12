@@ -39,8 +39,8 @@ function jsonResponse(status, body) {
 }
 
 // Row ids are UUIDs: the header's file_id is the row id's 16 bytes.
-const FILE_ID = '3f1c2a9e-7b4d-4c1e-9a2f-0d6e8b5c4a71'
-const DIRECT_FILE_ID = '9e2b7c4d-1a3f-4e8b-8c6d-5f0a2b9e7d13'
+const FILE_ID = '01928c3a-1b2c-7d3e-8f40-123456789abc'
+const DIRECT_FILE_ID = '01928c3a-1b2c-7d3e-9f40-0a0b0c0d0e0f'
 
 async function withTempFile(content, fn) {
   const dir = await mkdtemp(join(tmpdir(), 'sf-cli-flow-'))
@@ -128,6 +128,7 @@ test('multipart push: parts, nonce sequencing, first-chunk proof, ciphertextHash
         name: 'Secret Q3.pdf',
         path,
         size: content.length,
+        rowId: FILE_ID,
       }),
     )
   } finally {
@@ -138,6 +139,14 @@ test('multipart push: parts, nonce sequencing, first-chunk proof, ciphertextHash
 
   // Session was requested with the true byte size.
   assert.equal(createBody.sizeBytes, 20)
+  // Row binding from the first write: the client picks the UUIDv7 row id and
+  // the name sent at create is already the v6 envelope sealed to it.
+  assert.equal(createBody.clientUploadId, FILE_ID)
+  assert.equal(JSON.parse(createBody.name_encrypted).v, 6)
+  assert.equal(
+    await decryptName({ envelope: JSON.parse(createBody.name_encrypted), folderKey: rootKey, rowId: FILE_ID }),
+    'Secret Q3.pdf',
+  )
 
   // Exactly three parts landed, numbered 1..3 in order.
   assert.deepEqual(
@@ -282,6 +291,7 @@ test('multipart push: parts completing OUT OF ORDER still finalize in chunk orde
         name: 'Big Secret.pdf',
         path,
         size: content.length,
+        rowId: FILE_ID,
       }),
     )
   } finally {
@@ -404,6 +414,7 @@ test('multipart push: a 5xx on a part is retried with a fresh URL and succeeds',
         name: 'Secret.pdf',
         path,
         size: content.length,
+        rowId: FILE_ID,
       }),
     )
   } finally {
@@ -476,6 +487,7 @@ test('direct push: presigned PUT, no Authorization, no b2FileId at finalize', as
         name: 'small.txt',
         path,
         size: content.length,
+        rowId: DIRECT_FILE_ID,
       }),
     )
   } finally {
