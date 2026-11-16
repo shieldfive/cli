@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## 0.5.0 — 2026-11-16
+
+### Behaviour changes
+
+- **`sf push` copies the whole folder tree.** It creates one vault folder named
+  after the source and recreates every subfolder inside it (folder keys and
+  names made as the web app's Upload folder makes them). It used to upload only
+  the files at the top of the folder, to the vault root. Through the agent it
+  still does that, and refuses a folder with subfolders.
+- **`sf push` is resumable.** A 0600 state file in `~/.shieldfive/push/` records
+  finished folders and files; rerunning skips them. A file whose finalize was
+  cut off is settled by asking the server, not uploaded twice.
+
+### Added
+
+- Retries with backoff for network errors and 5xx/408/429 answers on the
+  session, the direct PUT, each part and the folder calls; 3 files at a time
+  (`SF_PUSH_CONCURRENCY`); per-file output and a progress line every 10 s;
+  first Ctrl-C finishes uploads in progress, second quits.
+- The access token is refreshed during a long push, including in the middle of
+  a large file.
+- File and folder names are sent in Unicode NFC.
+
+### Verified
+
+- Run against production on 2026-11-16 with the canary account: 249 files /
+  532 MB in 10 folders (520 MB and 12 MB files, Unicode/long/duplicate names),
+  killed and interrupted midway, resumed, rows `ready` with the right sizes,
+  downloads byte-identical in the web app.
+
 ## 0.4.0 — 2026-10-12
 
 ### Behaviour changes
