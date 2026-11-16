@@ -390,7 +390,7 @@ export async function runPush({
         const secs = (Date.now() - started) / 1000
         const sent = summary.bytesUploaded + inFlightBytes
         status(
-          `progress: ${completed}/${todo.length} files, ${fmtBytes(summary.bytesUploaded)} of ${fmtBytes(todoBytes)}` +
+          `progress: ${completed}/${todo.length} files, ${fmtBytes(sent)} of ${fmtBytes(todoBytes)}` +
             (secs > 0 ? `, ${fmtBytes(sent / secs)}/s` : ''),
         )
       }, progressEveryMs)

@@ -40,15 +40,16 @@ size, uploading nothing.
 - The underlying cryptography ([`@shieldfive/crypto`](https://github.com/shieldfive/crypto))
   has **not** undergone an external audit yet. Treat this as early software.
 - **`sf push` was run against production on 2026-11-16** (0.5.0, with the
-  dedicated canary account): a 532 MB tree of 249 files in 10 folders, including
-  a 520 MB file, a 12 MB file, ~240 small files, Unicode, very long and
-  duplicate names, a hidden `.DS_Store` and a symlink. The run was hard-killed
-  (SIGKILL) partway, then stopped with Ctrl-C, then rerun to the end; a fourth
-  run uploaded nothing. Every file is `ready` in the database with the right
-  size, and files downloaded in the web app came back byte-identical (see
-  [Migrating from Dropbox or Google Drive](#migrating-from-dropbox-or-google-drive-with-rclone)).
-  Production does not accept 0-byte files yet: `sf push` skips them, says so,
-  and exits 2.
+  dedicated canary account) on a tree of 248 files (534 MB) in 10 folders: a
+  520 MB file, a 12 MB file, 240 small files, an empty folder, a 0-byte file,
+  Unicode, 200-character and duplicate names, two `.DS_Store` files and a
+  symlink. The first run was killed (SIGKILL) after 81 files, the second was
+  stopped with Ctrl-C after 60 more, the third resumed and finished, and a
+  fourth uploaded nothing. In the production database all 247 non-empty files
+  are `ready`, each with its id, plaintext size and folder exactly as the client
+  recorded them, and the 10 folders form the source tree. The hidden files and
+  the symlink were skipped. Production does not accept 0-byte files yet:
+  `sf push` skips them, says so, and exits 2.
 - These `sf push` behaviours are covered by offline tests only and have **not**
   been exercised against production: retries after network errors and 5xx/429
   answers, stopping on a full vault, refreshing the session during a run longer
