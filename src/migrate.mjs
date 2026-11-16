@@ -302,7 +302,9 @@ export async function runPush({
   const state = await loadState(statePath, { account, source })
   const save = (() => {
     let chain = Promise.resolve()
-    return () => (chain = chain.then(() => saveState(statePath, state)))
+    // Serialised; one failed write (disk full) fails its caller but does not
+    // poison every later save.
+    return () => (chain = chain.catch(() => {}).then(() => saveState(statePath, state)))
   })()
 
   // Folders: resume into the ones recorded, create the rest.
