@@ -50,12 +50,29 @@ const CAPABILITIES_PATH = '/api/files/upload-capabilities'
 // part upload is idempotent by (part number, SHA-1) — retrying overwrites the
 // same part. Bound the retries and back off so one transient blip does not
 // abort a whole multi-gigabyte upload.
-const MAX_PART_ATTEMPTS = 3
-const PART_RETRY_BASE_DELAY_MS = 250
+const MAX_PART_ATTEMPTS = 5
+const PART_RETRY_BASE_DELAY_MS = 1000
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 const partRetryDelayMs = (attempt) =>
-  PART_RETRY_BASE_DELAY_MS * 2 ** (attempt - 1) // 250ms, 500ms, ...
+  PART_RETRY_BASE_DELAY_MS * 2 ** (attempt - 1) // 1s, 2s, 4s, 8s
+
+// `accessToken` is a string, or a function returning the current one. A
+// function is resolved at every request, so an upload that outlives the access
+// token (about an hour; a multi-gigabyte file can) picks up a refreshed session
+// for its later part URLs and its finalize.
+export async function resolveToken(accessToken) {
+  return typeof accessToken === 'function' ? accessToken() : accessToken
+}
+
+// An Error that keeps the HTTP status and the server's error code, so callers
+// can tell a transient failure (5xx, 429) from a terminal one (quota, 4xx).
+export function httpError(message, status, body) {
+  const err = new Error(message)
+  err.status = status
+  if (body && typeof body === 'object' && typeof body.code === 'string') err.serverCode = body.code
+  return err
+}
 
 // Read a file in fixed-size chunks without holding it all in memory. Each yield
 // is an independent copy (the read buffer is reused), so the caller may retain
@@ -120,22 +137,30 @@ export async function createUploadSession({
   name,
   size,
   rowId,
+  folderId = null,
+  folderKey = null,
 }) {
   const rootKeyB64 = bytesToBase64(rootKey)
+  // The parent's key: the root key at the vault root, else the folder's own
+  // key. The name is sealed under it and the envelope key wrapped by it,
+  // exactly as the web uploader does for a file inside a folder. The name hash
+  // is always keyed by the root key (web hashMetadataClient(name, rootKey)).
+  const parentKey = folderKey ?? rootKey
+  const parentKeyB64 = bytesToBase64(parentKey)
   // The client picks the row id (UUIDv7, sent as clientUploadId), so the very
   // first stored name is already the v6 envelope bound to that row. No v4
   // (row-unbound) name is ever written, even for an upload that fails before
   // finalize.
-  const nameEnvelopeV6 = await encryptNameV6({ name, folderKey: rootKey, rowId })
+  const nameEnvelopeV6 = await encryptNameV6({ name, folderKey: parentKey, rowId })
   // For suite 0x03 this is the classical envelope key; csk_wrapped holds it
-  // under the parent key (the root key: sf uploads to the vault root).
+  // under the parent key.
   const csk = generateRandomKeyB64()
-  const cskEnvelope = wrapKeyB64({ wrappingKeyB64: rootKeyB64, keyToWrapB64: csk })
+  const cskEnvelope = wrapKeyB64({ wrappingKeyB64: parentKeyB64, keyToWrapB64: csk })
 
   const res = await fetch(new URL(CREATE_SESSION_PATH, apiBaseUrl), {
     method: 'POST',
     headers: {
-      Authorization: `Bearer ${accessToken}`,
+      Authorization: `Bearer ${await resolveToken(accessToken)}`,
       'Content-Type': 'application/json',
     },
     // v1 wire format: no cipher_nonce_prefix and no chunkSize (the server
@@ -148,7 +173,7 @@ export async function createUploadSession({
       csk_iv: cskEnvelope.iv,
       cipherVersion: CIPHER_VERSION_PQ,
       sizeBytes: size,
-      folderId: null,
+      folderId,
       contentType: 'application/octet-stream',
       thumbnail_ciphertext_b64: null,
       thumbnail_nonce_prefix: null,
@@ -156,8 +181,10 @@ export async function createUploadSession({
   })
   const body = await res.json().catch(() => ({}))
   if (!res.ok) {
-    throw new Error(
+    throw httpError(
       `create-upload-session failed (HTTP ${res.status}): ${JSON.stringify(body)}`,
+      res.status,
+      body,
     )
   }
   return { session: body, csk, nameEncryptedV6: JSON.stringify(nameEnvelopeV6) }
@@ -178,18 +205,34 @@ export async function createUploadSession({
 // Returns nothing. A presigned PUT answers with an ETag, not a Backblaze file
 // id, so there is no storage id to hand to finalize.
 async function putDirectPresigned({ session, ciphertext }) {
-  const res = await fetch(session.uploadUrl, {
-    method: 'PUT',
-    headers: {
-      'Content-Type': session.contentType || 'application/octet-stream',
-    },
-    body: ciphertext,
-  })
-  if (!res.ok) {
-    throw new Error(
+  // Retried on network errors and 5xx / 408 / 429: the presigned URL names one
+  // object key, so a repeated PUT overwrites the same object with the same bytes.
+  let lastError
+  for (let tries = 1; tries <= MAX_PART_ATTEMPTS; tries += 1) {
+    let res
+    try {
+      res = await fetch(session.uploadUrl, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': session.contentType || 'application/octet-stream',
+        },
+        body: ciphertext,
+      })
+    } catch (err) {
+      lastError = err
+      if (tries < MAX_PART_ATTEMPTS) await sleep(partRetryDelayMs(tries))
+      continue
+    }
+    if (res.ok) return
+    lastError = httpError(
       `Direct upload failed (HTTP ${res.status}): ${await res.text().catch(() => '')}`,
+      res.status,
     )
+    const retryable = res.status >= 500 || res.status === 429 || res.status === 408
+    if (!retryable) throw lastError
+    if (tries < MAX_PART_ATTEMPTS) await sleep(partRetryDelayMs(tries))
   }
+  throw lastError
 }
 
 // Ask the server for a fresh b2_upload_part URL + token when the current one
@@ -198,15 +241,17 @@ async function refreshUploadPartUrl({ apiBaseUrl, accessToken, fileId }) {
   const res = await fetch(new URL(PART_URL_PATH, apiBaseUrl), {
     method: 'POST',
     headers: {
-      Authorization: `Bearer ${accessToken}`,
+      Authorization: `Bearer ${await resolveToken(accessToken)}`,
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({ fileId }),
   })
   const body = await res.json().catch(() => ({}))
   if (!res.ok || !body.uploadUrl || !body.authToken) {
-    throw new Error(
+    throw httpError(
       `upload-part-url failed (HTTP ${res.status}): ${JSON.stringify(body)}`,
+      res.status,
+      body,
     )
   }
   return { uploadUrl: body.uploadUrl, authToken: body.authToken }
@@ -273,9 +318,10 @@ async function putPartToBackblaze({
 
     if (res.ok) return { uploadUrl: url, authToken: token }
 
-    lastError = new Error(
+    lastError = httpError(
       `Backblaze part ${partNumber} upload failed (HTTP ${res.status}): ` +
         `${await res.text().catch(() => '')}`,
+      res.status,
     )
 
     // 5xx / 408 / 429 are worth retrying; other 4xx (after the auth refresh
@@ -310,7 +356,7 @@ async function finalizeUpload({
     res = await fetch(new URL(COMPLETE_PATH, apiBaseUrl), {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${accessToken}`,
+        Authorization: `Bearer ${await resolveToken(accessToken)}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({ fileId, b2FileId, partSha1Array, proof, ciphertextHash, nameEncryptedV6 }),
@@ -323,8 +369,10 @@ async function finalizeUpload({
   }
   const body = await res.json().catch(() => ({}))
   if (!res.ok) {
-    throw new Error(
+    throw httpError(
       `complete-upload failed (HTTP ${res.status}): ${JSON.stringify(body)}`,
+      res.status,
+      body,
     )
   }
   return body
@@ -498,7 +546,7 @@ export async function cancelUploadSession({ apiBaseUrl, accessToken, fileId }) {
     const res = await fetch(new URL(DELETE_PATH, apiBaseUrl), {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${accessToken}`,
+        Authorization: `Bearer ${await resolveToken(accessToken)}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({ ids: [fileId] }),
@@ -526,7 +574,7 @@ export class EmptyFileUnsupportedError extends Error {
 async function serverAcceptsEmptyFiles({ apiBaseUrl, accessToken }) {
   try {
     const res = await fetch(new URL(CAPABILITIES_PATH, apiBaseUrl), {
-      headers: { Authorization: `Bearer ${accessToken}` },
+      headers: { Authorization: `Bearer ${await resolveToken(accessToken)}` },
     })
     if (!res.ok) return false
     const body = await res.json().catch(() => ({}))
@@ -541,7 +589,7 @@ async function serverAcceptsEmptyFiles({ apiBaseUrl, accessToken }) {
 // chunks to record what was actually uploaded; hashing the file separately,
 // before or after, cannot see a change made and undone while it was being read.
 // `rowId` is for tests only; callers let it default to a fresh UUIDv7.
-export async function uploadFile({ apiBaseUrl, accessToken, rootKey, name, path, size, onPlaintextChunk, rowId = newRowBoundId() }) {
+export async function uploadFile({ apiBaseUrl, accessToken, rootKey, name, path, size, onPlaintextChunk, rowId = newRowBoundId(), folderId = null, folderKey = null }) {
   // Derived before anything is sent, so a vault whose identity cannot be
   // derived fails before a session (and a pending row) exists.
   const recipientPublicKey = await vaultMlKemPublicKey(rootKey)
@@ -555,6 +603,8 @@ export async function uploadFile({ apiBaseUrl, accessToken, rootKey, name, path,
     name,
     size,
     rowId,
+    folderId,
+    folderKey,
   })
   // From here on a pending row exists. Any failure before finalize answers
   // cancels it (see cancelUploadSession).

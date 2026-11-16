@@ -401,6 +401,17 @@ async function cmdLogout(flags) {
 async function cmdPush(folder, flags) {
   const { agent } = await chooseAuth()
   if (agent) {
+    // The agent uploads single files to the vault root; it cannot make vault
+    // folders yet. Refuse a tree rather than flatten it.
+    const { readdir: readDir } = await import('node:fs/promises')
+    const entries = await readDir(resolve(folder), { withFileTypes: true })
+    if (entries.some((e) => e.isDirectory() && !e.name.startsWith('.'))) {
+      throw new Error(
+        'this folder has subfolders, and pushing through the agent (sf login) only ' +
+          'uploads the files at its top level. To copy the whole tree, run sf logout, ' +
+          'then set SF_EMAIL and SF_PASSWORD and run sf push again.',
+      )
+    }
     const { request } = await import('./agent/client.mjs')
     process.stderr.write(`pushing to account ${agent.account} through the agent\n`)
     let differs = 0
@@ -431,29 +442,68 @@ async function cmdPush(folder, flags) {
   }
 
   const cfg = readLiveConfig(flags)
-  const { uploadFile } = await import('./upload.mjs')
-  const { accessToken, rootKey } = await authAndUnlock(cfg)
+  const { runPush } = await import('./migrate.mjs')
+  const { createSessionTokens } = await import('./sync.mjs')
+  const session = await authAndUnlock(cfg)
+  const accessToken = createSessionTokens({
+    accessToken: session.accessToken,
+    refreshToken: session.refreshToken,
+    expiresAt: session.expiresAt,
+    refresh: session.refreshSession,
+  })
 
-  let skipped = 0
-  for await (const { name, path, size } of filesIn(folder, pushListOptions(flags))) {
-    try {
-      await uploadFile({
-        apiBaseUrl: cfg.apiBaseUrl,
-        accessToken,
-        rootKey,
-        name,
-        path,
-        size,
-      })
-    } catch (err) {
-      if (err.code !== 'empty_file_unsupported') throw err
-      process.stdout.write(`skipped ${name}: ${err.message}\n`)
-      skipped++
-      continue
+  // First Ctrl-C: start nothing new, let uploads in progress finish and be
+  // recorded. Second: quit now. Either way a rerun picks up where this left off.
+  const controller = new AbortController()
+  const onSigint = () => {
+    if (controller.signal.aborted) {
+      process.stderr.write('\nquitting now; run the same command again to resume\n')
+      process.exit(130)
     }
-    process.stdout.write(`pushed ${name}\n`)
+    controller.abort()
+    process.stderr.write(
+      '\nstopping: finishing the uploads in progress (Ctrl-C again to quit now). ' +
+        'Run the same command again to resume.\n',
+    )
   }
-  if (skipped) process.exitCode = 2
+  process.on('SIGINT', onSigint)
+  let summary
+  try {
+    summary = await runPush({
+      source: folder,
+      apiBaseUrl: cfg.apiBaseUrl,
+      accessToken,
+      rootKey: session.rootKey,
+      account: cfg.email.toLowerCase(),
+      includeDotfiles: pushListOptions(flags).includeDotfiles,
+      signal: controller.signal,
+    })
+  } finally {
+    process.off('SIGINT', onSigint)
+  }
+  const fmt = (n) => `${(n / 1e9).toFixed(2)} GB`
+  process.stderr.write(
+    `done: ${summary.uploaded} uploaded (${fmt(summary.bytesUploaded)}), ` +
+      `${summary.alreadyThere} already there, ${summary.foldersCreated} folders created` +
+      (summary.failed.length ? `, ${summary.failed.length} FAILED` : '') +
+      (summary.changed.length ? `, ${summary.changed.length} changed while uploading` : '') +
+      (summary.skippedEmpty.length ? `, ${summary.skippedEmpty.length} empty skipped` : '') +
+      '\n',
+  )
+  if (summary.stoppedBy) {
+    process.stderr.write(`stopped: ${summary.stoppedBy.message}\n`)
+    process.exitCode = 1
+    return
+  }
+  if (summary.interrupted) {
+    process.stderr.write(`interrupted with ${summary.notStarted} files not started; run the same command again to resume\n`)
+    process.exitCode = 130
+    return
+  }
+  if (summary.failed.length || summary.changed.length || summary.skippedEmpty.length) {
+    process.stderr.write('some files are not in the vault; run the same command again to retry them\n')
+    process.exitCode = 2
+  }
 }
 
 function pushListOptions(flags) {
