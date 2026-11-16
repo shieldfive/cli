@@ -207,3 +207,28 @@ test('an aborted run starts nothing new', async () => {
   assert.equal(s.interrupted, true)
   assert.equal(s.notStarted, 2)
 })
+
+test('a vault folder deleted between runs is made again and its files re-uploaded', async () => {
+  const src = await makeTree()
+  const statePath = join(dir, 'state.json')
+  await runPush({ source: src, apiBaseUrl: 'https://x.test', accessToken: 't', rootKey, account: 'a@x', statePath, uploadFn: fakeUploader([]), ...quiet })
+  const state = JSON.parse(await readFile(statePath, 'utf8'))
+  server.folders.delete(state.folders['Photos/2024'])
+  const again = []
+  await runPush({ source: src, apiBaseUrl: 'https://x.test', accessToken: 't', rootKey, account: 'a@x', statePath, uploadFn: fakeUploader(again), ...quiet })
+  assert.deepEqual(again.map((u) => u.name), ['Caf\u00e9.jpg'])
+})
+
+test('a file that changes while it uploads is reported and not recorded as done', async () => {
+  const src = join(dir, 'src')
+  await mkdir(src)
+  await writeFile(join(src, 'f.txt'), 'one')
+  const statePath = join(dir, 's.json')
+  const uploader = async (args) => {
+    await writeFile(args.path, 'changed, longer')
+    return fakeUploader([])(args)
+  }
+  const s = await runPush({ source: src, apiBaseUrl: 'https://x.test', accessToken: 't', rootKey, account: 'a@x', statePath, uploadFn: uploader, ...quiet })
+  assert.deepEqual(s.changed, ['f.txt'])
+  assert.equal(JSON.parse(await readFile(statePath, 'utf8')).files['f.txt'], undefined)
+})

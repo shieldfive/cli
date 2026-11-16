@@ -335,7 +335,15 @@ export async function runPush({
       state.folders = {}
       state.files = {}
       state.pending = {}
-    } else state.folders[rel] = made.id
+    } else {
+      state.folders[rel] = made.id
+      // The folder was (re)made, so files recorded in the old one are not in
+      // this one: forget them so they upload again.
+      for (const key of Object.keys(state.files)) {
+        const cut = key.lastIndexOf('/')
+        if ((cut === -1 ? '' : key.slice(0, cut)) === rel) delete state.files[key]
+      }
+    }
     await save()
     return true
   }

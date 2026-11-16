@@ -49,6 +49,12 @@ size, uploading nothing.
   [Migrating from Dropbox or Google Drive](#migrating-from-dropbox-or-google-drive-with-rclone)).
   Production does not accept 0-byte files yet: `sf push` skips them, says so,
   and exits 2.
+- These `sf push` behaviours are covered by offline tests only and have **not**
+  been exercised against production: retries after network errors and 5xx/429
+  answers, stopping on a full vault, refreshing the session during a run longer
+  than the access token's lifetime, settling a file whose finalize was cut off,
+  a file changing while it uploads, a vault folder deleted between runs, and a
+  vault password different from the account password.
 - `sf sync` is **append-only**: it uploads new and changed files; it does not
   yet mirror local deletions or renames into the vault.
 - **`sf login` and the agent have not been run against production.** They are
