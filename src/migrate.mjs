@@ -220,13 +220,14 @@ function folderKeyFor(id, byId, rootKeyB64, cache) {
   return key
 }
 
-async function createFolder({ apiBaseUrl, accessToken, rootKeyB64, name, parentId, parentKeyB64 }) {
+// Build the create request once; retries resend the same id and body, and the
+// server answers a repeated create whose first answer was lost with the folder
+// it already made, so a retry never makes a second folder.
+async function prepareFolder({ rootKeyB64, name, parentId, parentKeyB64 }) {
   const id = newRowBoundId()
   const envelope = await encryptNameV6({ name, folderKey: base64ToBytes(parentKeyB64), rowId: id })
   const folderKey = generateRandomKeyB64()
   const wrapped = wrapKeyB64({ wrappingKeyB64: parentKeyB64, keyToWrapB64: folderKey })
-  // The same id and body on every retry: the server answers a repeated create
-  // whose first answer was lost with the folder it already made.
   const body = {
     id,
     name_encrypted: JSON.stringify(envelope),
@@ -235,9 +236,13 @@ async function createFolder({ apiBaseUrl, accessToken, rootKeyB64, name, parentI
     fk_wrapped: wrapped.wrapped,
     fk_iv: wrapped.iv,
   }
-  const res = await apiJson(apiBaseUrl, accessToken, '/api/folders/create', { method: 'POST', body })
-  if (res?.folder?.id !== id) throw new Error(`folders/create returned ${res?.folder?.id} for ${id}`)
-  return { id, key: folderKey }
+  return { id, key: folderKey, body }
+}
+
+async function sendFolder({ apiBaseUrl, accessToken, prepared }) {
+  const res = await apiJson(apiBaseUrl, accessToken, '/api/folders/create', { method: 'POST', body: prepared.body })
+  if (res?.folder?.id !== prepared.id) throw new Error(`folders/create returned ${res?.folder?.id} for ${prepared.id}`)
+  return { id: prepared.id, key: prepared.key }
 }
 
 async function verifyReady({ apiBaseUrl, accessToken, ids }) {
@@ -316,16 +321,14 @@ export async function runPush({
         return false
       }
     }
+    const prepared = await prepareFolder({
+      rootKeyB64,
+      name: vaultName(name),
+      parentId: parent?.id ?? null,
+      parentKeyB64: parent?.key ?? rootKeyB64,
+    })
     const made = await withRetry(
-      () =>
-        createFolder({
-          apiBaseUrl,
-          accessToken,
-          rootKeyB64,
-          name: vaultName(name),
-          parentId: parent?.id ?? null,
-          parentKeyB64: parent?.key ?? rootKeyB64,
-        }),
+      () => sendFolder({ apiBaseUrl, accessToken, prepared }),
       { onRetry: (e, n, d) => status(`creating folder ${rel || name}: ${e.message}; retrying in ${Math.round(d / 1000)} s`) },
     )
     folderIds.set(rel, made)

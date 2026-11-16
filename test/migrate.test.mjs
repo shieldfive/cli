@@ -232,3 +232,25 @@ test('a file that changes while it uploads is reported and not recorded as done'
   assert.deepEqual(s.changed, ['f.txt'])
   assert.equal(JSON.parse(await readFile(statePath, 'utf8')).files['f.txt'], undefined)
 })
+
+test('a folder create whose answer was lost is retried with the same id', async () => {
+  const src = join(dir, 'src')
+  await mkdir(join(src, 'sub'), { recursive: true })
+  const inner = globalThis.fetch
+  const ids = []
+  let dropped = false
+  globalThis.fetch = async (url, init) => {
+    if (new URL(url).pathname === '/api/folders/create') {
+      ids.push(JSON.parse(init.body).id)
+      if (!dropped) {
+        dropped = true
+        await inner(url, init) // the server makes it...
+        throw new TypeError('fetch failed') // ...the answer is lost
+      }
+    }
+    return inner(url, init)
+  }
+  await runPush({ source: src, apiBaseUrl: 'https://x.test', accessToken: 't', rootKey, account: 'a@x', statePath: join(dir, 's.json'), uploadFn: fakeUploader([]), ...quiet })
+  assert.equal(ids[0], ids[1])
+  assert.equal(server.folders.size, 2)
+})
