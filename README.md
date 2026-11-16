@@ -39,18 +39,27 @@ size, uploading nothing.
 
 - The underlying cryptography ([`@shieldfive/crypto`](https://github.com/shieldfive/crypto))
   has **not** undergone an external audit yet. Treat this as early software.
-- **Neither upload path has been exercised against production since 2026-09-03.**
-  The direct (≤ 5 MiB) path was validated end to end against the backend as it
-  stood at 0.1.0, but the server then moved that path to a presigned S3 PUT and
-  stopped issuing an upload token. 0.2.0 hard-required that token, so it could
-  not upload any file of 5 MiB or less at all. This release rewrites the direct
-  path to the presigned PUT. It is covered by the offline mock test in
-  [`test/upload.flow.test.mjs`](test/upload.flow.test.mjs) and sends byte-for-byte
-  the request the web app sends, but it has not been run live.
-- The **multipart** path (files larger than 5 MiB) is covered by a byte-for-byte
-  review against the server contract and a mock end-to-end test that decrypts
-  every part, but has not yet been exercised against production with a real
-  large file.
+- **`sf push` was run against production on 2026-11-16** (0.5.0, with the
+  dedicated canary account) on a tree of 248 files (534 MB) in 10 folders: a
+  520 MB file, a 12 MB file, 240 small files, an empty folder, a 0-byte file,
+  Unicode, 200-character and duplicate names, two `.DS_Store` files and a
+  symlink. The first run was killed (SIGKILL) after 81 files, the second was
+  stopped with Ctrl-C after 60 more, the third resumed and finished, and a
+  fourth uploaded nothing. In the production database all 247 non-empty files
+  are `ready`, each with its id, plaintext size and folder exactly as the client
+  recorded them, and the 10 folders form the source tree. The hidden files and
+  the symlink were skipped. Three of the files (a small one at the top, the
+  Unicode-named one and the 520 MB one) were then downloaded in the web app and
+  decrypted byte-identical. Uploading left the account's download allowance
+  counter unchanged. One `sf sync` pass of a flat folder uploaded both of its
+  files to the vault root. Production does not accept 0-byte files yet:
+  `sf push` skips them, says so, and exits 2.
+- These `sf push` behaviours are covered by offline tests only and have **not**
+  been exercised against production: retries after network errors and 5xx/429
+  answers, stopping on a full vault, refreshing the session during a run longer
+  than the access token's lifetime, settling a file whose finalize was cut off,
+  a file changing while it uploads, a vault folder deleted between runs, and a
+  vault password different from the account password.
 - `sf sync` is **append-only**: it uploads new and changed files; it does not
   yet mirror local deletions or renames into the vault.
 - **`sf login` and the agent have not been run against production.** They are
@@ -83,7 +92,7 @@ trust it):
 git clone https://github.com/shieldfive/cli.git
 cd cli
 npm install     # @shieldfive/crypto (+ libsodium), @supabase/supabase-js, @noble/*
-npm test        # 107 tests
+npm test
 ```
 
 ## Commands
@@ -92,7 +101,7 @@ npm test        # 107 tests
 sf login [--idle=<hours>]                    sign in once; an agent holds the session in memory (locks after 8 h idle)
 sf status                                    is an agent running, and for which account
 sf logout [--everywhere]                     revoke the session and stop the agent; --everywhere signs out every device
-sf push <folder> [--include-dotfiles]        encrypt and upload every file once (skips dotfiles unless asked; never follows symlinks)
+sf push <folder> [--include-dotfiles]        copy a whole folder tree into a new vault folder; rerun to resume
 sf sync <folder> [--watch] [--interval=N]    upload new/changed files; --watch keeps a poll loop (N seconds, default 5)
 sf verify <file>...                          report whether each file is safely stored in your vault
 sf encrypt <folder>                          encrypt each file locally, upload nothing (no account needed)
@@ -100,14 +109,36 @@ sf inspect <folder>                          read-only recursive migration inven
 ```
 
 `sf push` and `sf sync` pick the direct or multipart upload path automatically
-from the file size. Both read only regular files directly inside the folder:
-symlinks are skipped (and files are opened with `O_NOFOLLOW`), and names
-starting with `.` are skipped unless you pass `sf push --include-dotfiles`.
-An empty (0-byte) file is uploaded only when the server says it accepts empty
-files; otherwise it is reported as skipped and the exit code is 2. If an upload
-fails after its session was created, the pending session is cancelled so it
-does not hold quota. `sf sync` writes its manifest (`.shieldfive-sync.json`)
-with mode 0600.
+from the file size. Symlinks are never followed (files are opened with
+`O_NOFOLLOW`), and names starting with `.` (`.DS_Store`, `.git`, `.env`) are
+skipped unless you pass `sf push --include-dotfiles`. An empty (0-byte) file is
+uploaded only when the server says it accepts empty files; otherwise it is
+reported as skipped and the exit code is 2. If an upload fails after its session
+was created, the pending session is cancelled so it does not hold quota.
+
+`sf push` copies the whole tree: it creates one vault folder named after
+`<folder>` and recreates every subfolder (empty ones too) inside it, the way the
+web app's Upload folder does. Three files upload at a time
+(`SF_PUSH_CONCURRENCY`, 1-8); large files also send three parts at a time
+(`SF_UPLOAD_CONCURRENCY`). Network errors, 5xx, 408 and 429 answers are retried
+with backoff. It prints each file as it finishes and a progress line every 10
+seconds. A full vault or a refused session stops the run; any other file that
+fails is listed, the rest continue, and the exit code is 2.
+
+It is resumable. A state file in `~/.shieldfive/push/` (mode 0600; file names
+and vault ids, never keys) records each folder made and each file once its
+upload is final, so running the same command again skips those and uploads the
+rest; a file interrupted halfway starts again from its beginning. The first
+Ctrl-C lets the uploads in progress finish and exits 130; a second quits at once.
+A run killed during a file's last step is settled on the next run by asking the
+server whether that file arrived, so it is not uploaded twice. A file that
+changes while it uploads is reported, and uploaded again on the next run. Files
+you delete from the vault after a run are not re-uploaded by a rerun.
+
+Through the agent (`sf login`), `sf push` uploads only the files at the top of
+the folder, to the vault root, and refuses a folder with subfolders; use the
+environment variables below for a tree. `sf sync` is also top-level only and
+uploads to the vault root.
 
 `sf inspect` reports JSON counts of files, directories, bytes and skipped entries.
 It includes nested/hidden files and empty folders, reads metadata only, and
@@ -181,6 +212,32 @@ Only TOTP is supported; SMS and other factors are not.
 With `sf login` you are asked once. The agent refreshes the stepped-up session
 on its own, so `sf sync --watch` keeps working on a two-factor account until the
 agent locks or you log out.
+
+## Migrating from Dropbox or Google Drive with rclone
+
+For most people the web app is simpler: sync Dropbox to your computer, then
+**Upload > Upload folder** in the browser
+(see [Move from Dropbox to ShieldFive](https://shieldfive.com/help/move-from-dropbox)).
+For a large or scripted move:
+
+```sh
+# 1. Copy your cloud files to a local folder (rclone.org; `rclone config` first)
+rclone copy dropbox: ~/dropbox-export --progress
+#    Google Drive: rclone copy gdrive: ~/drive-export --progress
+
+# 2. Encrypt and upload it, keeping the folder structure
+export SF_EMAIL=you@example.com
+read -rs SF_PASSWORD; echo; export SF_PASSWORD
+sf push ~/dropbox-export
+
+# 3. If it stops for any reason, run the same command again: it resumes.
+sf push ~/dropbox-export
+```
+
+Your vault gets a folder named `dropbox-export` with the same tree inside. The
+command exits 0 only when every file is in the vault. Uploads do not count
+toward your monthly download allowance. `sf push` copies once; it does not keep
+the folder in sync afterwards.
 
 ## What the agent can and cannot do
 
