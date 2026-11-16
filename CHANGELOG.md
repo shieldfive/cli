@@ -35,8 +35,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Run against production on 2026-11-16 with the canary account: 248 files /
   534 MB in 10 folders (520 MB and 12 MB files, Unicode/long/duplicate names),
   killed and interrupted midway, resumed; all 247 non-empty files `ready` with
-  the recorded ids, sizes and folders; the 0-byte file skipped (production does
-  not accept empty files yet).
+  the recorded ids, sizes and folders; three of them (including the 520 MB
+  file) downloaded byte-identical in the web app; the 0-byte file skipped
+  (production does not accept empty files yet).
 
 ## 0.4.0 — 2026-10-12
 

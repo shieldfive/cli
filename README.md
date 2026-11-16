@@ -48,7 +48,11 @@ size, uploading nothing.
   fourth uploaded nothing. In the production database all 247 non-empty files
   are `ready`, each with its id, plaintext size and folder exactly as the client
   recorded them, and the 10 folders form the source tree. The hidden files and
-  the symlink were skipped. Production does not accept 0-byte files yet:
+  the symlink were skipped. Three of the files (a small one at the top, the
+  Unicode-named one and the 520 MB one) were then downloaded in the web app and
+  decrypted byte-identical. Uploading left the account's download allowance
+  counter unchanged. One `sf sync` pass of a flat folder uploaded both of its
+  files to the vault root. Production does not accept 0-byte files yet:
   `sf push` skips them, says so, and exits 2.
 - These `sf push` behaviours are covered by offline tests only and have **not**
   been exercised against production: retries after network errors and 5xx/429
