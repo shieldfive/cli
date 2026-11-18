@@ -1,0 +1,118 @@
+name: release
+
+# Publishes @shieldfive/cli to npm WITH provenance when a version tag (vX.Y.Z)
+# is pushed. npm provenance (https://docs.npmjs.com/generating-provenance-statements)
+# cryptographically links the published tarball to this exact source commit and CI
+# run, and shows a "verified" provenance badge on the npm package page — a real
+# supply-chain trust signal.
+#
+# ── ONE-TIME SETUP ───────────────────────────────────────────────────────────
+#   Trusted publishing (OIDC), not a token. npm restricts tokens that bypass
+#   2FA for direct publishes (EOTP in CI, seen on @shieldfive/mcp 2026-09-21);
+#   the replacement is for the registry to trust THIS workflow directly:
+#     npmjs.com → @shieldfive/cli → Settings → Trusted Publisher →
+#       GitHub Actions · shieldfive/cli · workflow release.yml
+#   No secret is involved: npm verifies this job's id-token (below), and the
+#   provenance statement comes out of the same exchange.
+#
+# ── RELEASE FLOW (same convention, minus the manual `npm publish`) ────────────
+#   merge the release PR → push an annotated tag vX.Y.Z at the merge commit →
+#   this workflow tests and publishes with provenance.
+#
+#   dist-tag is derived from the version:
+#     1.0.0          → latest
+#     1.0.0-beta.1   → beta      (prereleases go to their own channel, NOT latest)
+#     1.0.0-rc.1     → rc
+#   To promote a prerelease to `latest`, run manually afterward:
+#     npm dist-tag add @shieldfive/cli@<version> latest
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Tag to publish (e.g. v1.0.0-rc.1)'
+        required: true
+
+permissions:
+  contents: read
+  id-token: write # REQUIRED for npm provenance (OIDC)
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 20
+          # No registry-url: it writes an .npmrc auth line expecting a token,
+          # and an empty one gets in the way of the OIDC exchange.
+          cache: npm
+
+      # Trusted publishing needs npm 11.5.1 or newer; Node 20 ships npm 10.
+      # Pinned to one exact version (Scorecard PinnedDependencies).
+      - name: Upgrade npm
+        run: npm install -g npm@11.21.0
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Test
+        run: npm test
+
+      - name: Resolve version and verify it matches the tag
+        id: ver
+        env:
+          # Untrusted input (workflow_dispatch ref / pushed tag name) is passed
+          # via env and never interpolated into the shell — git ref names permit
+          # `$()`, backticks, `;`, `|`, `&`, so a `${{ ... }}` interpolation here
+          # is a command-injection sink in the job that holds id-token:write. Mirrors dist-tag.yml. (Security audit SF-01, 2026-07.)
+          TAG_REF: ${{ github.event.inputs.ref || github.ref_name }}
+        run: |
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          TAG_VERSION="${TAG_REF#v}"
+          # Defense in depth: reject any version that is not a clean semver
+          # string, so no shell metacharacters can flow from package.json into
+          # the later `${{ steps.ver.outputs.version }}` uses (npm view / publish).
+          semver_re='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'
+          if [[ ! "$PKG_VERSION" =~ $semver_re ]]; then
+            echo "::error::package.json version is not a clean semver string"
+            exit 1
+          fi
+          if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
+            echo "::error::Tag (=$TAG_VERSION) does not match package.json version $PKG_VERSION"
+            exit 1
+          fi
+          echo "version=$PKG_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Skip if this version is already on npm
+        id: check
+        run: |
+          if npm view "@shieldfive/cli@${{ steps.ver.outputs.version }}" version >/dev/null 2>&1; then
+            echo "already=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::@shieldfive/cli@${{ steps.ver.outputs.version }} is already published — skipping publish."
+          else
+            echo "already=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish to npm with provenance
+        if: steps.check.outputs.already == 'false'
+        run: |
+          VER="${{ steps.ver.outputs.version }}"
+          if [[ "$VER" == *-* ]]; then
+            CHANNEL="$(echo "$VER" | sed -E 's/.*-([a-zA-Z]+).*/\1/')"
+          else
+            CHANNEL="latest"
+          fi
+          echo "Publishing $VER with provenance to dist-tag: $CHANNEL"
+          # OIDC: npm exchanges this job's GitHub identity for a short-lived
+          # publish credential. Nothing long-lived exists to leak.
+          npm publish --provenance --access public --tag "$CHANNEL"
