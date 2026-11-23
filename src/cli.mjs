@@ -18,6 +18,7 @@ import { webcrypto } from 'node:crypto'
 import { lstat, readFile, readdir } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 
+import { assertAgentPlatform } from './agent/paths.mjs'
 import { promptHidden, promptLine } from './prompt.mjs'
 import { deriveVaultIdentity, encryptFileForVault } from './sfCrypto.mjs'
 
@@ -47,8 +48,8 @@ function usage() {
       'After sf login, push / sync / verify go through the agent and need nothing',
       'in the environment. Without an agent, or when SF_EMAIL and SF_PASSWORD are',
       'set, push and sync sign in from those [SF_VAULT_PASSWORD if your vault',
-      'password differs]. SF_API_BASE_URL, SF_SUPABASE_URL, SF_SUPABASE_ANON_KEY',
-      'default to ShieldFive (override only for a development backend).',
+      'password differs]. On Windows, set SF_EMAIL and SF_PASSWORD before',
+      'running push or sync.',
       '',
     ].join('\n') + '\n',
   )
@@ -118,11 +119,12 @@ function readLiveConfig(flags = {}) {
   if (!email) missing.push('SF_EMAIL')
   if (!password) missing.push('SF_PASSWORD')
   if (missing.length) {
+    if (process.platform === 'win32') {
+      throw new Error(`Set ${missing.join(' and ')} in your terminal, then run the command again.`)
+    }
     throw new Error(
       `this command needs your ShieldFive account: run sf login, or set ` +
-        `${missing.join(' and ')}. (SF_API_BASE_URL, SF_SUPABASE_URL, and ` +
-        'SF_SUPABASE_ANON_KEY default to ShieldFive; override them only for a ' +
-        'development backend.)',
+        `${missing.join(' and ')}.`,
     )
   }
   return {
@@ -289,6 +291,7 @@ function readIdle(flags) {
 }
 
 async function cmdLogin(flags) {
+  assertAgentPlatform()
   const idle = readIdle(flags)
 
   const existing = await runningAgent()
@@ -485,7 +488,7 @@ async function cmdPush(folder, flags) {
   process.stderr.write(
     `done: ${summary.uploaded} uploaded (${fmt(summary.bytesUploaded)}), ` +
       `${summary.alreadyThere} already there, ${summary.foldersCreated} folders created` +
-      (summary.failed.length ? `, ${summary.failed.length} FAILED` : '') +
+      (summary.failed.length ? `, ${summary.failed.length} failed` : '') +
       (summary.changed.length ? `, ${summary.changed.length} changed while uploading` : '') +
       (summary.skippedEmpty.length ? `, ${summary.skippedEmpty.length} empty skipped` : '') +
       '\n',

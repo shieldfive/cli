@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## 0.5.1
+
+- Installation requires no lifecycle scripts. Argon2id uses the web vault's
+  WebAssembly implementation and produces the same keys.
+- `sf push` uses signed multipart uploads when the server allocates them.
+  Transient failures retry with fresh credentials and randomized backoff.
+- On Windows, agent sign-in points to `SF_EMAIL` and `SF_PASSWORD` for
+  `sf push` and `sf sync`. The package provides both `sf` and `shieldfive`.
+
 ## 0.5.0 — 2026-11-16
 
 ### Behaviour changes
@@ -104,7 +113,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   non-zero.
 
 - **Sign-in works for accounts on ShieldFive's current sign-in scheme.** 0.3.0
-  posted your password straight to Supabase, which fails for every account that
+  posted your password straight to the authentication service, which fails for every account that
   signs in with a client-derived login secret (all new accounts, and every
   account migrated on its next web or app sign-in), and sent the password to
   the server on each failed attempt. `sf login`, `sf push` and `sf sync` now ask
@@ -196,7 +205,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   token and threw `Direct upload session is missing credentials.` before sending
   a byte. The direct path now `PUT`s the ciphertext straight at the presigned
   URL with no `Authorization` and no `X-Bz-*` headers, and sends no `b2FileId`
-  at finalize — a presigned PUT returns an ETag, not a Backblaze file id, and
+  at finalize — a presigned PUT returns an ETag, not a storage file ID, and
   forwarding it would have been persisted verbatim as the storage id. Files
   larger than 5 MiB were never affected; the multipart path is unchanged and
   keeps its token, its `X-Bz-*` headers and its session-derived `b2FileId`.
@@ -204,7 +213,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **The direct path no longer sends a wire checksum.** It previously sent
-  `X-Bz-Content-Sha1`, which Backblaze's native upload verified server-side and
+  `X-Bz-Content-Sha1`, which the native storage upload verified server-side and
   rejected on mismatch. A presigned PUT signed for `host` only carries no
   equivalent, and the server's finalize check compares the client's
   `ciphertextHash` against the client's own `partSha1Array[0]` — both
@@ -237,7 +246,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **Two-factor authentication (TOTP).** Accounts with an authenticator app
-  enrolled now complete the Supabase AAL2 step-up during sign-in, which the
+  enrolled now complete the AAL2 step-up during sign-in, which the
   server's upload gate requires. After the password, the CLI prompts
   `Two-factor code (6 digits):` (or reads `SF_TOTP_CODE` in non-interactive
   contexts), runs the standard challenge/verify against the verified TOTP
@@ -247,7 +256,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Notes
 
-- The step-up flow is covered by unit tests over a mocked Supabase client
+- The step-up flow is covered by unit tests over a mocked authentication client
   (no-MFA, success, missing factor, malformed/wrong code, lookup failure). The
   live challenge/verify round-trip against a real 2FA account has not yet been
   exercised.

@@ -55,7 +55,7 @@ test('a failed upload cancels its pending session', async () => {
         if (url === `${API}/api/files/create-upload-session`) {
           return jsonResponse(200, { uploadKind: 'direct', fileId: FILE_ID, uploadUrl: 'https://s3.test/put', proofKey: PROOF_KEY })
         }
-        if (url === 'https://s3.test/put') return jsonResponse(500, { error: 'boom' })
+        if (url === 'https://s3.test/put') return jsonResponse(400, { error: 'Backblaze error' })
         if (url === `${API}/api/files/delete`) {
           deletes.push({ body: JSON.parse(init.body), auth: init.headers.Authorization })
           return jsonResponse(200, {})
@@ -65,14 +65,16 @@ test('a failed upload cancels its pending session', async () => {
       () =>
         assert.rejects(
           uploadFile({ apiBaseUrl: API, accessToken: 'tok', rootKey: rootKey(), name: 'a.bin', path, size: 5, rowId: FILE_ID }),
-          /Direct upload failed \(HTTP 500\)/,
+          { message: 'Direct upload failed (HTTP 400)' },
         ),
     )
   })
   assert.deepEqual(deletes, [{ body: { ids: [FILE_ID] }, auth: 'Bearer tok' }])
 })
 
-test('a lost finalize answer does NOT cancel (the file may already be in the vault)', async () => {
+test('a lost finalize answer preserves the pending row after a terminal retry', async (t) => {
+  t.mock.method(Math, 'random', () => 0)
+  let finalizations = 0
   let deleted = false
   await tempDir(async (dir) => {
     const path = join(dir, 'a.bin')
@@ -83,7 +85,10 @@ test('a lost finalize answer does NOT cancel (the file may already be in the vau
           return jsonResponse(200, { uploadKind: 'direct', fileId: FILE_ID, uploadUrl: 'https://s3.test/put', proofKey: PROOF_KEY })
         }
         if (url === 'https://s3.test/put') return jsonResponse(200, {})
-        if (url === `${API}/api/files/complete-upload`) throw new TypeError('fetch failed')
+        if (url === `${API}/api/files/complete-upload`) {
+          if (++finalizations === 1) throw new TypeError('fetch failed')
+          return jsonResponse(400, {})
+        }
         if (url === `${API}/api/files/delete`) {
           deleted = true
           return jsonResponse(200, {})
@@ -93,6 +98,7 @@ test('a lost finalize answer does NOT cancel (the file may already be in the vau
       () => assert.rejects(uploadFile({ apiBaseUrl: API, accessToken: 'tok', rootKey: rootKey(), name: 'a.bin', path, size: 5, rowId: FILE_ID })),
     )
   })
+  assert.equal(finalizations, 2)
   assert.equal(deleted, false)
 })
 

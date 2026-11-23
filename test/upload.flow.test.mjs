@@ -21,7 +21,7 @@ import { test } from 'node:test'
 
 import { decryptName, parseNameEnvelope } from '@shieldfive/crypto/vault'
 
-import { uploadFile } from '../src/upload.mjs'
+import { retryDelayMs, uploadFile } from '../src/upload.mjs'
 import { getCiphertextHashFromParts } from '../src/uploadCrypto.mjs'
 import { concat, independentV3Proof, referenceDecrypt, uuidBytes } from './v1Reference.mjs'
 
@@ -533,4 +533,116 @@ test('direct push: presigned PUT, no Authorization, no b2FileId at finalize', as
   )
   assert.deepEqual(finalizeBody.partSha1Array, [putSha1])
   assert.equal(finalizeBody.ciphertextHash, putSha1) // single part
+})
+
+test('signed multipart refreshes credentials across storage and allocation faults', async (t) => {
+  t.mock.method(Math, 'random', () => 0)
+  const rootKey = webcrypto.getRandomValues(new Uint8Array(32))
+  const requests = []
+  const sentParts = new Map()
+  const manifests = []
+  const messages = []
+  let firstPartPresigns = 0
+  let firstPartUploads = 0
+  t.mock.method(globalThis, 'fetch', async (input, init) => {
+    const url = new URL(input)
+    if (url.pathname === '/api/files/create-upload-session') {
+      assert.equal(JSON.parse(init.body).vaultS3Multipart, true)
+      return Response.json({
+        uploadKind: 's3-multipart', fileId: FILE_ID, b2FileId: 'storage-id', chunkSize: 8,
+        framesPerPart: 1, proofKey: PROOF_KEY,
+      })
+    }
+    if (url.pathname === '/api/files/upload-part-url') {
+      const body = JSON.parse(init.body)
+      assert.equal(body.kind, 's3-multipart')
+      assert.equal(body.fileId, FILE_ID)
+      const credential = requests.push(body)
+      if (body.partNumber === 1 && ++firstPartPresigns === 2) {
+        return Response.json({ error: 'Backblaze could not issue a URL' }, { status: 429 })
+      }
+      return Response.json({
+        uploadKind: 's3-multipart', uploadUrl: `https://storage.test/parts/${credential}`,
+      })
+    }
+    if (url.hostname === 'storage.test') {
+      const { partNumber, contentLength } = requests[Number(url.pathname.split('/').at(-1)) - 1]
+      const ciphertext = Buffer.from(init.body)
+      assert.equal(init.method, 'PUT')
+      assert.deepEqual(init.headers, { 'Content-Length': String(contentLength) })
+      assert.equal(ciphertext.length, contentLength)
+      if (sentParts.has(partNumber)) assert.deepEqual(ciphertext, sentParts.get(partNumber))
+      sentParts.set(partNumber, ciphertext)
+      if (partNumber === 1) {
+        firstPartUploads += 1
+        if (firstPartUploads === 1) {
+          return new Response('<Error><Code>ServiceUnavailable</Code><Host>Backblaze B2</Host></Error>', { status: 503 })
+        }
+        if (firstPartUploads === 2) throw new TypeError('network reset')
+      }
+      return new Response(null, { headers: { ETag: createHash('md5').update(ciphertext).digest('hex') } })
+    }
+    if (url.pathname === '/api/files/complete-upload') {
+      manifests.push(JSON.parse(init.body))
+      if (manifests.length === 1) return Response.json({}, { status: 503 })
+      return Response.json({ ok: true })
+    }
+    assert.fail(`unexpected request: ${url}`)
+  })
+  await withTempFile(Buffer.alloc(20, 2), (path) =>
+    uploadFile({
+      apiBaseUrl: API, accessToken: 'tok', rootKey, name: 'secret.bin', path, size: 20,
+      rowId: FILE_ID, onRetry: (message) => messages.push(message),
+    }),
+  )
+  assert.equal(firstPartPresigns, 4)
+  assert.equal(firstPartUploads, 3)
+  assert.equal(manifests.length, 2)
+  assert.deepEqual(manifests[0], manifests[1])
+  const parts = [1, 2, 3].map((partNumber) => sentParts.get(partNumber))
+  assert.deepEqual(manifests[0].partSha1Array, parts.map(sha1HexOf))
+  assert.deepEqual(manifests[0].partETags, parts.map((part) => createHash('md5').update(part).digest('hex')))
+  assert.ok(messages.includes('Upload part 1 failed (HTTP 503), retrying'))
+  assert.ok(messages.includes('Get upload credentials failed (HTTP 429), retrying'))
+  assert.doesNotMatch(messages.join('\n'), /Backblaze|\bB2\b/i)
+})
+
+test('direct upload replaces the signed URL after a storage fault', async (t) => {
+  t.mock.method(Math, 'random', () => 0)
+  const rootKey = webcrypto.getRandomValues(new Uint8Array(32))
+  const bodies = []
+  t.mock.method(globalThis, 'fetch', async (input, init) => {
+    const url = new URL(input)
+    if (url.pathname === '/api/files/create-upload-session') {
+      return Response.json({
+        uploadKind: 'direct', fileId: FILE_ID, uploadUrl: 'https://storage.test/old', proofKey: PROOF_KEY,
+      })
+    }
+    if (url.pathname === '/api/files/upload-part-url') {
+      assert.deepEqual(JSON.parse(init.body), { fileId: FILE_ID, kind: 'direct' })
+      return Response.json({ uploadKind: 'direct', uploadUrl: 'https://storage.test/new' })
+    }
+    if (url.hostname === 'storage.test') {
+      bodies.push(Buffer.from(init.body))
+      if (url.pathname === '/old') return Response.json({ code: 'too_busy' }, { status: 503 })
+      return new Response(null)
+    }
+    assert.equal(url.pathname, '/api/files/complete-upload')
+    return Response.json({ ok: true })
+  })
+  await withTempFile(Buffer.from('test'), (path) =>
+    uploadFile({ apiBaseUrl: API, accessToken: 'tok', rootKey, name: 'test', path, size: 4, rowId: FILE_ID }),
+  )
+  assert.equal(bodies.length, 2)
+  assert.deepEqual(bodies[0], bodies[1])
+})
+
+
+test('upload backoff uses full jitter with a 1 to 32 second exponential ceiling', (t) => {
+  t.mock.method(Math, 'random', () => 0.25)
+  assert.deepEqual(
+    [1, 2, 3, 4, 5, 6, 7].map((attempt) => retryDelayMs(attempt)),
+    [250, 500, 1000, 2000, 4000, 8000, 8000],
+  )
+  assert.equal(retryDelayMs(6, 60_000), 60_000)
 })

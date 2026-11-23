@@ -22,7 +22,7 @@ export async function stepUpMfaIfRequired({ supabase, getTotpCode }) {
   const { data: aal, error: aalError } =
     await supabase.auth.mfa.getAuthenticatorAssuranceLevel()
   if (aalError) {
-    throw new Error(`Could not check two-factor status: ${aalError.message}`)
+    throw new Error('Could not check two-factor status. Please try again.')
   }
   const needsStepUp = aal?.nextLevel === 'aal2' && aal?.currentLevel !== 'aal2'
   if (!needsStepUp) return null
@@ -37,7 +37,7 @@ export async function stepUpMfaIfRequired({ supabase, getTotpCode }) {
   const { data: factors, error: factorsError } =
     await supabase.auth.mfa.listFactors()
   if (factorsError) {
-    throw new Error(`Could not list two-factor methods: ${factorsError.message}`)
+    throw new Error('Could not list two-factor methods. Please try again.')
   }
   const totp = (factors?.totp ?? []).filter(
     (f) => f?.id && f?.status === 'verified',
@@ -54,7 +54,7 @@ export async function stepUpMfaIfRequired({ supabase, getTotpCode }) {
     await supabase.auth.mfa.challenge({ factorId })
   if (challengeError) {
     throw new Error(
-      `Could not start two-factor challenge: ${challengeError.message}`,
+      'Could not start two-factor verification. Please try again.',
     )
   }
 
@@ -69,7 +69,7 @@ export async function stepUpMfaIfRequired({ supabase, getTotpCode }) {
     code,
   })
   if (verifyError) {
-    throw new Error(`Two-factor verification failed: ${verifyError.message}`)
+    throw new Error('Two-factor verification failed. Check your code and try again.')
   }
   const token = verified?.access_token
   if (!token) {
@@ -186,8 +186,7 @@ export async function refreshAccessToken({
   })
   const body = await res.json().catch(() => ({}))
   if (!res.ok || !body.access_token || !body.refresh_token) {
-    const reason = body.error_description ?? body.msg ?? body.error ?? 'no session returned'
-    const err = new Error(`Session refresh failed (HTTP ${res.status}): ${reason}`)
+    const err = new Error(`Session refresh failed (HTTP ${res.status})`)
     err.status = res.status
     throw err
   }

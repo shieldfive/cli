@@ -76,8 +76,10 @@ size, uploading nothing.
 ## Install
 
 ```sh
-npm install -g @shieldfive/cli    # provides the `sf` command
+npm install -g @shieldfive/cli    # installs sf and shieldfive
 ```
+
+The package installs without lifecycle scripts.
 
 Or run it without installing:
 
@@ -91,7 +93,7 @@ trust it):
 ```sh
 git clone https://github.com/shieldfive/cli.git
 cd cli
-npm install     # @shieldfive/crypto (+ libsodium), @supabase/supabase-js, @noble/*
+npm ci
 npm test
 ```
 
@@ -184,15 +186,24 @@ before. Your password is typed, never passed on the command line:
 ```sh
 export SF_EMAIL=you@example.com
 read -rs SF_PASSWORD; echo; export SF_PASSWORD
-export SF_VAULT_PASSWORD="$SF_PASSWORD"   # only if your vault password differs
+# If your vault password differs, set SF_VAULT_PASSWORD as well.
 
 sf push ./my-folder
 sf sync ./my-folder --watch
 ```
 
+On Windows, use PowerShell:
+
+```powershell
+$env:SF_EMAIL = 'you@example.com'
+$env:SF_PASSWORD = [System.Net.NetworkCredential]::new('', (Read-Host 'ShieldFive password' -AsSecureString)).Password
+sf push 'C:\Users\you\Documents'
+Remove-Item Env:SF_PASSWORD
+```
+
 The backend endpoints default to ShieldFive, so there is nothing else to
 configure. `SF_API_BASE_URL`, `SF_SUPABASE_URL`, and `SF_SUPABASE_ANON_KEY` are
-baked in with ShieldFive's public values (the Supabase anon key is a `role=anon`
+baked in with ShieldFive's public values (the public auth key is a `role=anon`
 JWT gated by row-level security, the same value any browser receives) and only
 need overriding if you point the CLI at a development backend.
 
@@ -286,7 +297,8 @@ exits 1; run `sf login` and then `sf logout --everywhere` once you are online.
 
 Limits:
 
-- Windows is not supported. Use `SF_EMAIL` and `SF_PASSWORD` there.
+- The agent is available on macOS and Linux. On Windows, set `SF_EMAIL` and
+  `SF_PASSWORD` in PowerShell and run `sf push` or `sf sync`.
 - Node cannot see which process connected to the socket, so directory
   permissions are the only gate. This is also how `ssh-agent` works on macOS.
 - Overwriting the key in memory is best-effort. A garbage-collected runtime can
@@ -339,9 +351,10 @@ this client no longer writes it.
   `partSha1Array[0]`, so they always agree. Integrity here rests on the upload
   proof and on the header MAC and chunk tags at download, not on a wire checksum.
 - **Multipart** (> 5 MiB) — the file is streamed one 5 MiB chunk at a time (never
-  loaded whole into memory), each chunk uploaded as a Backblaze part. The
-  ciphertext hash the server checks is SHA-1 over the concatenated raw part
-  digests; the server finishes the large file with the ordered part list.
+  loaded whole into memory). The server can allocate signed part URLs or native
+  multipart credentials. The server finishes the file with the ordered part
+  manifest. Transient failures retry the same encrypted part with fresh
+  credentials. Rerunning `sf push` skips files already completed.
 
 The mock end-to-end test in [`test/upload.flow.test.mjs`](test/upload.flow.test.mjs)
 captures every byte this client would send, opens the stored object with
@@ -359,7 +372,7 @@ blob and streaming readers.
   with two-factor step-up
 - `src/loginSecret.mjs` — the login secret derived from your password; for
   accounts on the current scheme the password itself is never sent
-- `src/argon2.mjs` — Argon2id, native when available, WebAssembly otherwise
+- `src/argon2.mjs` — Argon2id via the shared WebAssembly implementation
 - `src/vault.mjs` / `src/unlock.mjs` — fetch the wrapped vault key, unwrap the
   root key from your password (Argon2id / PBKDF2)
 - `src/uploadCrypto.mjs` — filename encryption, the suite-0x03 part writer,
