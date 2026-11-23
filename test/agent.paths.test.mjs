@@ -35,7 +35,8 @@ test('agentDir is ~/.shieldfive/run on every POSIX platform, whatever the enviro
 test('agentDir on Windows throws an error callers can recognise', () => {
   assert.throws(
     () => agentDir({ platform: 'win32', home: 'C:\\u' }),
-    (e) => e instanceof UnsupportedPlatformError && e.code === 'unsupported_platform',
+    (e) => e instanceof UnsupportedPlatformError && e.code === 'unsupported_platform' &&
+      /Windows.*SF_EMAIL and SF_PASSWORD.*sf push/.test(e.message),
   )
 })
 

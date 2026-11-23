@@ -53,7 +53,7 @@ test('refreshAccessToken carries the HTTP status on failure so the agent can tel
   const f = recordingFetch({ ok: false, status: 400, json: async () => ({ error_description: 'Invalid Refresh Token: Already Used' }) })
   await assert.rejects(
     refreshAccessToken({ supabaseUrl: 'https://s.test', anonKey: 'anon', refreshToken: 'rt1', fetchImpl: f.fn }),
-    (e) => e.status === 400 && /Already Used/.test(e.message),
+    (e) => e.status === 400 && /Session refresh failed/.test(e.message),
   )
   await assert.rejects(
     refreshAccessToken({ supabaseUrl: 'https://s.test', anonKey: 'anon', refreshToken: null, fetchImpl: f.fn }),

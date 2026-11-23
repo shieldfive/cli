@@ -254,3 +254,33 @@ test('a folder create whose answer was lost is retried with the same id', async 
   assert.equal(ids[0], ids[1])
   assert.equal(server.folders.size, 2)
 })
+
+test('keeps an unconfirmed finalization in the checkpoint for the next run', async () => {
+  const src = join(dir, 'source')
+  await mkdir(src)
+  await writeFile(join(src, 'a.txt'), 'a')
+  const statePath = join(dir, 'state.json')
+  const args = {
+    source: src, apiBaseUrl: 'https://x.test', accessToken: 't', rootKey,
+    account: 'a@x', statePath, ...quiet,
+  }
+  const uploadAttempts = []
+  const summary = await runPush({
+    ...args,
+    uploadFn: async ({ rowId }) => {
+      uploadAttempts.push(rowId)
+      throw Object.assign(new Error('Complete upload could not reach the server'), {
+        uploadNetworkError: true, finalizeOutcomeUnknown: true,
+      })
+    },
+  })
+  assert.equal(summary.failed.length, 1)
+  assert.equal(uploadAttempts.length, 1)
+  const pending = JSON.parse(await readFile(statePath, 'utf8')).pending['a.txt']
+  assert.equal(pending.fileId, uploadAttempts[0])
+  server.ready.add(pending.fileId)
+  const uploads = []
+  const resumed = await runPush({ ...args, uploadFn: fakeUploader(uploads) })
+  assert.equal(resumed.alreadyThere, 1)
+  assert.deepEqual(uploads, [])
+})

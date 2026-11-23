@@ -1,14 +1,7 @@
 // ShieldFive CLI — upload: create-session -> chunk-encrypt -> upload -> finalize.
 // Ported from the apps (mobile cloudApi.ts + syncService.ts).
 //
-// Two paths, chosen by the server, and they no longer share a wire protocol:
-//   direct  — a single-chunk file (<= chunkSize). One presigned S3 PUT, no
-//             Authorization header and no storage id at finalize. The server
-//             moved this path off b2_upload_file in web b52b4c8 (PR #726).
-//   large   — a multipart file (> chunkSize). b2_upload_part per chunk, with a
-//             Backblaze token and X-Bz-* headers, then b2_finish_large_file
-//             (server-side) at finalize. Unchanged.
-//
+// The server selects a direct PUT, signed multipart PUTs, or native multipart.
 // Chunks are read from disk one at a time (never the whole file into memory),
 // so a multi-gigabyte upload holds at most a few chunks (~5 MiB each) resident.
 //
@@ -19,7 +12,7 @@
 
 import { constants as fsConstants } from 'node:fs'
 import { open } from 'node:fs/promises'
-import { webcrypto } from 'node:crypto'
+import { createHash, webcrypto } from 'node:crypto'
 
 import { encryptNameV6 } from '@shieldfive/crypto/vault'
 
@@ -46,16 +39,63 @@ const PART_URL_PATH = '/api/files/upload-part-url'
 const DELETE_PATH = '/api/files/delete'
 const CAPABILITIES_PATH = '/api/files/upload-capabilities'
 
-// Backblaze documents retrying b2_upload_part on 5xx / network failures, and a
-// part upload is idempotent by (part number, SHA-1) — retrying overwrites the
-// same part. Bound the retries and back off so one transient blip does not
-// abort a whole multi-gigabyte upload.
-const MAX_PART_ATTEMPTS = 5
-const PART_RETRY_BASE_DELAY_MS = 1000
-
+const MAX_PART_ATTEMPTS = 7
+// Session creation and completion are each limited to 100 requests a minute.
+const UPLOAD_RATE_WINDOW_MS = 60_000
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
-const partRetryDelayMs = (attempt) =>
-  PART_RETRY_BASE_DELAY_MS * 2 ** (attempt - 1) // 1s, 2s, 4s, 8s
+
+export const isRetryableStatus = (status) =>
+  status === 408 || status === 429 || (status >= 500 && status <= 599)
+
+export function retryDelayMs(attempt, retryAfterMs = 0) {
+  return Math.max(retryAfterMs, Math.random() * Math.min(32_000, 1000 * 2 ** (attempt - 1)))
+}
+
+export function responseError(operation, res, body, { status = res.status, fallbackRetryAfterMs } = {}) {
+  let guidance = ''
+  if (body?.code === 'mfa_required') guidance = 'Two-factor verification is required.'
+  if (status === 412) guidance = 'Acknowledge your recovery key in the web app before uploading.'
+  if (status === 402 || body?.code === 'storage_limit_exceeded') guidance = 'Your vault storage limit was reached.'
+  if (status === 413 && !guidance) guidance = 'This file exceeds the upload size limit.'
+  const error = new Error(`${operation} failed (HTTP ${status})${guidance ? `. ${guidance}` : ''}`)
+  error.status = status
+  if (typeof body?.code === 'string') error.serverCode = body.code
+  error.retryAfterMs = fallbackRetryAfterMs
+  const header = res.headers?.get('retry-after')
+  if (header) {
+    const delay = /^\d+$/.test(header) ? Number(header) * 1000 : Date.parse(header) - Date.now()
+    if (Number.isFinite(delay)) error.retryAfterMs = Math.max(0, delay)
+  }
+  return error
+}
+
+async function uploadRequest(url, init, operation) {
+  try {
+    return await fetch(url, init)
+  } catch {
+    const error = new Error(`${operation} could not reach the server`)
+    error.uploadNetworkError = true
+    throw error
+  }
+}
+
+async function withUploadRetry(send, onRetry) {
+  let refreshedAuth = false
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return await send(attempt)
+    } catch (error) {
+      const authRejected = error.storageAuthRejected && !refreshedAuth
+      if (attempt >= MAX_PART_ATTEMPTS ||
+          !(authRejected || error.uploadNetworkError || isRetryableStatus(error.status))) throw error
+      refreshedAuth ||= authRejected
+      const delay = authRejected ? (error.retryAfterMs ?? 0) : retryDelayMs(attempt, error.retryAfterMs)
+      const wait = delay >= 1000 ? ` in ${Math.ceil(delay / 1000)} s` : ''
+      onRetry?.(`${error.message}, retrying${wait}`)
+      if (delay > 0) await sleep(delay)
+    }
+  }
+}
 
 // `accessToken` is a string, or a function returning the current one. A
 // function is resolved at every request, so an upload that outlives the access
@@ -63,15 +103,6 @@ const partRetryDelayMs = (attempt) =>
 // for its later part URLs and its finalize.
 export async function resolveToken(accessToken) {
   return typeof accessToken === 'function' ? accessToken() : accessToken
-}
-
-// An Error that keeps the HTTP status and the server's error code, so callers
-// can tell a transient failure (5xx, 429) from a terminal one (quota, 4xx).
-export function httpError(message, status, body) {
-  const err = new Error(message)
-  err.status = status
-  if (body && typeof body === 'object' && typeof body.code === 'string') err.serverCode = body.code
-  return err
 }
 
 // Read a file in fixed-size chunks without holding it all in memory. Each yield
@@ -137,6 +168,7 @@ export async function createUploadSession({
   name,
   size,
   rowId,
+  onRetry,
   folderId = null,
   folderKey = null,
 }) {
@@ -157,188 +189,81 @@ export async function createUploadSession({
   const csk = generateRandomKeyB64()
   const cskEnvelope = wrapKeyB64({ wrappingKeyB64: parentKeyB64, keyToWrapB64: csk })
 
-  const res = await fetch(new URL(CREATE_SESSION_PATH, apiBaseUrl), {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${await resolveToken(accessToken)}`,
-      'Content-Type': 'application/json',
-    },
-    // v1 wire format: no cipher_nonce_prefix and no chunkSize (the server
-    // rejects both; they live in the header).
-    body: JSON.stringify({
-      clientUploadId: rowId,
-      name_encrypted: JSON.stringify(nameEnvelopeV6),
-      nameHash: hashMetadataV4(name.toLowerCase(), rootKeyB64),
-      csk_wrapped: cskEnvelope.wrapped,
-      csk_iv: cskEnvelope.iv,
-      cipherVersion: CIPHER_VERSION_PQ,
-      sizeBytes: size,
-      folderId,
-      contentType: 'application/octet-stream',
-      thumbnail_ciphertext_b64: null,
-      thumbnail_nonce_prefix: null,
-    }),
+  // Replays of this row ID must carry the same encrypted name and wrapped key.
+  const payload = JSON.stringify({
+    clientUploadId: rowId,
+    vaultS3Multipart: true,
+    name_encrypted: JSON.stringify(nameEnvelopeV6),
+    nameHash: hashMetadataV4(name.toLowerCase(), rootKeyB64),
+    csk_wrapped: cskEnvelope.wrapped,
+    csk_iv: cskEnvelope.iv,
+    cipherVersion: CIPHER_VERSION_PQ,
+    sizeBytes: size,
+    folderId,
+    contentType: 'application/octet-stream',
+    thumbnail_ciphertext_b64: null,
+    thumbnail_nonce_prefix: null,
   })
-  const body = await res.json().catch(() => ({}))
-  if (!res.ok) {
-    throw httpError(
-      `create-upload-session failed (HTTP ${res.status}): ${JSON.stringify(body)}`,
-      res.status,
-      body,
-    )
-  }
+  const body = await withUploadRetry(async () => {
+    const operation = 'Create upload session'
+    const res = await uploadRequest(new URL(CREATE_SESSION_PATH, apiBaseUrl), {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${await resolveToken(accessToken)}`,
+        'Content-Type': 'application/json',
+      },
+      body: payload,
+    }, operation)
+    const json = await res.json().catch(() => ({}))
+    if (!res.ok) throw responseError(operation, res, json, {
+      fallbackRetryAfterMs: res.status === 429 ? UPLOAD_RATE_WINDOW_MS : undefined,
+    })
+    return json
+  }, onRetry)
   return { session: body, csk, nameEncryptedV6: JSON.stringify(nameEnvelopeV6) }
 }
 
-// Direct upload: a presigned S3 PUT (web b52b4c8 / PR #726), not b2_upload_file.
-// The SigV4 signature in the URL IS the credential and it authorises exactly one
-// object key, so Authorization and X-Bz-* are neither required nor signed --
-// sending them would be noise, and an Authorization header would mislead the
-// next reader into thinking the token still matters here.
-//
-// Content-Type is sent so the stored object carries a sensible type. It is
-// currently unsigned, but only because the vault call site presigns without
-// ContentLength; if that ever changes, this header becomes load-bearing and a
-// mismatch 403s every direct upload. See the web repo's
-// tests/storage/presignedPutContract.test.ts, which pins the signed-header set.
-//
-// Returns nothing. A presigned PUT answers with an ETag, not a Backblaze file
-// id, so there is no storage id to hand to finalize.
-async function putDirectPresigned({ session, ciphertext }) {
-  // Retried on network errors and 5xx / 408 / 429: the presigned URL names one
-  // object key, so a repeated PUT overwrites the same object with the same bytes.
-  let lastError
-  for (let tries = 1; tries <= MAX_PART_ATTEMPTS; tries += 1) {
-    let res
-    try {
-      res = await fetch(session.uploadUrl, {
-        method: 'PUT',
-        headers: {
-          'Content-Type': session.contentType || 'application/octet-stream',
-        },
-        body: ciphertext,
-      })
-    } catch (err) {
-      lastError = err
-      if (tries < MAX_PART_ATTEMPTS) await sleep(partRetryDelayMs(tries))
-      continue
-    }
-    if (res.ok) return
-    lastError = httpError(
-      `Direct upload failed (HTTP ${res.status}): ${await res.text().catch(() => '')}`,
-      res.status,
-    )
-    const retryable = res.status >= 500 || res.status === 429 || res.status === 408
-    if (!retryable) throw lastError
-    if (tries < MAX_PART_ATTEMPTS) await sleep(partRetryDelayMs(tries))
-  }
-  throw lastError
-}
-
-// Ask the server for a fresh b2_upload_part URL + token when the current one
-// expires (Backblaze part tokens are short-lived and single-host).
-async function refreshUploadPartUrl({ apiBaseUrl, accessToken, fileId }) {
-  const res = await fetch(new URL(PART_URL_PATH, apiBaseUrl), {
+// Signed URLs name a single object or part. Keep the ciphertext unchanged
+// across attempts and obtain replacement credentials after a refused send.
+async function refreshUploadUrl({ apiBaseUrl, accessToken, fileId }, metadata) {
+  const operation = 'Get upload credentials'
+  const res = await uploadRequest(new URL(PART_URL_PATH, apiBaseUrl), {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${await resolveToken(accessToken)}`,
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({ fileId }),
-  })
+    body: JSON.stringify({ fileId, ...metadata }),
+  }, operation)
   const body = await res.json().catch(() => ({}))
-  if (!res.ok || !body.uploadUrl || !body.authToken) {
-    throw httpError(
-      `upload-part-url failed (HTTP ${res.status}): ${JSON.stringify(body)}`,
-      res.status,
-      body,
-    )
+  if (!res.ok) throw responseError(operation, res, body)
+  if (!body?.uploadUrl || (metadata ? body.uploadKind !== metadata.kind : !body.authToken)) {
+    throw new Error('Storage returned incomplete upload credentials.')
   }
-  return { uploadUrl: body.uploadUrl, authToken: body.authToken }
+  return body
 }
 
-// One b2_upload_part POST. On an expired token (401/403) refresh the part URL
-// and retry immediately, mirroring uploadMultipartCiphertextPart in the apps.
-// On a transient failure (5xx / 408 / 429 / network error) refresh the part URL
-// and retry with exponential backoff, up to MAX_PART_ATTEMPTS, so a single blip
-// does not abort the whole upload. Returns the (possibly refreshed) url/token so
-// the caller reuses them for the next part.
-async function putPartToBackblaze({
-  apiBaseUrl,
-  accessToken,
-  fileId,
-  uploadUrl,
-  authToken,
-  partNumber,
-  ciphertext,
-  sha1,
-}) {
-  const attempt = (url, token) =>
-    fetch(url, {
-      method: 'POST', // Backblaze b2_upload_part is a POST
-      headers: {
-        Authorization: token,
-        'X-Bz-Part-Number': String(partNumber),
-        'X-Bz-Content-Sha1': sha1,
-        'Content-Type': 'application/octet-stream',
-      },
+async function sendStorage(url, init, operation) {
+  const res = await uploadRequest(url, { ...init, redirect: 'error' }, operation)
+  if (res.ok) return res
+  const body = await res.text().catch(() => '')
+  const busy = /"code"\s*:\s*"too_busy"|<Code>ServiceUnavailable<\/Code>/.test(body)
+  const error = responseError(operation, res, null, { status: busy ? 503 : res.status })
+  error.storageAuthRejected = res.status === 401 || res.status === 403
+  throw error
+}
+
+async function putDirectPresigned({ context, session, ciphertext, onRetry }) {
+  await withUploadRetry(async (attempt) => {
+    const credentials = attempt === 1
+      ? session
+      : await refreshUploadUrl(context, { kind: 'direct' })
+    await sendStorage(credentials.uploadUrl, {
+      method: 'PUT',
+      headers: { 'Content-Type': session.contentType || 'application/octet-stream' },
       body: ciphertext,
-    })
-
-  let url = uploadUrl
-  let token = authToken
-  let lastError
-
-  for (let tries = 1; tries <= MAX_PART_ATTEMPTS; tries += 1) {
-    let res
-    try {
-      res = await attempt(url, token)
-    } catch (err) {
-      // Network/transport failure (reset, timeout, DNS). Retry with a fresh
-      // part URL after a backoff.
-      lastError = err
-      if (tries === MAX_PART_ATTEMPTS) break
-      await sleep(partRetryDelayMs(tries))
-      ;({ uploadUrl: url, authToken: token } = await refreshUploadPartUrl({
-        apiBaseUrl,
-        accessToken,
-        fileId,
-      }))
-      continue
-    }
-
-    if (res.status === 401 || res.status === 403) {
-      // Expected token rotation, not a transient failure: refresh and retry
-      // immediately without consuming a backoff slot.
-      const refreshed = await refreshUploadPartUrl({ apiBaseUrl, accessToken, fileId })
-      url = refreshed.uploadUrl
-      token = refreshed.authToken
-      res = await attempt(url, token)
-    }
-
-    if (res.ok) return { uploadUrl: url, authToken: token }
-
-    lastError = httpError(
-      `Backblaze part ${partNumber} upload failed (HTTP ${res.status}): ` +
-        `${await res.text().catch(() => '')}`,
-      res.status,
-    )
-
-    // 5xx / 408 / 429 are worth retrying; other 4xx (after the auth refresh
-    // above) are terminal.
-    const retryable =
-      res.status >= 500 || res.status === 429 || res.status === 408
-    if (!retryable || tries === MAX_PART_ATTEMPTS) throw lastError
-
-    await sleep(partRetryDelayMs(tries))
-    ;({ uploadUrl: url, authToken: token } = await refreshUploadPartUrl({
-      apiBaseUrl,
-      accessToken,
-      fileId,
-    }))
-  }
-
-  throw lastError ?? new Error(`Backblaze part ${partNumber} upload failed`)
+    }, 'Direct upload')
+  }, onRetry)
 }
 
 async function finalizeUpload({
@@ -347,41 +272,46 @@ async function finalizeUpload({
   fileId,
   b2FileId,
   partSha1Array,
+  partETags,
+  onRetry,
   proof,
   ciphertextHash,
   nameEncryptedV6,
 }) {
-  let res
+  const operation = 'Complete upload'
+  let outcomeUnknown = false
   try {
-    res = await fetch(new URL(COMPLETE_PATH, apiBaseUrl), {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${await resolveToken(accessToken)}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ fileId, b2FileId, partSha1Array, proof, ciphertextHash, nameEncryptedV6 }),
-    })
-  } catch (err) {
-    // The request may have reached the server and finalized the file; only the
-    // answer was lost. Cancelling now could bin a file that is in the vault.
-    err.finalizeOutcomeUnknown = true
-    throw err
+    return await withUploadRetry(async () => {
+      // Reuse the manifest and row if storage completed before the reply was lost.
+      try {
+        const res = await uploadRequest(new URL(COMPLETE_PATH, apiBaseUrl), {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${await resolveToken(accessToken)}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ fileId, b2FileId, partSha1Array, partETags, proof, ciphertextHash, nameEncryptedV6 }),
+        }, operation)
+        const body = await res.json().catch(() => ({}))
+        if (!res.ok) throw responseError(operation, res, body, {
+          fallbackRetryAfterMs: res.status === 429 ? UPLOAD_RATE_WINDOW_MS : undefined,
+        })
+        return body
+      } catch (error) {
+        outcomeUnknown ||= error.uploadNetworkError === true || error.status >= 500
+        throw error
+      }
+    }, onRetry)
+  } catch (error) {
+    if (outcomeUnknown) error.finalizeOutcomeUnknown = true
+    throw error
   }
-  const body = await res.json().catch(() => ({}))
-  if (!res.ok) {
-    throw httpError(
-      `complete-upload failed (HTTP ${res.status}): ${JSON.stringify(body)}`,
-      res.status,
-      body,
-    )
-  }
-  return body
 }
 
 // Single-chunk file: one part (header || frame_0), SHA-1 + proof, PUT it at
 // the presigned URL, finalize. No b2FileId is sent -- the server HEADs the
 // stored object and derives the storage id itself.
-async function uploadDirect({ apiBaseUrl, accessToken, session, parts, nameEncryptedV6, empty = false }) {
+async function uploadDirect({ apiBaseUrl, accessToken, session, parts, nameEncryptedV6, onRetry, empty = false }) {
   let ciphertext = null
   for await (const part of parts) {
     if (ciphertext !== null) {
@@ -397,7 +327,10 @@ async function uploadDirect({ apiBaseUrl, accessToken, session, parts, nameEncry
     ? computeV3EmptyUploadProof({ proofKeyHex: session.proofKey, header: ciphertext })
     : await computeV3UploadProof({ proofKeyHex: session.proofKey, part0: ciphertext })
 
-  await putDirectPresigned({ session, ciphertext })
+  await putDirectPresigned({
+    context: { apiBaseUrl, accessToken, fileId: session.fileId },
+    session, ciphertext, onRetry,
+  })
 
   // b2FileId is deliberately omitted. JSON.stringify drops the undefined key,
   // so complete-upload/finalize.ts takes its "no client-supplied id" branch and
@@ -409,25 +342,15 @@ async function uploadDirect({ apiBaseUrl, accessToken, session, parts, nameEncry
     accessToken,
     fileId: session.fileId,
     partSha1Array: [sha1],
+    onRetry,
     proof,
     ciphertextHash: sha1,
     nameEncryptedV6,
   })
 }
 
-// Multipart file: stream each encrypted part (one chunk frame each; part 1
-// also carries the header), b2_upload_part, collect part SHA-1s. The upload
-// proof covers the header and the first frame only — the server re-derives it
-// from the start of the stored object, which is exactly part 1. b2FileId is the
-// large-file id from the session; the server calls b2_finish_large_file with
-// the ordered part hashes at finalize.
-// Bounded concurrency for multipart part uploads. The serial version left the
-// network idle during encrypt and the CPU idle during each PUT; uploading a few
-// parts at once fills the pipe. Backblaze needs one upload URL per concurrent
-// connection, so K concurrent parts draw K URLs from a small pool. Default 3;
-// override with SF_UPLOAD_CONCURRENCY (clamped 1..6). SF_UPLOAD_CONCURRENCY=1
-// reproduces the exact serial behaviour. Memory ceiling ≈ 2 * K * chunkSize
-// (K plaintext chunks + K ciphertexts resident at once).
+// Each concurrent upload holds one encrypted frame and, for the native
+// transport, leases its own upload URL until the request succeeds.
 const DEFAULT_UPLOAD_CONCURRENCY = 3
 const MAX_UPLOAD_CONCURRENCY = 6
 function resolveUploadConcurrency() {
@@ -438,9 +361,9 @@ function resolveUploadConcurrency() {
   return DEFAULT_UPLOAD_CONCURRENCY
 }
 
-async function uploadMultipart({ apiBaseUrl, accessToken, session, parts, nameEncryptedV6 }) {
+async function uploadMultipart({ apiBaseUrl, accessToken, session, parts, nameEncryptedV6, onRetry }) {
   if (!session.b2FileId) {
-    throw new Error('Multipart upload session is missing storage id (b2FileId).')
+    throw new Error('Multipart upload session is missing its storage ID.')
   }
   const concurrency = resolveUploadConcurrency()
 
@@ -450,39 +373,60 @@ async function uploadMultipart({ apiBaseUrl, accessToken, session, parts, nameEn
   let proof // computed from chunk 0 only (the server verifies the proof over part 1)
   let firstError = null
 
-  // Pool of b2_upload_part URLs — one per concurrent connection. Seed with the
-  // session URL, fetch more on demand up to `concurrency`, and return each after
-  // a successful part so URLs are reused rather than re-fetched per part.
-  // putPartToBackblaze already self-heals expired tokens and retries 5xx.
-  const urlPool = [{ uploadUrl: session.uploadUrl, authToken: session.authToken }]
-  const acquireUrl = async () =>
-    urlPool.pop() ??
-    (await refreshUploadPartUrl({ apiBaseUrl, accessToken, fileId: session.fileId }))
+  const signed = session.uploadKind === 's3-multipart'
+  const partETags = signed ? [] : undefined
+  const context = { apiBaseUrl, accessToken, fileId: session.fileId }
+  const urlPool = [session]
 
   const inFlight = new Set()
   const dispatch = (chunkIndex, ciphertext) => {
     const run = (async () => {
       try {
-        const encrypted = { ciphertext, sha1Hex: await sha1Hex(ciphertext) }
+        const sha1 = await sha1Hex(ciphertext)
         if (chunkIndex === 0) {
           proof = await computeV3UploadProof({ proofKeyHex: session.proofKey, part0: ciphertext })
         }
 
-        const slot = await acquireUrl()
-        const updated = await putPartToBackblaze({
-          apiBaseUrl,
-          accessToken,
-          fileId: session.fileId,
-          uploadUrl: slot.uploadUrl,
-          authToken: slot.authToken,
-          partNumber: chunkIndex + 1, // Backblaze parts are 1-based
-          ciphertext: encrypted.ciphertext,
-          sha1: encrypted.sha1Hex,
-        })
-        // Return the (possibly refreshed) URL for the next part to reuse. A URL
-        // whose part failed is intentionally NOT returned (it may be bad).
-        urlPool.push({ uploadUrl: updated.uploadUrl, authToken: updated.authToken })
-        partSha1ByIndex[chunkIndex] = encrypted.sha1Hex
+        const partNumber = chunkIndex + 1
+        const operation = `Upload part ${partNumber}`
+        if (signed) {
+          const checksum = createHash('md5').update(ciphertext).digest('hex')
+          const etag = await withUploadRetry(async () => {
+            const { uploadUrl } = await refreshUploadUrl(context, {
+              kind: 's3-multipart', partNumber, contentLength: ciphertext.byteLength,
+            })
+            const res = await sendStorage(uploadUrl, {
+              method: 'PUT',
+              headers: { 'Content-Length': String(ciphertext.byteLength) },
+              body: ciphertext,
+            }, operation)
+            const tag = res.headers.get('etag')
+            if (tag !== checksum && tag !== `"${checksum}"`) {
+              throw new Error(`${operation} returned an invalid checksum.`)
+            }
+            return tag
+          }, onRetry)
+          partETags[chunkIndex] = etag
+        } else {
+          const slot = urlPool.pop()
+          const credentials = await withUploadRetry(async (attempt) => {
+            const current = (attempt === 1 && slot) || await refreshUploadUrl(context)
+            const res = await sendStorage(current.uploadUrl, {
+              method: 'POST',
+              headers: {
+                Authorization: current.authToken,
+                'X-Bz-Part-Number': String(partNumber),
+                'X-Bz-Content-Sha1': sha1,
+                'Content-Type': 'application/octet-stream',
+              },
+              body: ciphertext,
+            }, operation)
+            await res.text().catch(() => '')
+            return current
+          }, onRetry)
+          urlPool.push(credentials)
+        }
+        partSha1ByIndex[chunkIndex] = sha1
       } catch (err) {
         if (!firstError) firstError = err
       }
@@ -492,21 +436,16 @@ async function uploadMultipart({ apiBaseUrl, accessToken, session, parts, nameEn
   }
 
   let chunkIndex = 0
-  for await (const ciphertext of parts) {
-    if (firstError) break
-    // Backpressure: hold at most `concurrency` parts in flight. inFlight is
-    // non-empty when this runs (size >= concurrency >= 1), so race never hangs.
-    while (inFlight.size >= concurrency) {
-      await Promise.race(inFlight)
+  try {
+    for await (const ciphertext of parts) {
+      while (inFlight.size >= concurrency && !firstError) await Promise.race(inFlight)
       if (firstError) break
+      dispatch(chunkIndex, ciphertext)
+      chunkIndex += 1
     }
-    if (firstError) break
-    dispatch(chunkIndex, ciphertext)
-    chunkIndex += 1
+  } finally {
+    await Promise.allSettled(inFlight)
   }
-
-  // Let every in-flight part settle before finalizing or surfacing the error.
-  await Promise.allSettled(inFlight)
   if (firstError) throw firstError
 
   if (!chunkIndex || !proof) {
@@ -529,6 +468,8 @@ async function uploadMultipart({ apiBaseUrl, accessToken, session, parts, nameEn
     fileId: session.fileId,
     b2FileId: session.b2FileId,
     partSha1Array,
+    partETags,
+    onRetry,
     proof,
     ciphertextHash,
     nameEncryptedV6,
@@ -536,8 +477,8 @@ async function uploadMultipart({ apiBaseUrl, accessToken, session, parts, nameEn
 }
 
 // Best-effort cancel of a session that will never finalize. The pending row
-// otherwise holds quota (and, for multipart, an unfinished Backblaze large
-// file) until the server's stale-upload reaper gets to it. POST
+// otherwise holds quota (and, for multipart, an unfinished storage
+// upload) until the server's stale-upload reaper gets to it. POST
 // /api/files/delete with the row id is what the web app's cancel path uses:
 // for a non-ready row it cancels the large file and drops the metadata. Never
 // throws; a failure here must not hide the error that caused it.
@@ -588,8 +529,8 @@ async function serverAcceptsEmptyFiles({ apiBaseUrl, accessToken }) {
 // order, from the same read that feeds encryption. The agent hashes those
 // chunks to record what was actually uploaded; hashing the file separately,
 // before or after, cannot see a change made and undone while it was being read.
-// `rowId` is for tests only; callers let it default to a fresh UUIDv7.
-export async function uploadFile({ apiBaseUrl, accessToken, rootKey, name, path, size, onPlaintextChunk, rowId = newRowBoundId(), folderId = null, folderKey = null }) {
+// Bulk push supplies the row ID from its checkpoint. Other callers get a fresh UUIDv7.
+export async function uploadFile({ apiBaseUrl, accessToken, rootKey, name, path, size, onPlaintextChunk, onRetry, rowId = newRowBoundId(), folderId = null, folderKey = null }) {
   // Derived before anything is sent, so a vault whose identity cannot be
   // derived fails before a session (and a pending row) exists.
   const recipientPublicKey = await vaultMlKemPublicKey(rootKey)
@@ -603,6 +544,7 @@ export async function uploadFile({ apiBaseUrl, accessToken, rootKey, name, path,
     name,
     size,
     rowId,
+    onRetry,
     folderId,
     folderKey,
   })
@@ -615,11 +557,10 @@ export async function uploadFile({ apiBaseUrl, accessToken, rootKey, name, path,
     // row it made) rather than upload under a mismatched binding.
     if (session?.fileId !== rowId) {
       throw new Error(
-        `create-upload-session returned file id ${session?.fileId} for requested ${rowId}; ` +
-          'this ShieldFive server is too old for this client.',
+        'The upload session returned an unexpected file ID. This ShieldFive server may be too old for this client.',
       )
     }
-    await sendUpload({ apiBaseUrl, accessToken, name, path, size, onPlaintextChunk, session, envelopeKey, recipientPublicKey, nameEncryptedV6 })
+    await sendUpload({ apiBaseUrl, accessToken, path, size, onPlaintextChunk, onRetry, session, envelopeKey, recipientPublicKey, nameEncryptedV6 })
   } catch (err) {
     if (!err?.finalizeOutcomeUnknown && session?.fileId) {
       await cancelUploadSession({ apiBaseUrl, accessToken, fileId: session.fileId })
@@ -632,7 +573,7 @@ export async function uploadFile({ apiBaseUrl, accessToken, rootKey, name, path,
   return { fileId: session.fileId }
 }
 
-async function sendUpload({ apiBaseUrl, accessToken, name, path, size, onPlaintextChunk, session, envelopeKey, recipientPublicKey, nameEncryptedV6 }) {
+async function sendUpload({ apiBaseUrl, accessToken, path, size, onPlaintextChunk, onRetry, session, envelopeKey, recipientPublicKey, nameEncryptedV6 }) {
   if (!session.proofKey) throw new Error('Upload session is missing its proof key.')
 
   // The server's v1 chunk size (5 MiB): each encrypted chunk is one storage part.
@@ -654,21 +595,16 @@ async function sendUpload({ apiBaseUrl, accessToken, name, path, size, onPlainte
   // The same v6 name sent at create (bound to the row id) is sent again at
   // finalize, which still expects it.
   if (session.uploadKind === 'direct') {
-    // No authToken and no storagePath check: since web b52b4c8 (PR #726) the
-    // direct path is a presigned S3 PUT, so the signature inside uploadUrl is
-    // the only credential and it already binds the object key. Requiring the
-    // token the server stopped issuing is what made every <= 5 MiB upload fail
-    // from 2026-09-03. The 'large' branch below still needs both.
     if (!session.uploadUrl) {
       throw new Error('Direct upload session is missing an upload URL.')
     }
-    await uploadDirect({ apiBaseUrl, accessToken, session, parts, nameEncryptedV6, empty: size === 0 })
-  } else if (session.uploadKind === 'large') {
-    if (!session.uploadUrl || !session.authToken) {
+    await uploadDirect({ apiBaseUrl, accessToken, session, parts, nameEncryptedV6, onRetry, empty: size === 0 })
+  } else if (session.uploadKind === 'large' || session.uploadKind === 's3-multipart') {
+    if (session.uploadKind === 'large' && (!session.uploadUrl || !session.authToken)) {
       throw new Error('Multipart upload session is missing credentials.')
     }
-    await uploadMultipart({ apiBaseUrl, accessToken, session, parts, nameEncryptedV6 })
+    await uploadMultipart({ apiBaseUrl, accessToken, session, parts, nameEncryptedV6, onRetry })
   } else {
-    throw new Error(`Unknown uploadKind "${session.uploadKind}" for "${name}".`)
+    throw new Error('The server selected an unsupported upload transport.')
   }
 }

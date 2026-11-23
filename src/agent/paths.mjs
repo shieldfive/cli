@@ -29,6 +29,15 @@ export class UnsupportedPlatformError extends Error {
   }
 }
 
+export function assertAgentPlatform(platform = process.platform) {
+  if (platform === 'win32') {
+    throw new UnsupportedPlatformError(
+      'Agent sign-in is unavailable on Windows. Set SF_EMAIL and SF_PASSWORD ' +
+        'in your terminal, then run sf push <folder> or sf sync <folder>.',
+    )
+  }
+}
+
 /**
  * The directory holding the agent socket: always ~/.shieldfive/run.
  *
@@ -40,13 +49,7 @@ export class UnsupportedPlatformError extends Error {
  * same place.
  */
 export function agentDir({ platform = process.platform, home = homedir() } = {}) {
-  if (platform === 'win32') {
-    throw new UnsupportedPlatformError(
-      'sf agent does not run on Windows yet: named pipes have a different ' +
-        'permission model and it has not been designed. Use SF_EMAIL and ' +
-        'SF_PASSWORD with sf push / sf sync instead.',
-    )
-  }
+  assertAgentPlatform(platform)
   return join(home, '.shieldfive', 'run')
 }
 
@@ -66,12 +69,12 @@ export function ledgerDir(home = homedir()) {
  * Create `dir` if needed, then refuse unless it is a real directory owned by
  * this user with no group or other permission bits.
  */
-export async function ensurePrivateDir(dir, { uid = process.getuid?.() } = {}) {
+export async function ensurePrivateDir(dir, { uid = process.getuid?.(), platform = process.platform } = {}) {
   await mkdir(dir, { recursive: true, mode: 0o700 })
-  return assertPrivateDir(dir, { uid })
+  return assertPrivateDir(dir, { uid, platform })
 }
 
-export async function assertPrivateDir(dir, { uid = process.getuid?.() } = {}) {
+export async function assertPrivateDir(dir, { uid = process.getuid?.(), platform = process.platform } = {}) {
   const st = await lstat(dir)
   if (st.isSymbolicLink() || !st.isDirectory()) {
     throw new UnsafeDirectoryError(
@@ -85,7 +88,8 @@ export async function assertPrivateDir(dir, { uid = process.getuid?.() } = {}) {
         'and run sf login again.',
     )
   }
-  if ((st.mode & 0o077) !== 0) {
+  // Windows profile directories use ACLs; their POSIX mode bits are synthetic.
+  if (platform !== 'win32' && (st.mode & 0o077) !== 0) {
     throw new UnsafeDirectoryError(
       `${dir} is accessible to other users (mode ` +
         `${(st.mode & 0o777).toString(8)}). Run: chmod 700 '${dir}'`,

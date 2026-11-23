@@ -52,7 +52,7 @@ asked to act without ever being asked to disclose.
 
 The server's bearer MFA gate (`utils/mfa.ts` in `shieldfive/web`) reads the `aal`
 claim from the JWT and requires `aal2` when the user has a verified TOTP factor.
-It applies no recency window. Supabase stores `aal` on the session row
+It applies no recency window. The authentication service stores `aal` on the session row
 (`auth.sessions.aal`), so a session stepped up once mints `aal2` access tokens on
 every refresh. One interactive `sf login` therefore unlocks unattended sync on a
 two-factor account until the session is revoked.

@@ -27,9 +27,11 @@ import { encryptNameV6 } from '@shieldfive/crypto/vault'
 
 import {
   EmptyFileUnsupportedError,
-  httpError,
+  isRetryableStatus,
   newRowBoundId,
   resolveToken,
+  responseError,
+  retryDelayMs,
   uploadFile,
 } from './upload.mjs'
 import {
@@ -45,8 +47,6 @@ const STATE_VERSION = 1
 const DEFAULT_CONCURRENCY = 3
 const MAX_CONCURRENCY = 8
 const MAX_FILE_ATTEMPTS = 8
-const RETRY_BASE_MS = 2000
-const RETRY_MAX_MS = 60_000
 const VERIFY_BATCH = 100
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
@@ -148,9 +148,7 @@ async function apiJson(apiBaseUrl, accessToken, path, { method = 'GET', body } =
   })
   const json = await res.json().catch(() => ({}))
   if (!res.ok) {
-    const err = httpError(`${method} ${path} failed (HTTP ${res.status}): ${JSON.stringify(json)}`, res.status, json)
-    err.retryAfterMs = Number(res.headers.get('retry-after')) * 1000 || null
-    throw err
+    throw responseError(`${method} ${path}`, res, json)
   }
   return json
 }
@@ -160,11 +158,11 @@ export function isTransient(err) {
     // Network / transport failures only (fetch throws TypeError 'fetch failed').
     return (
       err?.name === 'TypeError' ||
-      err?.finalizeOutcomeUnknown === true ||
+      err?.uploadNetworkError === true ||
       /fetch failed|ECONNRESET|ETIMEDOUT|EPIPE|ENOTFOUND|EAI_AGAIN|socket|network/i.test(err?.message ?? '')
     )
   }
-  return err.status >= 500 || err.status === 408 || err.status === 429
+  return isRetryableStatus(err.status)
 }
 
 // A refusal that every remaining file would meet too: stop the run.
@@ -174,7 +172,7 @@ export function isRunFatal(err) {
     err?.status === 402 ||
     err?.status === 412 ||
     (err?.status === 413 && err?.serverCode !== 'too_many_parts') ||
-    (err?.status === 403 && /mfa|step/i.test(err?.message ?? ''))
+    (err?.status === 403 && (err.serverCode === 'mfa_required' || /mfa|step/i.test(err.message ?? '')))
   )
 }
 
@@ -183,8 +181,8 @@ async function withRetry(fn, { onRetry = () => {}, attempts = MAX_FILE_ATTEMPTS 
     try {
       return await fn(attempt)
     } catch (err) {
-      if (attempt >= attempts || !isTransient(err) || isRunFatal(err)) throw err
-      const delay = Math.min(err.retryAfterMs ?? RETRY_BASE_MS * 2 ** (attempt - 1), RETRY_MAX_MS)
+      if (attempt >= attempts || err?.finalizeOutcomeUnknown || !isTransient(err) || isRunFatal(err)) throw err
+      const delay = retryDelayMs(attempt, err.retryAfterMs)
       onRetry(err, attempt, delay)
       await sleep(delay)
     }
@@ -331,7 +329,7 @@ export async function runPush({
     })
     const made = await withRetry(
       () => sendFolder({ apiBaseUrl, accessToken, prepared }),
-      { onRetry: (e, n, d) => status(`creating folder ${rel || name}: ${e.message}; retrying in ${Math.round(d / 1000)} s`) },
+      { onRetry: (e, _attempt, d) => status(`creating folder ${rel || name}: ${e.message}; retrying in ${Math.round(d / 1000)} s`) },
     )
     folderIds.set(rel, made)
     if (rel === '') {
@@ -430,6 +428,7 @@ export async function runPush({
               rowId: fileId,
               folderId: folder.id,
               folderKey: base64ToBytes(folder.key),
+              onRetry: (message) => status(`${f.rel}: ${message}`),
               onPlaintextChunk: (c) => {
                 progressed += c.length
                 inFlightBytes += c.length
@@ -457,8 +456,8 @@ export async function runPush({
           await save()
         },
         {
-          onRetry: (e, n, d) =>
-            status(`${f.rel}: ${e.message.slice(0, 200)}; retry ${n} in ${Math.round(d / 1000)} s`),
+          onRetry: (e, _attempt, d) =>
+            status(`${f.rel}: ${e.message.slice(0, 200)}; retrying in ${Math.round(d / 1000)} s`),
         },
       )
     } catch (err) {

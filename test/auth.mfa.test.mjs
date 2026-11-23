@@ -121,7 +121,7 @@ test('malformed code: rejected before calling verify', async () => {
   assert.equal(supabase.calls.verify.length, 0)
 })
 
-test('wrong code (server rejects): surfaces the verify error', async () => {
+test('wrong code (server rejects): asks the user to check the code', async () => {
   const supabase = mockSupabase({
     aal: ok({ currentLevel: 'aal1', nextLevel: 'aal2' }),
     factors: ok({ totp: [{ id: 'factor-1', status: 'verified' }] }),
@@ -130,7 +130,7 @@ test('wrong code (server rejects): surfaces the verify error', async () => {
   })
   await assert.rejects(
     () => stepUpMfaIfRequired({ supabase, getTotpCode: async () => '654321' }),
-    /Two-factor verification failed: Invalid TOTP code/,
+    /Two-factor verification failed. Check your code/,
   )
 })
 
@@ -138,6 +138,6 @@ test('AAL lookup failure: fails closed with a clear message', async () => {
   const supabase = mockSupabase({ aal: fail('service down') })
   await assert.rejects(
     () => stepUpMfaIfRequired({ supabase, getTotpCode: async () => '123456' }),
-    /Could not check two-factor status: service down/,
+    /Could not check two-factor status/,
   )
 })
