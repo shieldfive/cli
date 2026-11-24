@@ -187,8 +187,11 @@ const REFRESH_MARGIN_S = 120
 export function createSessionTokens({ accessToken, refreshToken, expiresAt, refresh, now = () => Date.now() }) {
   let tokens = { access: accessToken, refresh: refreshToken, expiresAt }
   let inflight = null
-  return async function current() {
-    if (!refresh || !tokens.expiresAt || now() / 1000 < tokens.expiresAt - REFRESH_MARGIN_S) {
+  // { forceRefresh: true } refreshes now, whatever the expiry says: the server
+  // refused the token (HTTP 401), e.g. the session was rotated elsewhere.
+  return async function current({ forceRefresh = false } = {}) {
+    if (forceRefresh && !refresh) throw new Error('This session cannot be refreshed.')
+    if (!forceRefresh && (!refresh || !tokens.expiresAt || now() / 1000 < tokens.expiresAt - REFRESH_MARGIN_S)) {
       return tokens.access
     }
     inflight ??= refresh(tokens.refresh)
