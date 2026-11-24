@@ -177,6 +177,25 @@ test('upload records a tagged ledger entry and no response ever contains key mat
   }
 })
 
+test('upload hands uploadFile a token getter that follows refreshes, so long uploads do not 401', async () => {
+  let midUpload
+  const h = await harness({
+    expiresInSec: 0,
+    uploadHook: async (args) => {
+      if (args.phase === 'after-read') midUpload = args.accessToken
+    },
+  })
+  try {
+    const p = await h.file('big.bin', 'x')
+    await h.call('upload', { path: p })
+    assert.equal(typeof midUpload, 'function', 'uploadFile must get a getter, not a fixed token')
+    assert.match(await midUpload(), /^at-\d+$/)
+    assert.ok(h.calls.refresh >= 1, 'the expired token was refreshed, not reused')
+  } finally {
+    await h.agent.stop('test')
+  }
+})
+
 test('verify: verified, missing and not_in_ledger come from ledger plus server, never from names', async () => {
   const h = await harness()
   try {

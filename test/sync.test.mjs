@@ -261,7 +261,7 @@ test('runSync --watch refreshes the session before the access token expires', as
         rootKey: new Uint8Array(32),
       }),
       uploadFn: async ({ name, accessToken }) => {
-        used.push([name, accessToken])
+        used.push([name, typeof accessToken === "function" ? await accessToken() : accessToken])
         if (name === 'a.txt') {
           // An hour goes by; a new file appears for the next pass.
           clock += 3590 * 1000
@@ -307,7 +307,7 @@ test('runSync --watch stops with an error when the session cannot be refreshed',
           rootKey: new Uint8Array(32),
         }),
         uploadFn: async ({ name, accessToken }) => {
-          used.push([name, accessToken])
+          used.push([name, typeof accessToken === "function" ? await accessToken() : accessToken])
           return { fileId: 'x' }
         },
         log: () => {},
