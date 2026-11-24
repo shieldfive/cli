@@ -132,9 +132,11 @@ export function createAgent({
     }
   }
 
-  async function accessToken() {
+  // { forceRefresh: true }: the API refused the current token (HTTP 401), so
+  // refresh now even if it has not reached its expiry margin.
+  async function accessToken({ forceRefresh = false } = {}) {
     assertRunning('before this request could run')
-    if (tokens.expiresAt && now() / 1000 < tokens.expiresAt - REFRESH_MARGIN_S) {
+    if (!forceRefresh && tokens.expiresAt && now() / 1000 < tokens.expiresAt - REFRESH_MARGIN_S) {
       return tokens.access
     }
     // Single flight. Supabase rotates refresh tokens, and presenting the same

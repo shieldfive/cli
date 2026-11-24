@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## 0.5.3
+
+- A single transient server error no longer fails an upload. Creating the
+  upload session, getting upload credentials, uploading parts and completing
+  the upload each retry HTTP 5xx, 429, connection resets and timeouts with
+  bounded, randomized backoff (7 attempts). A reply cut off mid-body is
+  retried instead of being read as empty.
+- Requests have a deadline (90 s for API calls, 10 min per storage part), so a
+  stalled connection is retried instead of hanging the upload.
+- An API HTTP 401 during an upload refreshes the sign-in once and repeats the
+  request. If the refresh fails, the upload stops with the sign-in-again
+  message. Other 4xx answers are never retried.
+
 ## 0.5.2
 
 - Uploads that take longer than the sign-in lifetime (about an hour, e.g. a

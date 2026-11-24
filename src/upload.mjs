@@ -70,14 +70,60 @@ export function responseError(operation, res, body, { status = res.status, fallb
   return error
 }
 
-async function uploadRequest(url, init, operation) {
+// Per-request deadlines. A request that hangs (a half-open connection, a stalled
+// proxy) is aborted and retried like a reset instead of blocking the upload
+// forever. API calls are small JSON exchanges; a storage request carries one
+// part of at most a few MiB, so it gets a longer deadline for slow links.
+export const API_REQUEST_TIMEOUT_MS = 90_000
+export const STORAGE_REQUEST_TIMEOUT_MS = 10 * 60_000
+
+async function uploadRequest(url, init, operation, timeoutMs = API_REQUEST_TIMEOUT_MS) {
   try {
-    return await fetch(url, init)
-  } catch {
-    const error = new Error(`${operation} could not reach the server`)
+    return await fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) })
+  } catch (cause) {
+    const timedOut = cause?.name === 'TimeoutError'
+    const error = new Error(`${operation} ${timedOut ? 'timed out' : 'could not reach the server'}`)
     error.uploadNetworkError = true
+    error.cause = cause
     throw error
   }
+}
+
+// Read a JSON reply. A 2xx whose body cannot be read (the connection reset
+// mid-body) is a network failure to retry, never an empty success.
+async function readJson(res, operation) {
+  try {
+    return await res.json()
+  } catch (cause) {
+    if (!res.ok) return {}
+    const error = new Error(`${operation} could not read the server's reply`)
+    error.uploadNetworkError = true
+    error.cause = cause
+    throw error
+  }
+}
+
+// One API call with the bearer token. On HTTP 401 the token is refreshed once
+// (when the caller supplied a refreshable getter) and the call is repeated; if
+// that refresh fails, or the repeat is refused too, the 401 surfaces with its
+// sign-in-again guidance. Other statuses are left to the caller.
+async function apiRequest({ url, accessToken, body, operation, auth }) {
+  const send = async (token) => uploadRequest(url, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body,
+  }, operation)
+  const res = await send(await resolveToken(accessToken))
+  if (res.status !== 401 || typeof accessToken !== 'function' || auth.refreshed) return res
+  auth.refreshed = true
+  let fresh
+  try {
+    fresh = await accessToken({ forceRefresh: true })
+  } catch {
+    return res
+  }
+  await res.body?.cancel().catch(() => {})
+  return send(fresh)
 }
 
 async function withUploadRetry(send, onRetry) {
@@ -102,8 +148,8 @@ async function withUploadRetry(send, onRetry) {
 // function is resolved at every request, so an upload that outlives the access
 // token (about an hour; a multi-gigabyte file can) picks up a refreshed session
 // for its later part URLs and its finalize.
-export async function resolveToken(accessToken) {
-  return typeof accessToken === 'function' ? accessToken() : accessToken
+export async function resolveToken(accessToken, options) {
+  return typeof accessToken === 'function' ? accessToken(options) : accessToken
 }
 
 // Read a file in fixed-size chunks without holding it all in memory. Each yield
@@ -205,17 +251,15 @@ export async function createUploadSession({
     thumbnail_ciphertext_b64: null,
     thumbnail_nonce_prefix: null,
   })
+  // Safe to repeat: the server treats a replay of the same clientUploadId with
+  // the same name and wrapped key as the same session.
+  const auth = { refreshed: false }
   const body = await withUploadRetry(async () => {
     const operation = 'Create upload session'
-    const res = await uploadRequest(new URL(CREATE_SESSION_PATH, apiBaseUrl), {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${await resolveToken(accessToken)}`,
-        'Content-Type': 'application/json',
-      },
-      body: payload,
-    }, operation)
-    const json = await res.json().catch(() => ({}))
+    const res = await apiRequest({
+      url: new URL(CREATE_SESSION_PATH, apiBaseUrl), accessToken, body: payload, operation, auth,
+    })
+    const json = await readJson(res, operation)
     if (!res.ok) throw responseError(operation, res, json, {
       fallbackRetryAfterMs: res.status === 429 ? UPLOAD_RATE_WINDOW_MS : undefined,
     })
@@ -226,17 +270,16 @@ export async function createUploadSession({
 
 // Signed URLs name a single object or part. Keep the ciphertext unchanged
 // across attempts and obtain replacement credentials after a refused send.
-async function refreshUploadUrl({ apiBaseUrl, accessToken, fileId }, metadata) {
+async function refreshUploadUrl({ apiBaseUrl, accessToken, fileId, auth }, metadata) {
   const operation = 'Get upload credentials'
-  const res = await uploadRequest(new URL(PART_URL_PATH, apiBaseUrl), {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${await resolveToken(accessToken)}`,
-      'Content-Type': 'application/json',
-    },
+  const res = await apiRequest({
+    url: new URL(PART_URL_PATH, apiBaseUrl),
+    accessToken,
     body: JSON.stringify({ fileId, ...metadata }),
-  }, operation)
-  const body = await res.json().catch(() => ({}))
+    operation,
+    auth,
+  })
+  const body = await readJson(res, operation)
   if (!res.ok) throw responseError(operation, res, body)
   if (!body?.uploadUrl || (metadata ? body.uploadKind !== metadata.kind : !body.authToken)) {
     throw new Error('Storage returned incomplete upload credentials.')
@@ -245,7 +288,7 @@ async function refreshUploadUrl({ apiBaseUrl, accessToken, fileId }, metadata) {
 }
 
 async function sendStorage(url, init, operation) {
-  const res = await uploadRequest(url, { ...init, redirect: 'error' }, operation)
+  const res = await uploadRequest(url, { ...init, redirect: 'error' }, operation, STORAGE_REQUEST_TIMEOUT_MS)
   if (res.ok) return res
   const body = await res.text().catch(() => '')
   const busy = /"code"\s*:\s*"too_busy"|<Code>ServiceUnavailable<\/Code>/.test(body)
@@ -280,20 +323,20 @@ async function finalizeUpload({
   nameEncryptedV6,
 }) {
   const operation = 'Complete upload'
+  const auth = { refreshed: false }
   let outcomeUnknown = false
   try {
     return await withUploadRetry(async () => {
       // Reuse the manifest and row if storage completed before the reply was lost.
       try {
-        const res = await uploadRequest(new URL(COMPLETE_PATH, apiBaseUrl), {
-          method: 'POST',
-          headers: {
-            Authorization: `Bearer ${await resolveToken(accessToken)}`,
-            'Content-Type': 'application/json',
-          },
+        const res = await apiRequest({
+          url: new URL(COMPLETE_PATH, apiBaseUrl),
+          accessToken,
           body: JSON.stringify({ fileId, b2FileId, partSha1Array, partETags, proof, ciphertextHash, nameEncryptedV6 }),
-        }, operation)
-        const body = await res.json().catch(() => ({}))
+          operation,
+          auth,
+        })
+        const body = await readJson(res, operation)
         if (!res.ok) throw responseError(operation, res, body, {
           fallbackRetryAfterMs: res.status === 429 ? UPLOAD_RATE_WINDOW_MS : undefined,
         })
@@ -329,7 +372,7 @@ async function uploadDirect({ apiBaseUrl, accessToken, session, parts, nameEncry
     : await computeV3UploadProof({ proofKeyHex: session.proofKey, part0: ciphertext })
 
   await putDirectPresigned({
-    context: { apiBaseUrl, accessToken, fileId: session.fileId },
+    context: { apiBaseUrl, accessToken, fileId: session.fileId, auth: { refreshed: false } },
     session, ciphertext, onRetry,
   })
 
@@ -376,7 +419,8 @@ async function uploadMultipart({ apiBaseUrl, accessToken, session, parts, nameEn
 
   const signed = session.uploadKind === 's3-multipart'
   const partETags = signed ? [] : undefined
-  const context = { apiBaseUrl, accessToken, fileId: session.fileId }
+  // One token refresh per upload, shared by every part's credential request.
+  const context = { apiBaseUrl, accessToken, fileId: session.fileId, auth: { refreshed: false } }
   const urlPool = [session]
 
   const inFlight = new Set()
