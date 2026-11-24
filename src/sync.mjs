@@ -126,6 +126,9 @@ export async function syncOnce({
 
   const tokenFor = typeof accessToken === 'function' ? accessToken : async () => accessToken
   for (const entry of toUpload) {
+    // Resolve once up front so a session that cannot be refreshed stops the
+    // pass here, outside the per-file isolation below.
+    await tokenFor()
     try {
       // Pass the getter so a long upload refreshes its token per request.
       const { fileId } = await uploadFn({

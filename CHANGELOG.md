@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## 0.5.2
+
+- Uploads that take longer than the sign-in lifetime (about an hour, e.g. a
+  multi-gigabyte file) no longer fail with "Get upload credentials failed
+  (HTTP 401)": the agent and `sf sync` refresh the access token per request.
+- A 401 during an upload now says the sign-in expired or was revoked and to
+  run `sf logout`, then `sf login`.
+
 ## 0.5.1
 
 - Installation requires no lifecycle scripts. Argon2id uses the web vault's
