@@ -193,7 +193,8 @@ export function createAgent({
     // O_NOFOLLOW, so a swap after this check fails too).
     const before = await lstat(path)
     if (!before.isFile()) throw new AgentError('not_a_file', `${path} is not a regular file.`)
-    const token = await accessToken()
+    // Fail fast when the session cannot be refreshed, before any bytes are read.
+    await accessToken()
 
     // The MAC recorded is the MAC of exactly the bytes that were encrypted, fed
     // in chunk by chunk as uploadFile reads them. Hashing the file before and
@@ -211,7 +212,10 @@ export function createAgent({
     try {
       ;({ fileId } = await uploadFile({
         apiBaseUrl: config.apiBaseUrl,
-        accessToken: token,
+        // The getter, not a token: uploadFile resolves it per request, so a
+        // multi-gigabyte upload that outlives the access token (about an hour)
+        // keeps getting part URLs instead of failing with HTTP 401.
+        accessToken,
         rootKey: uploadKey,
         name: basename(path),
         path,

@@ -126,11 +126,11 @@ export async function syncOnce({
 
   const tokenFor = typeof accessToken === 'function' ? accessToken : async () => accessToken
   for (const entry of toUpload) {
-    const token = await tokenFor()
     try {
+      // Pass the getter so a long upload refreshes its token per request.
       const { fileId } = await uploadFn({
         apiBaseUrl,
-        accessToken: token,
+        accessToken: tokenFor,
         rootKey,
         name: entry.name,
         path: entry.path,
