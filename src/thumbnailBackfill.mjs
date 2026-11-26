@@ -98,7 +98,7 @@ async function* listFolderFiles({ apiBaseUrl, accessToken, folderId }) {
   }
 }
 
-async function findVaultRoot({ source, media, vaultFolder, byId, rootKeyB64, keyCache, account }) {
+export async function findVaultRoot({ source, media, vaultFolder, byId, rootKeyB64, keyCache, account }) {
   const roots = [...byId.values()].filter((n) => !n.parent_id && !n.is_bin)
   if (media) {
     const m = roots.find((n) => n.is_media)

@@ -88,6 +88,15 @@ const SYSTEM_DIRS = new Set([
   '$recycle.bin',
   'system volume information',
   'lost+found',
+  '@synoresource',
+  '@synoeastream',
+  '@tmp',
+  '.ds_store',
+  '.appledouble',
+  '.trashes',
+  '.spotlight-v100',
+  '.fseventsd',
+  '.temporaryitems',
 ])
 export const isSystemDir = (name) => SYSTEM_DIRS.has(name.toLowerCase())
 

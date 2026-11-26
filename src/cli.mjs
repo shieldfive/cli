@@ -41,6 +41,8 @@ function usage() {
       '  thumbnails <folder>          add encrypted previews to photos/videos already pushed from',
       '                              <folder>, made from the local originals (no re-upload, no download)',
       '                              [--dry-run] count only  [--media] [--vault-folder=<a/b>]',
+      '  tidy [<folder>] [--media]    move empty NAS/system folders (@eaDir, #recycle, ...) an',
+      '                              earlier push made to the Bin [--dry-run] [--yes] [--delete]',
       '  sync <folder> [--watch]     upload new and changed files',
       '                              [--interval=<seconds>]  poll interval for --watch (default 5)',
       '  verify <file>...            report whether each file is safely in your vault',
@@ -579,6 +581,65 @@ async function cmdThumbnails(folder, flags) {
   else if (s.failed) process.exitCode = 2
 }
 
+// Move empty NAS/system folders (@eaDir, #recycle, ...) an earlier push made
+// into the Bin. Asks first; --yes skips the question, --dry-run only counts.
+async function cmdTidy(folder, flags) {
+  const { agent } = await chooseAuth()
+  if (agent) {
+    throw new Error('sf tidy signs in itself: run sf logout, then set SF_EMAIL and SF_PASSWORD and run it again.')
+  }
+  if (!folder && flags.media !== true && typeof flags['vault-folder'] !== 'string') {
+    throw new Error('tidy needs --media, --vault-folder=<path>, or the local <folder> you pushed')
+  }
+  const cfg = readLiveConfig(flags)
+  const { runTidy } = await import('./tidy.mjs')
+  const { createSessionTokens } = await import('./sync.mjs')
+  const session = await authAndUnlock(cfg)
+  const accessToken = createSessionTokens({
+    accessToken: session.accessToken,
+    refreshToken: session.refreshToken,
+    expiresAt: session.expiresAt,
+    refresh: session.refreshSession,
+  })
+  const purge = flags.delete === true
+  const s = await runTidy({
+    source: folder ?? '.',
+    apiBaseUrl: cfg.apiBaseUrl,
+    accessToken,
+    rootKey: session.rootKey,
+    account: cfg.email.toLowerCase(),
+    media: flags.media === true,
+    vaultFolder: typeof flags['vault-folder'] === 'string' ? flags['vault-folder'] : null,
+    apply: flags['dry-run'] !== true,
+    purge,
+    status: (m) => process.stderr.write(`${m}\n`),
+    confirm: async (p) => {
+      process.stderr.write(
+        `${p.empty} empty NAS/system folders (${p.emptyFolders} folders with their subfolders) can go; ` +
+          `${p.keptWithFiles} hold files and stay.\n`,
+      )
+      if (flags.yes === true) return true
+      const q = purge
+        ? `Move them to the Bin and then delete them from the Bin for good? [y/N] `
+        : `Move them to the Bin? [y/N] `
+      return /^y(es)?$/i.test((await promptLine(q)).trim())
+    },
+  })
+  if (flags['dry-run'] === true) {
+    process.stderr.write(
+      `dry run: ${s.empty} empty NAS/system folders (${s.emptyFolders} folders in all) would move to the Bin; ` +
+        `${s.keptWithFiles} hold files and would stay. Nothing was changed.\n`,
+    )
+  } else if (s.declined) process.stderr.write('nothing changed\n')
+  else {
+    process.stderr.write(
+      `moved ${s.movedToBin} folders (${s.foldersMoved} with their subfolders) to the Bin` +
+        (purge ? `; deleted ${s.purged} of them from the Bin` : '') + '\n' +
+        (purge ? '' : 'Folders in the Bin still count toward the folder limit: empty the Bin in the web app, or run again with --delete.\n'),
+    )
+  }
+}
+
 function pushListOptions(flags) {
   return { includeDotfiles: flags['include-dotfiles'] === true }
 }
@@ -724,6 +785,8 @@ async function main() {
   } else if (cmd === 'thumbnails') {
     if (!folder) throw new Error('thumbnails needs the local <folder> the files were pushed from')
     await cmdThumbnails(folder, flags)
+  } else if (cmd === 'tidy') {
+    await cmdTidy(folder, flags)
   } else if (cmd === 'sync') {
     if (!folder) throw new Error('sync needs a <folder>')
     // `--interval 10` (space-separated) would otherwise parse as a bare flag and
