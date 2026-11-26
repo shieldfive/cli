@@ -11,7 +11,7 @@
 
 import { isAbsolute } from 'node:path'
 
-export const OPS = Object.freeze(['status', 'upload', 'sync', 'verify', 'lock', 'logout'])
+export const OPS = Object.freeze(['status', 'upload', 'sync', 'push', 'tidy', 'thumbnails', 'verify', 'lock', 'logout'])
 const OP_SET = new Set(OPS)
 
 export const MAX_LINE_BYTES = 1_000_000
@@ -105,6 +105,31 @@ export function parseRequest(line) {
       return { id, op, args: { path: absolutePath(args.path, 'path') } }
     case 'sync':
       return { id, op, args: { folder: absolutePath(args.folder, 'folder') } }
+    case 'push':
+      return {
+        id,
+        op,
+        args: {
+          folder: absolutePath(args.folder, 'folder'),
+          media: args.media === true,
+          includeDotfiles: args.includeDotfiles === true,
+          thumbnails: args.thumbnails !== false,
+        },
+      }
+    case 'tidy':
+    case 'thumbnails':
+      return {
+        id,
+        op,
+        args: {
+          folder: args.folder == null ? null : absolutePath(args.folder, 'folder'),
+          media: args.media === true,
+          vaultFolder: typeof args.vaultFolder === 'string' ? args.vaultFolder : null,
+          apply: args.apply === true,
+          purge: args.purge === true,
+          dryRun: args.dryRun === true,
+        },
+      }
     case 'verify': {
       if (!Array.isArray(args.paths) || args.paths.length === 0) {
         throw new ProtocolError('bad_request', 'paths must be a non-empty array.')

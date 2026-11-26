@@ -162,3 +162,13 @@ test('no Bin and at the folder limit: a plain message, nothing moved', async () 
   await assert.rejects(runTidy(opts({ apply: true })), /no Bin yet.*folder limit/)
   assert.equal(srv.calls.move, 0)
 })
+
+test('--delete re-checks each folder right before deleting it and skips one that gained a file', async () => {
+  const t = await nasVault()
+  const child = [...srv.folders.values()].find((f) => f.parent_id === t.ea)
+  const s = await runTidy(opts({ apply: true, purge: true, confirm: async () => { srv.files.set(child.id, 1); return true } }))
+  assert.equal(s.skippedNotEmpty, 1)
+  assert.equal(s.purged, 2)
+  assert.ok(srv.folders.has(t.ea))
+  assert.ok(srv.folders.has(child.id))
+})

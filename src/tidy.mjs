@@ -208,7 +208,33 @@ export async function runTidy({
 
   if (purge) {
     const movePace = pacer(moveGapMs)
+    summary.skippedNotEmpty = 0
+    // Fresh tree: anything added under these folders since the scan counts.
+    const fresh = flattenTree((await withRetry(() => apiJson(apiBaseUrl, accessToken, '/api/folders/tree'))).tree)
+    const freshKids = new Map()
+    for (const n of fresh.values()) {
+      if (!n.parent_id) continue
+      if (!freshKids.has(n.parent_id)) freshKids.set(n.parent_id, [])
+      freshKids.get(n.parent_id).push(n)
+    }
     for (const c of [...moved, ...inBin]) {
+      // Re-check on the server, right before the delete, that nothing under
+      // this folder holds a file. One that does is left in the Bin.
+      const now = fresh.get(c.node.id)
+      if (!now) continue
+      const ids = []
+      const st = [now]
+      while (st.length) {
+        const x = st.pop()
+        ids.push(x.id)
+        st.push(...(freshKids.get(x.id) ?? []))
+      }
+      let full = false
+      for (const id of ids) if (await hasFile(id)) { full = true; break }
+      if (full) {
+        summary.skippedNotEmpty += 1
+        continue
+      }
       await movePace()
       try {
         await withRetry(() =>
