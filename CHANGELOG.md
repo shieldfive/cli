@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## 0.6.2
+
+- `sf push` of a folder tree or `--media`, `sf tidy` and `sf thumbnails` now
+  work with the signed-in session (`sf login`): no SF_EMAIL / SF_PASSWORD and
+  no logout. The agent runs them and prints a summary at the end.
+- `sf tidy` counts first and says what to run next. `--delete` removes only
+  empty NAS/system-named folders, including ones an earlier tidy left in the
+  Bin, and re-checks on the server right before each delete that nothing
+  under the folder holds a file.
+- `sf push` without this machine's resume record (a new machine, the agent,
+  an older CLI's push) skips files already in the vault folder with the same
+  name and size instead of uploading a second copy.
+
 ## 0.6.1
 
 - `sf push` skips NAS and system folders (`@eaDir`, `#recycle`, `#snapshot`,

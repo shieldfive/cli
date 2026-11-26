@@ -342,7 +342,7 @@ async function cmdLogin(flags) {
     password: vaultPassword,
   })
 
-  const started = await launchAgent({ session, rootKey, config: cfg, idleMs: idle.ms })
+  const started = await launchAgent({ session: { ...session, email: email.toLowerCase() }, rootKey, config: cfg, idleMs: idle.ms })
   rootKey.fill(0)
 
   process.stdout.write(
@@ -410,25 +410,58 @@ async function cmdLogout(flags) {
 }
 
 // login -> unlock -> encrypt -> upload every file in the folder, once.
+function printPushSummary(summary) {
+  for (const f of summary.failed ?? []) process.stdout.write(`failed ${f.rel}: ${f.message}\n`)
+  const fmt = (n) => `${(n / 1e9).toFixed(2)} GB`
+  process.stderr.write(
+    `done: ${summary.uploaded} uploaded (${fmt(summary.bytesUploaded)}), ` +
+      `${summary.alreadyThere} already there, ${summary.foldersCreated} folders created` +
+      (summary.failed.length ? `, ${summary.failed.length} failed` : '') +
+      (summary.changed.length ? `, ${summary.changed.length} changed while uploading` : '') +
+      (summary.skippedEmpty.length ? `, ${summary.skippedEmpty.length} empty skipped` : '') +
+      '\n',
+  )
+  if (summary.stoppedBy) {
+    process.stderr.write(`stopped: ${summary.stoppedBy.message}\n`)
+    process.exitCode = 1
+    return
+  }
+  if (summary.interrupted) {
+    process.stderr.write(`interrupted with ${summary.notStarted} files not started; run the same command again to resume\n`)
+    process.exitCode = 130
+    return
+  }
+  if (summary.failed.length || summary.changed.length || summary.skippedEmpty.length) {
+    process.stderr.write('some files are not in the vault; run the same command again to retry them\n')
+    process.exitCode = 2
+  }
+}
+
+
 async function cmdPush(folder, flags) {
   const { agent } = await chooseAuth()
-  if (agent && flags.media) {
-    throw new Error(
-      '--media is not available through the agent (sf login) yet. Run sf logout, ' +
-        'then set SF_EMAIL and SF_PASSWORD and run sf push --media again.',
-    )
-  }
   if (agent) {
-    // The agent uploads single files to the vault root; it cannot make vault
-    // folders yet. Refuse a tree rather than flatten it.
     const { readdir: readDir } = await import('node:fs/promises')
     const entries = await readDir(resolve(folder), { withFileTypes: true })
-    if (entries.some((e) => e.isDirectory() && !e.name.startsWith('.'))) {
-      throw new Error(
-        'this folder has subfolders, and pushing through the agent (sf login) only ' +
-          'uploads the files at its top level. To copy the whole tree, run sf logout, ' +
-          'then set SF_EMAIL and SF_PASSWORD and run sf push again.',
+    const tree = flags.media === true || entries.some((e) => e.isDirectory() && !e.name.startsWith('.'))
+    if (tree) {
+      const { request } = await import('./agent/client.mjs')
+      process.stderr.write(
+        `pushing ${flags.media === true ? 'into Media' : 'the folder tree'} for account ${agent.account} through the agent; ` +
+          'this can take a long time and prints a summary at the end\n',
       )
+      const summary = await request(
+        'push',
+        {
+          folder: resolve(folder),
+          media: flags.media === true,
+          includeDotfiles: flags['include-dotfiles'] === true,
+          thumbnails: flags['no-thumbnails'] !== true && process.env.SF_NO_THUMBNAILS !== '1',
+        },
+        { timeoutMs: 0 },
+      )
+      printPushSummary(summary)
+      return
     }
     const { request } = await import('./agent/client.mjs')
     process.stderr.write(`pushing to account ${agent.account} through the agent\n`)
@@ -501,40 +534,36 @@ async function cmdPush(folder, flags) {
   } finally {
     process.off('SIGINT', onSigint)
   }
-  const fmt = (n) => `${(n / 1e9).toFixed(2)} GB`
-  process.stderr.write(
-    `done: ${summary.uploaded} uploaded (${fmt(summary.bytesUploaded)}), ` +
-      `${summary.alreadyThere} already there, ${summary.foldersCreated} folders created` +
-      (summary.failed.length ? `, ${summary.failed.length} failed` : '') +
-      (summary.changed.length ? `, ${summary.changed.length} changed while uploading` : '') +
-      (summary.skippedEmpty.length ? `, ${summary.skippedEmpty.length} empty skipped` : '') +
-      '\n',
-  )
-  if (summary.stoppedBy) {
-    process.stderr.write(`stopped: ${summary.stoppedBy.message}\n`)
-    process.exitCode = 1
-    return
-  }
-  if (summary.interrupted) {
-    process.stderr.write(`interrupted with ${summary.notStarted} files not started; run the same command again to resume\n`)
-    process.exitCode = 130
-    return
-  }
-  if (summary.failed.length || summary.changed.length || summary.skippedEmpty.length) {
-    process.stderr.write('some files are not in the vault; run the same command again to retry them\n')
-    process.exitCode = 2
-  }
+  printPushSummary(summary)
 }
 
 // Add encrypted previews to photos/videos already in the vault, from the local
 // originals. Uploads previews only; never the files, never downloads.
+function printThumbnailSummary(s, flags) {
+  process.stderr.write(
+    `vault: ${s.vaultFiles} files, ${s.media} photos/videos, ${s.haveThumbnail} already with a preview\n` +
+      `local originals: ${s.matched} matched, ${s.noLocal} not found here, ${s.sizeDiffers} different size` +
+      (s.unreadableName ? `, ${s.unreadableName} names could not be read` : '') + '\n' +
+      (flags['dry-run'] === true
+        ? `dry run: ${s.toDo} previews would be added (${s.alreadyDone} done by an earlier run). Nothing was sent.\n`
+        : `previews: ${s.added} added, ${s.exists} already there, ${s.noPreview} not possible (format or no encoder), ${s.failed} failed\n`),
+  )
+  if (s.interrupted) process.exitCode = 130
+  else if (s.failed) process.exitCode = 2
+}
+
 async function cmdThumbnails(folder, flags) {
   const { agent } = await chooseAuth()
   if (agent) {
-    throw new Error(
-      'sf thumbnails signs in itself: run sf logout, then set SF_EMAIL and SF_PASSWORD ' +
-        'and run it again.',
+    const { request } = await import('./agent/client.mjs')
+    process.stderr.write(`adding previews for account ${agent.account} through the agent; prints a summary at the end\n`)
+    const s = await request(
+      'thumbnails',
+      { folder: resolve(folder), media: flags.media === true, vaultFolder: typeof flags['vault-folder'] === 'string' ? flags['vault-folder'] : null, dryRun: flags['dry-run'] === true },
+      { timeoutMs: 0 },
     )
+    printThumbnailSummary(s, flags)
+    return
   }
   const cfg = readLiveConfig(flags)
   const { runBackfill } = await import('./thumbnailBackfill.mjs')
@@ -569,76 +598,89 @@ async function cmdThumbnails(folder, flags) {
   } finally {
     process.off('SIGINT', onSigint)
   }
-  process.stderr.write(
-    `vault: ${s.vaultFiles} files, ${s.media} photos/videos, ${s.haveThumbnail} already with a preview\n` +
-      `local originals: ${s.matched} matched, ${s.noLocal} not found here, ${s.sizeDiffers} different size` +
-      (s.unreadableName ? `, ${s.unreadableName} names could not be read` : '') + '\n' +
-      (flags['dry-run'] === true
-        ? `dry run: ${s.toDo} previews would be added (${s.alreadyDone} done by an earlier run). Nothing was sent.\n`
-        : `previews: ${s.added} added, ${s.exists} already there, ${s.noPreview} not possible (format or no encoder), ${s.failed} failed\n`),
-  )
-  if (s.interrupted) process.exitCode = 130
-  else if (s.failed) process.exitCode = 2
+  printThumbnailSummary(s, flags)
 }
 
 // Move empty NAS/system folders (@eaDir, #recycle, ...) an earlier push made
-// into the Bin. Asks first; --yes skips the question, --dry-run only counts.
+// into the Bin, or with --delete delete them for good. Counts first and asks;
+// --yes skips the question, --dry-run only counts. Works through the agent
+// (sf login) or with SF_EMAIL / SF_PASSWORD.
 async function cmdTidy(folder, flags) {
-  const { agent } = await chooseAuth()
-  if (agent) {
-    throw new Error('sf tidy signs in itself: run sf logout, then set SF_EMAIL and SF_PASSWORD and run it again.')
-  }
   if (!folder && flags.media !== true && typeof flags['vault-folder'] !== 'string') {
     throw new Error('tidy needs --media, --vault-folder=<path>, or the local <folder> you pushed')
   }
-  const cfg = readLiveConfig(flags)
-  const { runTidy } = await import('./tidy.mjs')
-  const { createSessionTokens } = await import('./sync.mjs')
-  const session = await authAndUnlock(cfg)
-  const accessToken = createSessionTokens({
-    accessToken: session.accessToken,
-    refreshToken: session.refreshToken,
-    expiresAt: session.expiresAt,
-    refresh: session.refreshSession,
-  })
   const purge = flags.delete === true
-  const s = await runTidy({
-    source: folder ?? '.',
-    apiBaseUrl: cfg.apiBaseUrl,
-    accessToken,
-    rootKey: session.rootKey,
-    account: cfg.email.toLowerCase(),
+  const where = flags.media === true ? '--media' : typeof flags['vault-folder'] === 'string' ? `--vault-folder="${flags['vault-folder']}"` : `"${folder}"`
+  const base = {
+    folder: folder ? resolve(folder) : null,
     media: flags.media === true,
     vaultFolder: typeof flags['vault-folder'] === 'string' ? flags['vault-folder'] : null,
-    apply: flags['dry-run'] !== true,
-    purge,
-    status: (m) => process.stderr.write(`${m}\n`),
-    confirm: async (p) => {
-      process.stderr.write(
-        `${p.empty} empty NAS/system folders (${p.emptyFolders} folders with their subfolders) can go; ` +
-          `${p.keptWithFiles} hold files and stay.` +
-          (p.inBin ? ` ${p.inBin} empty ones are already in the Bin and will be deleted.` : '') + '\n',
-      )
-      if (flags.yes === true) return true
-      const q = purge
-        ? `Move them to the Bin and then delete them from the Bin for good? [y/N] `
-        : `Move them to the Bin? [y/N] `
-      return /^y(es)?$/i.test((await promptLine(q)).trim())
-    },
-  })
+  }
+  const { agent } = await chooseAuth()
+  let run
+  if (agent) {
+    const { request } = await import('./agent/client.mjs')
+    process.stderr.write(`checking account ${agent.account} through the agent\n`)
+    run = (args) => request('tidy', { ...base, ...args }, { timeoutMs: 0 })
+  } else {
+    const cfg = readLiveConfig(flags)
+    const { runTidy } = await import('./tidy.mjs')
+    const { createSessionTokens } = await import('./sync.mjs')
+    const session = await authAndUnlock(cfg)
+    const accessToken = createSessionTokens({
+      accessToken: session.accessToken,
+      refreshToken: session.refreshToken,
+      expiresAt: session.expiresAt,
+      refresh: session.refreshSession,
+    })
+    run = (args) =>
+      runTidy({
+        source: base.folder ?? '.',
+        apiBaseUrl: cfg.apiBaseUrl,
+        accessToken,
+        rootKey: session.rootKey,
+        account: cfg.email.toLowerCase(),
+        media: base.media,
+        vaultFolder: base.vaultFolder,
+        status: (m) => process.stderr.write(`${m}\n`),
+        ...args,
+      })
+  }
+  // Count first (also what is already in the Bin when --delete is given).
+  const plan = await run({ apply: false, purge })
+  const total = plan.empty + (plan.inBin ?? 0)
+  process.stderr.write(
+    `${plan.empty} empty NAS/system folders (${plan.emptyFolders} folders with their subfolders) found` +
+      (plan.inBin ? `, plus ${plan.inBin} already in the Bin` : '') +
+      `; ${plan.keptWithFiles} hold files and are never touched. Your vault has ${plan.vaultFolders} folders.\n`,
+  )
+  if (total === 0) {
+    process.stderr.write('nothing to tidy\n')
+    return
+  }
   if (flags['dry-run'] === true) {
     process.stderr.write(
-      `dry run: ${s.empty} empty NAS/system folders (${s.emptyFolders} folders in all) would move to the Bin; ` +
-        `${s.keptWithFiles} hold files and would stay. Nothing was changed.\n`,
+      'dry run: nothing was changed. Next:\n' +
+        `  sf tidy ${where} --delete   delete these empty folders for good (frees folder slots; Bin folders still count toward the limit)\n` +
+        `  sf tidy ${where}            only move them to the Bin\n`,
     )
-  } else if (s.declined) process.stderr.write('nothing changed\n')
-  else {
-    process.stderr.write(
-      `moved ${s.movedToBin} folders (${s.foldersMoved} with their subfolders) to the Bin` +
-        (purge ? `; deleted ${s.purged} from the Bin for good` : '') + '\n' +
-        (purge ? '' : 'Folders in the Bin still count toward the folder limit: empty the Bin in the web app, or run again with --delete.\n'),
-    )
+    return
   }
+  if (flags.yes !== true) {
+    const q = purge
+      ? `Delete these ${total} empty folders for good? Folders with files are skipped. [y/N] `
+      : `Move these ${plan.empty} empty folders to the Bin? [y/N] `
+    if (!/^y(es)?$/i.test((await promptLine(q)).trim())) {
+      process.stderr.write('nothing changed\n')
+      return
+    }
+  }
+  const s = await run({ apply: true, purge })
+  process.stderr.write(
+    `moved ${s.movedToBin} folders (${s.foldersMoved} with their subfolders) to the Bin` +
+      (purge ? `; deleted ${s.purged} for good` + (s.skippedNotEmpty ? `; ${s.skippedNotEmpty} skipped because they now hold files` : '') : '') + '\n' +
+      (purge ? '' : `Folders in the Bin still count toward the folder limit; run sf tidy ${where} --delete to free them.\n`),
+  )
 }
 
 function pushListOptions(flags) {

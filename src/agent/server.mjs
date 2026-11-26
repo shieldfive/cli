@@ -29,7 +29,7 @@ const STOP_NETWORK_BUDGET_MS = 5_000
 // Only these count as use for the idle lock. A status probe does no work; if it
 // counted, a shell prompt or a health check polling `sf status` would keep the
 // agent unlocked forever.
-const USE_OPS = new Set(['upload', 'sync', 'verify'])
+const USE_OPS = new Set(['upload', 'sync', 'push', 'tidy', 'thumbnails', 'verify'])
 
 class AgentError extends Error {
   constructor(code, message) {
@@ -320,6 +320,64 @@ export function createAgent({
       }
       case 'sync':
         return sync(req.args.folder)
+      // Tree push, tidy and preview backfill run here with the agent's session,
+      // so a signed-in user needs no SF_EMAIL / SF_PASSWORD. Each gets its own
+      // copy of the root key, wiped when it returns.
+      case 'push':
+      case 'tidy':
+      case 'thumbnails': {
+        const k = Buffer.from(key)
+        const account = session.email ?? session.userId
+        const quiet = () => {}
+        try {
+          if (req.op === 'push') {
+            const { runPush } = await import('../migrate.mjs')
+            const s = await runPush({
+              source: req.args.folder,
+              apiBaseUrl: config.apiBaseUrl,
+              accessToken,
+              rootKey: k,
+              account,
+              media: req.args.media,
+              includeDotfiles: req.args.includeDotfiles,
+              thumbnails: req.args.thumbnails,
+              uploadFn: (a) => uploadFile({ ...a, accessToken }),
+              log: quiet,
+              status: quiet,
+            })
+            return { ...s, failed: s.failed.map((f) => ({ rel: f.rel, message: f.message ?? String(f.error?.message ?? f.error ?? '') })), stoppedBy: s.stoppedBy ? { message: s.stoppedBy.message } : null }
+          }
+          if (req.op === 'tidy') {
+            const { runTidy } = await import('../tidy.mjs')
+            return await runTidy({
+              source: req.args.folder ?? '.',
+              apiBaseUrl: config.apiBaseUrl,
+              accessToken,
+              rootKey: k,
+              account,
+              media: req.args.media,
+              vaultFolder: req.args.vaultFolder,
+              apply: req.args.apply,
+              purge: req.args.purge,
+            })
+          }
+          const { runBackfill } = await import('../thumbnailBackfill.mjs')
+          return await runBackfill({
+            source: req.args.folder,
+            apiBaseUrl: config.apiBaseUrl,
+            accessToken,
+            rootKey: k,
+            account,
+            media: req.args.media,
+            vaultFolder: req.args.vaultFolder,
+            dryRun: req.args.dryRun,
+          })
+        } catch (err) {
+          throw new AgentError(err.code ?? err.serverCode ?? 'failed', err.message)
+        } finally {
+          k.fill(0)
+        }
+      }
       case 'verify': {
         const { entries } = await readEntries(ledgerFile, { ledgerKey })
         return classify(req.args.paths, { entries, ledgerKey, verifyFileIds, device })

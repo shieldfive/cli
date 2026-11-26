@@ -382,6 +382,7 @@ export async function runPush({
   const byId = flattenTree(tree.tree)
   const keyCache = new Map()
   const folderIds = new Map() // rel dir ('' = top) -> { id, key }
+  const createdThisRun = new Set()
 
   // --media: the top of the source is the account's Media folder itself (files
   // at the top land in the gallery; subfolders become Media subfolders).
@@ -461,6 +462,7 @@ export async function runPush({
       throw e
     }
     folderIds.set(rel, made)
+    if (made.id === prepared.id) createdThisRun.add(made.id)
     if (rel === '') {
       state.rootFolderId = made.id
       // A new top folder means nothing recorded under the old one is there.
@@ -524,6 +526,52 @@ export async function runPush({
     const done = state.files[f.rel]
     if (done && done.signature === signatureOf(f)) summary.alreadyThere += 1
     else todo.push(f)
+  }
+  // Not in this machine's record (a fresh machine, the agent, a deleted state
+  // file, an older CLI): a file of the same name and size already in the
+  // vault folder is the same file. Use it instead of uploading a second copy.
+  // Only folders that existed before this run can hold one.
+  const byDir = new Map()
+  for (const f of todo) {
+    const target = folderIds.get(f.dir)
+    if (!target || createdThisRun.has(target.id)) continue
+    if (!byDir.has(f.dir)) byDir.set(f.dir, [])
+    byDir.get(f.dir).push(f)
+  }
+  if (byDir.size) {
+    const { decryptStoredName } = await import('./thumbnailBackfill.mjs')
+    const found = new Set()
+    for (const [dirRel, files] of byDir) {
+      const { id, key } = folderIds.get(dirRel)
+      const vault = new Map()
+      let cursor = null
+      do {
+        const q = new URLSearchParams({ limit: '100', folderId: id })
+        if (cursor) q.set('cursor', cursor)
+        const res = await withRetry(() => apiJson(apiBaseUrl, accessToken, `/api/files?${q}`))
+        for (const v of res.files ?? []) {
+          let nm = null
+          try {
+            nm = await decryptStoredName(v.name, key, rootKeyB64, v.id)
+          } catch {}
+          if (nm && v.size_declared != null) vault.set(`${nm.normalize("NFC")}\u0000${Number(v.size_declared)}`, v.id)
+        }
+        cursor = res.pagination?.hasMore ? res.pagination.nextCursor : null
+      } while (cursor)
+      for (const f of files) {
+        const hit = vault.get(`${vaultName(f.name)}\u0000${f.size}`)
+        if (hit) {
+          state.files[f.rel] = { signature: signatureOf(f), fileId: hit }
+          found.add(f)
+        }
+      }
+    }
+    if (found.size) {
+      for (let i = todo.length - 1; i >= 0; i -= 1) if (found.has(todo[i])) todo.splice(i, 1)
+      summary.alreadyThere += found.size
+      await save()
+      status(`${found.size} files are already in the vault with the same name and size; skipping them`)
+    }
   }
   if (summary.alreadyThere) status(`${summary.alreadyThere} files already uploaded by an earlier run; skipping them`)
   let support = { image: false, video: false }

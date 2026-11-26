@@ -16,7 +16,9 @@ import {
 const req = (obj) => JSON.stringify(obj)
 
 test('the operation list is exactly the write-only set', () => {
-  assert.deepEqual([...OPS].sort(), ['lock', 'logout', 'status', 'sync', 'upload', 'verify'])
+  // push / thumbnails write; tidy only moves or deletes EMPTY NAS/system
+  // folders. None returns a name, a key or file contents: counts only.
+  assert.deepEqual([...OPS].sort(), ['lock', 'logout', 'push', 'status', 'sync', 'thumbnails', 'tidy', 'upload', 'verify'])
 })
 
 test('operations that would read, list, decrypt or export are refused', () => {
@@ -88,4 +90,12 @@ test('lineSplitter reassembles lines split across chunks and handles several per
 test('lineSplitter refuses an unbounded line', () => {
   const feed = lineSplitter(() => {}, { maxBytes: 16 })
   assert.throws(() => feed('x'.repeat(32)), (e) => e.code === 'line_too_long')
+})
+
+test('push, tidy and thumbnails carry only absolute paths and flags', () => {
+  const p = parseRequest(req({ id: 1, op: 'push', args: { folder: '/tmp/x', media: true, extra: 'no' } }))
+  assert.deepEqual(p.args, { folder: '/tmp/x', media: true, includeDotfiles: false, thumbnails: true })
+  const t = parseRequest(req({ id: 2, op: 'tidy', args: { media: true, purge: true, apply: true } }))
+  assert.deepEqual(t.args, { folder: null, media: true, vaultFolder: null, apply: true, purge: true, dryRun: false })
+  assert.throws(() => parseRequest(req({ id: 3, op: 'push', args: { folder: 'rel' } })), ProtocolError)
 })
