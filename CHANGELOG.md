@@ -20,6 +20,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A rerun (also from another machine, or with the resume record gone) reuses
   existing Media subfolders by name instead of making copies, and an
   "already exists" answer for Media looks the folder up and uses it.
+- New `sf tidy [<folder>] [--media] [--vault-folder=<path>]`: finds the empty
+  NAS/system folders (`@eaDir`, `#recycle`, `.DS_Store`, `@SynoResource`, ...)
+  an earlier push made, shows how many, and on confirmation moves them to the
+  Bin. Folders holding any file are never touched. `--dry-run` only counts,
+  `--yes` skips the question, `--delete` then removes exactly those folders
+  from the Bin (Bin folders still count toward the folder limit).
 
 ## 0.6.0
 
