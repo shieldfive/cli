@@ -8,7 +8,7 @@ import { decryptName, encryptNameV6, parseNameEnvelope } from '@shieldfive/crypt
 
 import { runTidy } from '../src/tidy.mjs'
 import { newRowBoundId } from '../src/upload.mjs'
-import { base64ToBytes, bytesToBase64, generateRandomKeyB64, unwrapKeyB64, wrapKeyB64 } from '../src/uploadCrypto.mjs'
+import { base64ToBytes, bytesToBase64, generateRandomKeyB64, hashMetadataV4, unwrapKeyB64, wrapKeyB64 } from '../src/uploadCrypto.mjs'
 
 const rootKey = webcrypto.getRandomValues(new Uint8Array(32))
 const rootB64 = bytesToBase64(rootKey)
@@ -20,13 +20,14 @@ function vault() {
   const files = new Map() // folderId -> count
   const keys = new Map()
   const calls = { move: 0, del: 0, list: 0 }
-  const add = async (name, parent, extra = {}) => {
+  const add = async (name, parent, extra = {}, { fast = false } = {}) => {
     const id = newRowBoundId()
     const key = generateRandomKeyB64()
     const pk = parent ? keys.get(parent) : rootB64
     const w = wrapKeyB64({ wrappingKeyB64: pk, keyToWrapB64: key })
-    const env = await encryptNameV6({ name, folderKey: base64ToBytes(pk), rowId: id })
-    folders.set(id, { id, name: JSON.stringify(env), parent_id: parent, is_bin: false, is_media: false, fk_wrapped: w.wrapped, fk_iv: w.iv, ...extra })
+    // fast: a name nobody decrypts (no 90 ms KDF); only its hash is read.
+    const env = fast ? 'x' : JSON.stringify(await encryptNameV6({ name, folderKey: base64ToBytes(pk), rowId: id }))
+    folders.set(id, { id, name: env, name_hash: hashMetadataV4(name.toLowerCase(), rootB64), parent_id: parent, is_bin: false, is_media: false, fk_wrapped: w.wrapped, fk_iv: w.iv, ...extra })
     keys.set(id, key)
     return id
   }
@@ -46,14 +47,23 @@ function vault() {
       const n = files.get(u.searchParams.get('folderId')) ?? 0
       return json({ files: Array.from({ length: Math.min(n, 5) }, (_, i) => ({ id: `f${i}` })), pagination: { hasMore: false } })
     }
+    if (u.pathname === '/api/folders/index' && srv.batched !== false) {
+      calls.index = (calls.index ?? 0) + 1
+      return json({ folders: [...folders.values()].map(({ id, parent_id, name_hash, is_bin, is_media }) => ({ id, parent_id, name_hash, is_bin, is_media })) })
+    }
+    if (u.pathname === '/api/folders/with-files' && srv.batched !== false) {
+      calls.withFiles = (calls.withFiles ?? 0) + 1
+      return json({ withFiles: body.ids.filter((id) => (files.get(id) ?? 0) > 0) })
+    }
     if (u.pathname === '/api/folders/create') {
-      const row = { id: body.id, name: body.name_encrypted, parent_id: null, is_bin: true, is_media: false, fk_wrapped: body.fk_wrapped, fk_iv: body.fk_iv }
+      calls.create = (calls.create ?? 0) + 1
+      const row = { id: body.id, name: body.name_encrypted, name_hash: body.nameHash, parent_id: body.parentFolderId ?? null, is_bin: body.isBin === true, is_media: false, fk_wrapped: body.fk_wrapped, fk_iv: body.fk_iv }
       folders.set(body.id, row)
       return json({ folder: row })
     }
     if (u.pathname === '/api/folders/move') {
       calls.move += 1
-      for (const it of body.items) Object.assign(folders.get(it.id), { parent_id: body.newParentId, name: it.name_encrypted, fk_wrapped: it.fk_wrapped, fk_iv: it.fk_iv })
+      for (const it of body.items) Object.assign(folders.get(it.id), { parent_id: body.newParentId, name: it.name_encrypted, name_hash: it.nameHash, fk_wrapped: it.fk_wrapped, fk_iv: it.fk_iv })
       return json({ success: true, moved: body.items.length })
     }
     if (u.pathname === '/api/folders/delete') {
@@ -171,4 +181,35 @@ test('--delete re-checks each folder right before deleting it and skips one that
   assert.equal(s.purged, 2)
   assert.ok(srv.folders.has(t.ea))
   assert.ok(srv.folders.has(child.id))
+})
+
+test('10,000 folders are checked in a handful of batched calls, and --delete deletes once', async () => {
+  const media = await srv.add('Media', null, { is_media: true })
+  await srv.add('Bin', null, { is_bin: true })
+  for (let p = 0; p < 50; p += 1) {
+    const y = await srv.add(`y${p}`, media, {}, { fast: true })
+    srv.files.set(y, 3)
+    const ea = await srv.add('@eaDir', y, {}, { fast: true })
+    for (let i = 0; i < 199; i += 1) await srv.add(`IMG_${i}.jpg`, ea, {}, { fast: true })
+  }
+  const t0 = Date.now()
+  const s = await runTidy(opts({ apply: true, purge: true }))
+  const ms = Date.now() - t0
+  assert.equal(s.empty, 50)
+  assert.equal(s.emptyFolders, 10_000)
+  assert.equal(s.purged, 50)
+  assert.equal(srv.calls.list, 0)
+  assert.ok(srv.calls.withFiles <= 25, `withFiles calls ${srv.calls.withFiles}`)
+  assert.equal(srv.calls.del, 1)
+  assert.equal(srv.folders.size, 52) // Media, Bin, 50 real folders
+  assert.ok(ms < 20_000, `took ${ms} ms`)
+  console.log(`tidy over 10,000 folders: ${ms} ms`)
+})
+
+test('an older server without the index endpoints still works (decrypts names, per-folder checks)', async () => {
+  srv.batched = false
+  const t = await nasVault()
+  const s = await runTidy(opts({ apply: true }))
+  assert.equal(s.movedToBin, 3)
+  assert.equal(srv.folders.get(t.ea2).parent_id, t.media)
 })

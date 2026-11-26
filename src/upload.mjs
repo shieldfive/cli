@@ -58,7 +58,7 @@ export function responseError(operation, res, body, { status = res.status, fallb
   if (status === 412) guidance = 'Acknowledge your recovery key in the web app before uploading.'
   if (status === 402 || body?.code === 'storage_limit_exceeded') guidance = 'Your vault storage limit was reached.'
   if (status === 401 && !guidance) guidance = 'Your sign-in expired or was revoked. Run `sf logout`, then `sf login`, and retry; files already saved are kept.'
-  if (status === 409 && /maximum number of folders/i.test(body?.error ?? '')) guidance = `Your vault reached its folder limit. Delete folders you do not need (and empty the Bin), then run again.`
+  if (status === 409 && /maximum number of folders/i.test(body?.error ?? '')) guidance = 'Your vault reached its folder limit.'
   else if (status === 409 && body?.code === 'folderExists') guidance = 'A folder with that id already exists.'
   if (status === 413 && !guidance) guidance = 'This file exceeds the upload size limit.'
   const error = new Error(`${operation} failed (HTTP ${status})${guidance ? `. ${guidance}` : ''}`)

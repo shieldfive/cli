@@ -460,6 +460,7 @@ async function cmdPush(folder, flags) {
         },
         { timeoutMs: 0 },
       )
+      for (const n of summary.notes ?? []) process.stderr.write(`${n}\n`)
       printPushSummary(summary)
       return
     }

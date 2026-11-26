@@ -78,30 +78,31 @@ const vaultName = (name) => name.normalize('NFC')
 // photo (its index thumbnails), so pushing a photo library from one used to
 // create thousands of empty vault folders and run into the per-account folder
 // limit before a single photo of the folder went up.
-const SYSTEM_DIRS = new Set([
-  '@eadir',
+export const SYSTEM_DIR_NAMES = [
+  '@eaDir',
   '#recycle',
   '#snapshot',
-  '@recycle',
-  '@recently-snapshot',
+  '@Recycle',
+  '@Recently-Snapshot',
   '@sharebin',
-  '$recycle.bin',
-  'system volume information',
+  '$RECYCLE.BIN',
+  'System Volume Information',
   'lost+found',
-  '@synoresource',
-  '@synoeastream',
+  '@SynoResource',
+  '@SynoEAStream',
   '@tmp',
-  '.ds_store',
-  '.appledouble',
-  '.trashes',
-  '.spotlight-v100',
+  '.DS_Store',
+  '.AppleDouble',
+  '.Trashes',
+  '.Spotlight-V100',
   '.fseventsd',
-  '.temporaryitems',
-])
+  '.TemporaryItems',
+]
+const SYSTEM_DIRS = new Set(SYSTEM_DIR_NAMES.map((n) => n.toLowerCase()))
 export const isSystemDir = (name) => SYSTEM_DIRS.has(name.toLowerCase())
 
 // The server's per-account folder ceiling (folders_row_and_name_caps.sql).
-export const FOLDER_LIMIT = 10_000
+export const tidyHint = (media, source) => (media ? '`sf tidy --media --dry-run`' : `\`sf tidy "${source}" --dry-run\``)
 
 export async function scanTree(source, { includeDotfiles = false } = {}) {
   const dirs = []
@@ -356,6 +357,15 @@ export async function runPush({
   progressEveryMs = 10_000,
 }) {
   source = resolve(source)
+  // Notes worth showing even where progress lines are not (through the agent).
+  const notes = []
+  {
+    const inner = status
+    status = (m) => {
+      if (/^note:|already in the vault/.test(m)) notes.push(m)
+      inner(m)
+    }
+  }
   const rootKeyB64 = bytesToBase64(rootKey)
   const scan = await scanTree(source, { includeDotfiles })
   const totalBytes = scan.files.reduce((s, f) => s + f.size, 0)
@@ -395,13 +405,40 @@ export async function runPush({
   }
 
   const childNames = new Map() // parent id -> Map(name -> node)
+  // Folder name hashes from /api/folders/index (one call): finding a child by
+  // name then decrypts only the one or two folders whose hash matches, not
+  // every sibling (~90 ms a name). Older servers: decrypt every sibling.
+  let hashOf
+  const folderHashes = async () => {
+    if (hashOf !== undefined) return hashOf
+    try {
+      const idx = await withRetry(() => apiJson(apiBaseUrl, accessToken, '/api/folders/index'))
+      hashOf = new Map((idx.folders ?? []).map((f) => [f.id, f.name_hash]))
+    } catch (err) {
+      if (err?.status !== 404 && err?.status !== 405) throw err
+      hashOf = null
+    }
+    return hashOf
+  }
   const findChild = async (parentId, want) => {
+    const { decryptStoredName } = await import('./thumbnailBackfill.mjs')
+    const parentKey = folderKeyFor(parentId, byId, rootKeyB64, keyCache)
+    if (!parentKey) return null
+    const hashes = await folderHashes()
+    if (hashes) {
+      const h = hashMetadataV4(want.toLowerCase(), rootKeyB64)
+      for (const n of byId.values()) {
+        if (n.parent_id !== parentId || n.is_bin || hashes.get(n.id) !== h) continue
+        try {
+          if ((await decryptStoredName(n.name, parentKey, rootKeyB64, n.id))?.normalize('NFC') === want) return n
+        } catch {}
+      }
+      return null
+    }
     if (!childNames.has(parentId)) {
-      const { decryptStoredName } = await import('./thumbnailBackfill.mjs')
-      const parentKey = folderKeyFor(parentId, byId, rootKeyB64, keyCache)
       const names = new Map()
       for (const n of byId.values()) {
-        if (n.parent_id !== parentId || n.is_bin || !parentKey) continue
+        if (n.parent_id !== parentId || n.is_bin) continue
         try {
           const nm = (await decryptStoredName(n.name, parentKey, rootKeyB64, n.id))?.normalize('NFC')
           if (nm && !names.has(nm)) names.set(nm, n)
@@ -457,7 +494,8 @@ export async function runPush({
       )
     } catch (err) {
       const what = topMedia ? 'your Media folder' : `the folder "${rel || name}"`
-      const e = new Error(`could not create ${what} in your vault: ${err.message}`)
+      const hint = err.serverCode === 'folderLimitReached' ? ` Run ${tidyHint(media, source)} to find and remove empty NAS folders (@eaDir, #recycle) an earlier push copied, then run this push again; it resumes.` : ''
+      const e = new Error(`could not create ${what} in your vault: ${hint ? 'your vault reached its folder limit.' : err.message}${hint}`)
       Object.assign(e, { status: err.status, serverCode: err.serverCode, cause: err })
       throw e
     }
@@ -482,21 +520,14 @@ export async function runPush({
     return true
   }
 
-  // Folders this run would have to make, against the account's ceiling: stop
-  // before making any rather than part-way through.
-  {
-    const live = [...byId.values()].filter((n) => !n.is_bin).length
-    const known = new Set(byId.keys())
-    const top = media ? mediaNode?.id : state.rootFolderId
-    const needed = (top && known.has(top) ? 0 : 1) + scan.dirs.filter((rel) => !known.has(state.folders[rel])).length
-    if (byId.size + needed > FOLDER_LIMIT) {
-      const e = new Error(
-        `this push needs ${needed} new vault folders, but your vault already has ${byId.size} of its ${FOLDER_LIMIT} folder limit ` +
-          `(${live} outside the Bin). Delete folders you do not need (and empty the Bin), or push a smaller folder.`,
-      )
-      e.serverCode = 'folderLimitReached'
-      throw e
-    }
+  // The folder ceiling depends on the plan (10,000 free, more on paid) and
+  // only the server knows it, so the server decides; the CLI does not guess.
+  // A vault this full likely holds empty NAS folders an older push copied.
+  if (byId.size >= 9_000) {
+    status(
+      `note: your vault has ${byId.size} folders. If an earlier push copied NAS folders (@eaDir, #recycle), ` +
+        `run ${tidyHint(media, source)} to find the empty ones.`,
+    )
   }
 
   const topCreated = await ensure('', basename(source), null)
@@ -520,7 +551,7 @@ export async function runPush({
     await save()
   }
 
-  const summary = { uploaded: 0, alreadyThere: 0, failed: [], changed: [], skippedEmpty: [], bytesUploaded: 0, foldersCreated, stoppedBy: null, interrupted: false }
+  const summary = { notes, uploaded: 0, alreadyThere: 0, failed: [], changed: [], skippedEmpty: [], bytesUploaded: 0, foldersCreated, stoppedBy: null, interrupted: false }
   const todo = []
   for (const f of scan.files) {
     const done = state.files[f.rel]
@@ -544,22 +575,36 @@ export async function runPush({
     for (const [dirRel, files] of byDir) {
       const { id, key } = folderIds.get(dirRel)
       const vault = new Map()
-      let cursor = null
-      do {
-        const q = new URLSearchParams({ limit: '100', folderId: id })
-        if (cursor) q.set('cursor', cursor)
-        const res = await withRetry(() => apiJson(apiBaseUrl, accessToken, `/api/files?${q}`))
+      // By keyed name hash and plaintext size: no decrypting. Older servers
+      // without /api/folders/file-index: list and decrypt each name.
+      let indexed = true
+      try {
+        const res = await withRetry(() => apiJson(apiBaseUrl, accessToken, `/api/folders/file-index?folderId=${id}`))
         for (const v of res.files ?? []) {
-          let nm = null
-          try {
-            nm = await decryptStoredName(v.name, key, rootKeyB64, v.id)
-          } catch {}
-          if (nm && v.size_declared != null) vault.set(`${nm.normalize("NFC")}\u0000${Number(v.size_declared)}`, v.id)
+          if (v.name_hash && v.size_declared != null) vault.set(`${v.name_hash}\u0000${Number(v.size_declared)}`, v.id)
         }
-        cursor = res.pagination?.hasMore ? res.pagination.nextCursor : null
-      } while (cursor)
+      } catch (err) {
+        if (err?.status !== 404 && err?.status !== 405) throw err
+        indexed = false
+      }
+      if (!indexed) {
+        let cursor = null
+        do {
+          const q = new URLSearchParams({ limit: '100', folderId: id })
+          if (cursor) q.set('cursor', cursor)
+          const res = await withRetry(() => apiJson(apiBaseUrl, accessToken, `/api/files?${q}`))
+          for (const v of res.files ?? []) {
+            let nm = null
+            try {
+              nm = await decryptStoredName(v.name, key, rootKeyB64, v.id)
+            } catch {}
+            if (nm && v.size_declared != null) vault.set(`${hashMetadataV4(nm.normalize('NFC').toLowerCase(), rootKeyB64)}\u0000${Number(v.size_declared)}`, v.id)
+          }
+          cursor = res.pagination?.hasMore ? res.pagination.nextCursor : null
+        } while (cursor)
+      }
       for (const f of files) {
-        const hit = vault.get(`${vaultName(f.name)}\u0000${f.size}`)
+        const hit = vault.get(`${hashMetadataV4(vaultName(f.name).toLowerCase(), rootKeyB64)}\u0000${f.size}`)
         if (hit) {
           state.files[f.rel] = { signature: signatureOf(f), fileId: hit }
           found.add(f)
