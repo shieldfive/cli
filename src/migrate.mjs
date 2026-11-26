@@ -42,6 +42,7 @@ import {
   unwrapKeyB64,
   wrapKeyB64,
 } from './uploadCrypto.mjs'
+import { makeThumbnail, mediaKindOf, thumbnailSupport } from './thumbnail.mjs'
 
 const STATE_VERSION = 1
 const DEFAULT_CONCURRENCY = 3
@@ -57,8 +58,10 @@ export function resolvePushConcurrency(env = process.env) {
   return DEFAULT_CONCURRENCY
 }
 
-export function defaultStatePath(source, home = homedir()) {
-  const id = createHash('sha256').update(resolve(source)).digest('hex').slice(0, 32)
+export function defaultStatePath(source, home = homedir(), { media = false } = {}) {
+  // --media keeps its own record: the same source pushed to Drive and to Media
+  // is two different copies.
+  const id = createHash('sha256').update(resolve(source) + (media ? '\0media' : '')).digest('hex').slice(0, 32)
   return join(home, '.shieldfive', 'push', `${id}.json`)
 }
 
@@ -221,7 +224,7 @@ function folderKeyFor(id, byId, rootKeyB64, cache) {
 // Build the create request once; retries resend the same id and body, and the
 // server answers a repeated create whose first answer was lost with the folder
 // it already made, so a retry never makes a second folder.
-async function prepareFolder({ rootKeyB64, name, parentId, parentKeyB64 }) {
+async function prepareFolder({ rootKeyB64, name, parentId, parentKeyB64, isMedia = false }) {
   const id = newRowBoundId()
   const envelope = await encryptNameV6({ name, folderKey: base64ToBytes(parentKeyB64), rowId: id })
   const folderKey = generateRandomKeyB64()
@@ -233,12 +236,20 @@ async function prepareFolder({ rootKeyB64, name, parentId, parentKeyB64 }) {
     parentFolderId: parentId,
     fk_wrapped: wrapped.wrapped,
     fk_iv: wrapped.iv,
+    ...(isMedia ? { isMedia: true } : {}),
   }
-  return { id, key: folderKey, body }
+  return { id, key: folderKey, body, parentKeyB64 }
 }
 
 async function sendFolder({ apiBaseUrl, accessToken, prepared }) {
   const res = await apiJson(apiBaseUrl, accessToken, '/api/folders/create', { method: 'POST', body: prepared.body })
+  // The Media folder is one per account. If another client made it first, the
+  // server answers with that one: use it, with its own key.
+  if (prepared.body.isMedia && res?.folder?.is_media && res.folder.id !== prepared.id) {
+    const f = res.folder
+    const key = unwrapKeyB64({ wrappingKeyB64: prepared.parentKeyB64, wrappedKeyB64: f.fk_wrapped, ivB64: f.fk_iv })
+    return { id: f.id, key }
+  }
   if (res?.folder?.id !== prepared.id) throw new Error(`folders/create returned ${res?.folder?.id} for ${prepared.id}`)
   return { id: prepared.id, key: prepared.key }
 }
@@ -275,8 +286,12 @@ export async function runPush({
   accessToken,
   rootKey,
   account,
-  statePath = defaultStatePath(source),
+  media = false,
+  thumbnails = true,
+  statePath = defaultStatePath(source, homedir(), { media }),
   includeDotfiles = false,
+  makeThumbnailFn = makeThumbnail,
+  thumbnailSupportFn = thumbnailSupport,
   concurrency = resolvePushConcurrency(),
   uploadFn = uploadFile,
   log = (m) => process.stdout.write(`${m}\n`),
@@ -311,6 +326,16 @@ export async function runPush({
   const keyCache = new Map()
   const folderIds = new Map() // rel dir ('' = top) -> { id, key }
 
+  // --media: the top of the source is the account's Media folder itself (files
+  // at the top land in the gallery; subfolders become Media subfolders).
+  const mediaNode = media ? [...byId.values()].find((n) => n.is_media && !n.parent_id) : null
+  if (mediaNode && state.rootFolderId !== mediaNode.id) {
+    state.rootFolderId = mediaNode.id
+    state.folders = {}
+    state.files = {}
+    state.pending = {}
+  }
+
   const ensure = async (rel, name, parent) => {
     const recorded = rel === '' ? state.rootFolderId : state.folders[rel]
     const node = recorded ? byId.get(recorded) : null
@@ -321,11 +346,13 @@ export async function runPush({
         return false
       }
     }
+    const topMedia = media && rel === ''
     const prepared = await prepareFolder({
       rootKeyB64,
-      name: vaultName(name),
+      name: topMedia ? 'Media' : vaultName(name),
       parentId: parent?.id ?? null,
       parentKeyB64: parent?.key ?? rootKeyB64,
+      isMedia: topMedia,
     })
     const made = await withRetry(
       () => sendFolder({ apiBaseUrl, accessToken, prepared }),
@@ -352,7 +379,8 @@ export async function runPush({
   }
 
   const topCreated = await ensure('', basename(source), null)
-  status(`${topCreated ? 'created' : 'resuming into'} vault folder "${vaultName(basename(source))}"`)
+  if (media) status(topCreated ? 'created your Media folder; uploading into it' : 'uploading into Media')
+  else status(`${topCreated ? 'created' : 'resuming into'} vault folder "${vaultName(basename(source))}"`)
   let foldersCreated = 0
   for (const rel of scan.dirs) {
     const cut = rel.lastIndexOf('/')
@@ -379,6 +407,17 @@ export async function runPush({
     else todo.push(f)
   }
   if (summary.alreadyThere) status(`${summary.alreadyThere} files already uploaded by an earlier run; skipping them`)
+  let support = { image: false, video: false }
+  if (thumbnails) {
+    support = await thumbnailSupportFn()
+    const kinds = new Set(todo.map((f) => mediaKindOf(f.name)))
+    if (kinds.has('image') && !support.image) {
+      status('note: photos will upload without previews (install ffmpeg, or reinstall the CLI so its optional image encoder loads)')
+    }
+    if (kinds.has('video') && !support.video) {
+      status('note: videos will upload without previews; install ffmpeg (e.g. brew install ffmpeg) for video previews')
+    }
+  }
   const todoBytes = todo.reduce((s, f) => s + f.size, 0)
   status(`uploading ${todo.length} files (${fmtBytes(todoBytes)}), ${concurrency} at a time`)
 
@@ -409,6 +448,9 @@ export async function runPush({
     }
     const entry = { ...f, size: before.size, mtimeMs: before.mtimeMs }
     const folder = folderIds.get(f.dir)
+    const kind = thumbnails ? mediaKindOf(f.name) : null
+    // Made once per file, before any retry; a failure just means no preview.
+    const thumbnail = kind && support[kind] ? await makeThumbnailFn({ path: f.path, name: f.name, size: entry.size }) : null
     let progressed = 0
     try {
       await withRetry(
@@ -428,6 +470,7 @@ export async function runPush({
               rowId: fileId,
               folderId: folder.id,
               folderKey: base64ToBytes(folder.key),
+              thumbnail,
               onRetry: (message) => status(`${f.rel}: ${message}`),
               onPlaintextChunk: (c) => {
                 progressed += c.length

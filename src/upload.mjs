@@ -15,6 +15,7 @@ import { open } from 'node:fs/promises'
 import { createHash, webcrypto } from 'node:crypto'
 
 import { encryptNameV6 } from '@shieldfive/crypto/vault'
+import { thumbnailFields } from './thumbnail.mjs'
 
 import {
   base64ToBytes,
@@ -218,6 +219,7 @@ export async function createUploadSession({
   onRetry,
   folderId = null,
   folderKey = null,
+  thumbnail = null,
 }) {
   const rootKeyB64 = bytesToBase64(rootKey)
   // The parent's key: the root key at the vault root, else the folder's own
@@ -235,6 +237,17 @@ export async function createUploadSession({
   // under the parent key.
   const csk = generateRandomKeyB64()
   const cskEnvelope = wrapKeyB64({ wrappingKeyB64: parentKeyB64, keyToWrapB64: csk })
+  // Optional preview (JPEG bytes from thumbnail.mjs), encrypted under this
+  // file's content key exactly as the web uploader does. Only ciphertext leaves.
+  let thumb = null
+  if (thumbnail?.length) {
+    const cskBytes = base64ToBytes(csk)
+    try {
+      thumb = thumbnailFields(thumbnail, cskBytes)
+    } finally {
+      cskBytes.fill(0)
+    }
+  }
 
   // Replays of this row ID must carry the same encrypted name and wrapped key.
   const payload = JSON.stringify({
@@ -248,8 +261,8 @@ export async function createUploadSession({
     sizeBytes: size,
     folderId,
     contentType: 'application/octet-stream',
-    thumbnail_ciphertext_b64: null,
-    thumbnail_nonce_prefix: null,
+    thumbnail_ciphertext_b64: thumb?.thumbnail_ciphertext_b64 ?? null,
+    thumbnail_nonce_prefix: thumb?.thumbnail_nonce_prefix ?? null,
   })
   // Safe to repeat: the server treats a replay of the same clientUploadId with
   // the same name and wrapped key as the same session.
@@ -575,7 +588,7 @@ async function serverAcceptsEmptyFiles({ apiBaseUrl, accessToken }) {
 // chunks to record what was actually uploaded; hashing the file separately,
 // before or after, cannot see a change made and undone while it was being read.
 // Bulk push supplies the row ID from its checkpoint. Other callers get a fresh UUIDv7.
-export async function uploadFile({ apiBaseUrl, accessToken, rootKey, name, path, size, onPlaintextChunk, onRetry, rowId = newRowBoundId(), folderId = null, folderKey = null }) {
+export async function uploadFile({ apiBaseUrl, accessToken, rootKey, name, path, size, onPlaintextChunk, onRetry, rowId = newRowBoundId(), folderId = null, folderKey = null, thumbnail = null }) {
   // Derived before anything is sent, so a vault whose identity cannot be
   // derived fails before a session (and a pending row) exists.
   const recipientPublicKey = await vaultMlKemPublicKey(rootKey)
@@ -592,6 +605,7 @@ export async function uploadFile({ apiBaseUrl, accessToken, rootKey, name, path,
     onRetry,
     folderId,
     folderKey,
+    thumbnail,
   })
   // From here on a pending row exists. Any failure before finalize answers
   // cancels it (see cancelUploadSession).

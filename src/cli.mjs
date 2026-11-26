@@ -33,7 +33,11 @@ function usage() {
       '                              --everywhere also signs out your browser and phone',
       '  push <folder>               encrypt and upload every file in <folder>',
       '                              [--include-dotfiles]  also upload names starting with "."',
-      '                              (symlinks are never followed)',
+      '                              [--media]  upload into Media (the photo gallery) instead of',
+      '                                a new Drive folder; subfolders become Media subfolders',
+      '                              [--no-thumbnails]  skip making encrypted previews',
+      '                              (symlinks are never followed; photo and video previews are',
+      '                              made and encrypted here; video previews need ffmpeg)',
       '  sync <folder> [--watch]     upload new and changed files',
       '                              [--interval=<seconds>]  poll interval for --watch (default 5)',
       '  verify <file>...            report whether each file is safely in your vault',
@@ -403,6 +407,12 @@ async function cmdLogout(flags) {
 // login -> unlock -> encrypt -> upload every file in the folder, once.
 async function cmdPush(folder, flags) {
   const { agent } = await chooseAuth()
+  if (agent && flags.media) {
+    throw new Error(
+      '--media is not available through the agent (sf login) yet. Run sf logout, ' +
+        'then set SF_EMAIL and SF_PASSWORD and run sf push --media again.',
+    )
+  }
   if (agent) {
     // The agent uploads single files to the vault root; it cannot make vault
     // folders yet. Refuse a tree rather than flatten it.
@@ -479,6 +489,8 @@ async function cmdPush(folder, flags) {
       rootKey: session.rootKey,
       account: cfg.email.toLowerCase(),
       includeDotfiles: pushListOptions(flags).includeDotfiles,
+      media: flags.media === true,
+      thumbnails: flags['no-thumbnails'] !== true,
       signal: controller.signal,
     })
   } finally {

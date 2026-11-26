@@ -104,6 +104,7 @@ sf login [--idle=<hours>]                    sign in once; an agent holds the se
 sf status                                    is an agent running, and for which account
 sf logout [--everywhere]                     revoke the session and stop the agent; --everywhere signs out every device
 sf push <folder> [--include-dotfiles]        copy a whole folder tree into a new vault folder; rerun to resume
+                 [--media] [--no-thumbnails] into Media instead; skip encrypted previews
 sf sync <folder> [--watch] [--interval=N]    upload new/changed files; --watch keeps a poll loop (N seconds, default 5)
 sf verify <file>...                          report whether each file is safely stored in your vault
 sf encrypt <folder>                          encrypt each file locally, upload nothing (no account needed)
@@ -136,6 +137,21 @@ A run killed during a file's last step is settled on the next run by asking the
 server whether that file arrived, so it is not uploaded twice. A file that
 changes while it uploads is reported, and uploaded again on the next run. Files
 you delete from the vault after a run are not re-uploaded by a rerun.
+
+`sf push --media <folder>` uploads into Media (the photo and video gallery)
+instead: files at the top of `<folder>` land in Media itself and subfolders
+become Media subfolders. If the account has no Media folder yet, it is created.
+Through the agent, `--media` is refused for now; use the environment variables.
+
+Photos and videos get an encrypted preview, so they show a picture in Drive and
+Media rather than a type icon. The preview (a JPEG, at most 512 px on its
+longest side) is made on your machine and encrypted under that file's own
+content key, in the same format the web and mobile apps write; the server only
+ever receives ciphertext. Images use `sharp` (an optional dependency, installed
+automatically where a prebuilt binary exists); video previews, and images sharp
+cannot read (such as most HEIC), need `ffmpeg` on your PATH (`SF_FFMPEG` to point
+at another binary). Without them those files upload without a preview and push
+says so once. `--no-thumbnails` skips previews entirely.
 
 Through the agent (`sf login`), `sf push` uploads only the files at the top of
 the folder, to the vault root, and refuses a folder with subfolders; use the
