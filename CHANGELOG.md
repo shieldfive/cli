@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## 0.6.1
+
+- `sf push` skips NAS and system folders (`@eaDir`, `#recycle`, `#snapshot`,
+  `$RECYCLE.BIN`, `lost+found`, ...). On a Synology share `@eaDir` held one
+  folder per photo, so a photo library push made thousands of empty vault
+  folders and stopped at the account's 10,000-folder limit with
+  `POST /api/folders/create failed (HTTP 409)`.
+- Before creating folders, `sf push` checks the folder limit and stops with a
+  plain message saying how many folders it needs and what to delete.
+- Folder errors now say which folder failed and why, in plain words.
+- A rerun (also from another machine, or with the resume record gone) reuses
+  existing Media subfolders by name instead of making copies, and an
+  "already exists" answer for Media looks the folder up and uses it.
+
 ## 0.6.0
 
 - `sf push --media <folder>` uploads into Media (the photo and video gallery)
