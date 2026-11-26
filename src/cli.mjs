@@ -616,7 +616,8 @@ async function cmdTidy(folder, flags) {
     confirm: async (p) => {
       process.stderr.write(
         `${p.empty} empty NAS/system folders (${p.emptyFolders} folders with their subfolders) can go; ` +
-          `${p.keptWithFiles} hold files and stay.\n`,
+          `${p.keptWithFiles} hold files and stay.` +
+          (p.inBin ? ` ${p.inBin} empty ones are already in the Bin and will be deleted.` : '') + '\n',
       )
       if (flags.yes === true) return true
       const q = purge
@@ -634,7 +635,7 @@ async function cmdTidy(folder, flags) {
   else {
     process.stderr.write(
       `moved ${s.movedToBin} folders (${s.foldersMoved} with their subfolders) to the Bin` +
-        (purge ? `; deleted ${s.purged} of them from the Bin` : '') + '\n' +
+        (purge ? `; deleted ${s.purged} from the Bin for good` : '') + '\n' +
         (purge ? '' : 'Folders in the Bin still count toward the folder limit: empty the Bin in the web app, or run again with --delete.\n'),
     )
   }

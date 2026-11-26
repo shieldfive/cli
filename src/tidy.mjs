@@ -128,11 +128,30 @@ export async function runTidy({
     purged: 0,
     vaultFolders: byId.size,
   }
-  if (!apply || empty.length === 0) return summary
+  // With purge, also the empty system folders an earlier tidy left in the Bin.
+  const binNode = [...byId.values()].find((n) => n.is_bin && !n.parent_id)
+  const inBin = []
+  if (purge && binNode) {
+    const binKeyB64 = unwrapKeyB64({ wrappingKeyB64: rootKeyB64, wrappedKeyB64: binNode.fk_wrapped, ivB64: binNode.fk_iv })
+    for (const n of children.get(binNode.id) ?? []) {
+      let name = null
+      try {
+        name = await decryptStoredName(n.name, binKeyB64, rootKeyB64, n.id)
+      } catch {}
+      if (!name || !isSystemDir(name)) continue
+      let full = false
+      for (const x of subtree(n)) if (await hasFile(x.id)) { full = true; break }
+      if (!full) inBin.push({ node: n, name, count: subtree(n).length })
+    }
+  }
+  summary.inBin = inBin.length
+  if (!apply || empty.length + inBin.length === 0) return summary
   if (!(await confirm(summary))) return { ...summary, declined: true }
+  const moved = []
+  if (empty.length) {
 
   // The Bin: one top-level folder per account; make it if missing.
-  let bin = [...byId.values()].find((n) => n.is_bin && !n.parent_id)
+  let bin = binNode
   let binKey
   if (bin) binKey = unwrapKeyB64({ wrappingKeyB64: rootKeyB64, wrappedKeyB64: bin.fk_wrapped, ivB64: bin.fk_iv })
   else {
@@ -140,19 +159,26 @@ export async function runTidy({
     const key = generateRandomKeyB64()
     const w = wrapKeyB64({ wrappingKeyB64: rootKeyB64, keyToWrapB64: key })
     const env = await encryptNameV6({ name: 'Bin', folderKey: rootKey, rowId: id })
-    const res = await withRetry(() =>
-      apiJson(apiBaseUrl, accessToken, '/api/folders/create', {
-        method: 'POST',
-        body: { id, name_encrypted: JSON.stringify(env), nameHash: hashMetadataV4('bin', rootKeyB64), parentFolderId: null, fk_wrapped: w.wrapped, fk_iv: w.iv, isBin: true },
-      }),
-    )
+    let res
+    try {
+      res = await withRetry(() =>
+        apiJson(apiBaseUrl, accessToken, '/api/folders/create', {
+          method: 'POST',
+          body: { id, name_encrypted: JSON.stringify(env), nameHash: hashMetadataV4('bin', rootKeyB64), parentFolderId: null, fk_wrapped: w.wrapped, fk_iv: w.iv, isBin: true },
+        }),
+      )
+    } catch (err) {
+      throw new Error(
+        `your vault has no Bin yet and making one failed: ${err.message} ` +
+          'Open the web app once (it makes the Bin), or delete one folder there, then run sf tidy again.',
+      )
+    }
     bin = res.folder
     binKey = bin.id === id ? key : unwrapKeyB64({ wrappingKeyB64: rootKeyB64, wrappedKeyB64: bin.fk_wrapped, ivB64: bin.fk_iv })
   }
   if (!binKey) throw new Error('could not open your Bin folder with this vault key')
 
   const movePace = pacer(moveGapMs)
-  const moved = []
   for (let i = 0; i < empty.length; i += MOVE_BATCH) {
     const batch = empty.slice(i, i + MOVE_BATCH)
     const items = []
@@ -178,9 +204,11 @@ export async function runTidy({
   }
   summary.movedToBin = moved.length
   summary.foldersMoved = moved.reduce((s, c) => s + c.count, 0)
+  }
 
   if (purge) {
-    for (const c of moved) {
+    const movePace = pacer(moveGapMs)
+    for (const c of [...moved, ...inBin]) {
       await movePace()
       try {
         await withRetry(() =>
@@ -190,7 +218,7 @@ export async function runTidy({
         throw new Error(`could not delete folders from the Bin (${summary.purged} deleted so far; the rest stay in the Bin): ${err.message}`)
       }
       summary.purged += 1
-      if (summary.purged % 20 === 0) status(`deleted ${summary.purged} of ${moved.length} from the Bin`)
+      if (summary.purged % 20 === 0) status(`deleted ${summary.purged} of ${moved.length + inBin.length} from the Bin`)
     }
   }
   return summary

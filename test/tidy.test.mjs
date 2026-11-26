@@ -140,3 +140,25 @@ test('declining the question changes nothing; --delete purges only what moved', 
   const again = await runTidy(opts({ apply: true }))
   assert.equal(again.empty, 0)
 })
+
+test('--delete on a later run removes the empty system folders an earlier tidy left in the Bin', async () => {
+  const t = await nasVault()
+  await runTidy(opts({ apply: true }))
+  const s = await runTidy(opts({ apply: true, purge: true }))
+  assert.equal(s.empty, 0)
+  assert.equal(s.inBin, 3)
+  assert.equal(s.purged, 3)
+  for (const id of [t.ea, t.rec, t.ds]) assert.ok(!srv.folders.has(id))
+  assert.ok(srv.folders.has(t.ea2))
+})
+
+test('no Bin and at the folder limit: a plain message, nothing moved', async () => {
+  await nasVault()
+  const real = globalThis.fetch
+  globalThis.fetch = async (url, init) =>
+    new URL(url).pathname === '/api/folders/create'
+      ? new Response(JSON.stringify({ error: 'You have reached the maximum number of folders. Delete some folders to create more.' }), { status: 409 })
+      : real(url, init)
+  await assert.rejects(runTidy(opts({ apply: true })), /no Bin yet.*folder limit/)
+  assert.equal(srv.calls.move, 0)
+})
