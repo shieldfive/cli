@@ -38,6 +38,9 @@ function usage() {
       '                              [--no-thumbnails]  skip making encrypted previews',
       '                              (symlinks are never followed; photo and video previews are',
       '                              made and encrypted here; video previews need ffmpeg)',
+      '  thumbnails <folder>          add encrypted previews to photos/videos already pushed from',
+      '                              <folder>, made from the local originals (no re-upload, no download)',
+      '                              [--dry-run] count only  [--media] [--vault-folder=<a/b>]',
       '  sync <folder> [--watch]     upload new and changed files',
       '                              [--interval=<seconds>]  poll interval for --watch (default 5)',
       '  verify <file>...            report whether each file is safely in your vault',
@@ -490,7 +493,7 @@ async function cmdPush(folder, flags) {
       account: cfg.email.toLowerCase(),
       includeDotfiles: pushListOptions(flags).includeDotfiles,
       media: flags.media === true,
-      thumbnails: flags['no-thumbnails'] !== true,
+      thumbnails: flags['no-thumbnails'] !== true && process.env.SF_NO_THUMBNAILS !== '1',
       signal: controller.signal,
     })
   } finally {
@@ -519,6 +522,61 @@ async function cmdPush(folder, flags) {
     process.stderr.write('some files are not in the vault; run the same command again to retry them\n')
     process.exitCode = 2
   }
+}
+
+// Add encrypted previews to photos/videos already in the vault, from the local
+// originals. Uploads previews only; never the files, never downloads.
+async function cmdThumbnails(folder, flags) {
+  const { agent } = await chooseAuth()
+  if (agent) {
+    throw new Error(
+      'sf thumbnails signs in itself: run sf logout, then set SF_EMAIL and SF_PASSWORD ' +
+        'and run it again.',
+    )
+  }
+  const cfg = readLiveConfig(flags)
+  const { runBackfill } = await import('./thumbnailBackfill.mjs')
+  const { createSessionTokens } = await import('./sync.mjs')
+  const session = await authAndUnlock(cfg)
+  const accessToken = createSessionTokens({
+    accessToken: session.accessToken,
+    refreshToken: session.refreshToken,
+    expiresAt: session.expiresAt,
+    refresh: session.refreshSession,
+  })
+  const controller = new AbortController()
+  const onSigint = () => {
+    if (controller.signal.aborted) process.exit(130)
+    controller.abort()
+    process.stderr.write('\nstopping after the previews in progress; run again to resume\n')
+  }
+  process.on('SIGINT', onSigint)
+  let s
+  try {
+    s = await runBackfill({
+      source: folder,
+      apiBaseUrl: cfg.apiBaseUrl,
+      accessToken,
+      rootKey: session.rootKey,
+      account: cfg.email.toLowerCase(),
+      media: flags.media === true,
+      vaultFolder: typeof flags['vault-folder'] === 'string' ? flags['vault-folder'] : null,
+      dryRun: flags['dry-run'] === true,
+      signal: controller.signal,
+    })
+  } finally {
+    process.off('SIGINT', onSigint)
+  }
+  process.stderr.write(
+    `vault: ${s.vaultFiles} files, ${s.media} photos/videos, ${s.haveThumbnail} already with a preview\n` +
+      `local originals: ${s.matched} matched, ${s.noLocal} not found here, ${s.sizeDiffers} different size` +
+      (s.unreadableName ? `, ${s.unreadableName} names could not be read` : '') + '\n' +
+      (flags['dry-run'] === true
+        ? `dry run: ${s.toDo} previews would be added (${s.alreadyDone} done by an earlier run). Nothing was sent.\n`
+        : `previews: ${s.added} added, ${s.exists} already there, ${s.noPreview} not possible (format or no encoder), ${s.failed} failed\n`),
+  )
+  if (s.interrupted) process.exitCode = 130
+  else if (s.failed) process.exitCode = 2
 }
 
 function pushListOptions(flags) {
@@ -663,6 +721,9 @@ async function main() {
   } else if (cmd === 'push') {
     if (!folder) throw new Error('push needs a <folder>')
     await cmdPush(folder, flags)
+  } else if (cmd === 'thumbnails') {
+    if (!folder) throw new Error('thumbnails needs the local <folder> the files were pushed from')
+    await cmdThumbnails(folder, flags)
   } else if (cmd === 'sync') {
     if (!folder) throw new Error('sync needs a <folder>')
     // `--interval 10` (space-separated) would otherwise parse as a bare flag and
