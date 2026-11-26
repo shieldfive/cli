@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## 0.6.0
+
+- `sf push --media <folder>` uploads into Media (the photo and video gallery)
+  instead of a new Drive folder. Top-level files go into Media itself,
+  subfolders become Media subfolders, and the Media folder is created if the
+  account has none. It keeps its own resume record, separate from a Drive push
+  of the same folder.
+- Photos and videos pushed with `sf push` now carry an encrypted preview, so
+  they show a thumbnail in Drive and Media. The JPEG (<=512 px, ~55 KB budget)
+  is made locally and encrypted under the file's content key in the format the
+  web and mobile apps already read; only ciphertext is sent. Images use the new
+  optional dependency `sharp`; video previews (and HEIC) need `ffmpeg` on PATH,
+  and without it those files upload without a preview, with one note.
+  `--no-thumbnails` turns previews off.
+
 ## 0.5.3
 
 - A single transient server error no longer fails an upload. Creating the
