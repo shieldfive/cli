@@ -554,7 +554,7 @@ export async function runPush({
           try {
             nm = await decryptStoredName(v.name, key, rootKeyB64, v.id)
           } catch {}
-          if (nm) vault.set(`${nm.normalize('NFC')}\u0000${v.size_bytes ?? v.size}`, v.id)
+          if (nm && v.size_declared != null) vault.set(`${nm.normalize("NFC")}\u0000${Number(v.size_declared)}`, v.id)
         }
         cursor = res.pagination?.hasMore ? res.pagination.nextCursor : null
       } while (cursor)

@@ -165,7 +165,7 @@ test('a push with no local record skips files already in the vault (same name an
   for (const r of rows) {
     const env = await encryptNameV6({ name: r.name, folderKey: base64ToBytes(Buffer.from(r.folderKey).toString('base64')), rowId: `row-${r.name}` })
     if (!listed.has(r.folderId)) listed.set(r.folderId, [])
-    listed.get(r.folderId).push({ id: `row-${r.name}`, name: JSON.stringify(env), size_bytes: r.size })
+    listed.get(r.folderId).push({ id: `row-${r.name}`, name: JSON.stringify(env), size_bytes: r.size + 1761, size_declared: r.size })
   }
   const inner = globalThis.fetch
   globalThis.fetch = async (url, init) => {
