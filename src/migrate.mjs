@@ -101,7 +101,7 @@ const SYSTEM_DIRS = new Set([
 export const isSystemDir = (name) => SYSTEM_DIRS.has(name.toLowerCase())
 
 // The server's per-account folder ceiling (folders_row_and_name_caps.sql).
-export const FOLDER_LIMIT = 10_000
+export const tidyHint = (media, source) => (media ? '`sf tidy --media --dry-run`' : `\`sf tidy "${source}" --dry-run\``)
 
 export async function scanTree(source, { includeDotfiles = false } = {}) {
   const dirs = []
@@ -457,7 +457,8 @@ export async function runPush({
       )
     } catch (err) {
       const what = topMedia ? 'your Media folder' : `the folder "${rel || name}"`
-      const e = new Error(`could not create ${what} in your vault: ${err.message}`)
+      const hint = err.serverCode === 'folderLimitReached' ? ` Run ${tidyHint(media, source)} to find and remove empty NAS folders (@eaDir, #recycle) an earlier push copied, then run this push again; it resumes.` : ''
+      const e = new Error(`could not create ${what} in your vault: ${hint ? 'your vault reached its folder limit.' : err.message}${hint}`)
       Object.assign(e, { status: err.status, serverCode: err.serverCode, cause: err })
       throw e
     }
@@ -482,21 +483,14 @@ export async function runPush({
     return true
   }
 
-  // Folders this run would have to make, against the account's ceiling: stop
-  // before making any rather than part-way through.
-  {
-    const live = [...byId.values()].filter((n) => !n.is_bin).length
-    const known = new Set(byId.keys())
-    const top = media ? mediaNode?.id : state.rootFolderId
-    const needed = (top && known.has(top) ? 0 : 1) + scan.dirs.filter((rel) => !known.has(state.folders[rel])).length
-    if (byId.size + needed > FOLDER_LIMIT) {
-      const e = new Error(
-        `this push needs ${needed} new vault folders, but your vault already has ${byId.size} of its ${FOLDER_LIMIT} folder limit ` +
-          `(${live} outside the Bin). Delete folders you do not need (and empty the Bin), or push a smaller folder.`,
-      )
-      e.serverCode = 'folderLimitReached'
-      throw e
-    }
+  // The folder ceiling depends on the plan (10,000 free, more on paid) and
+  // only the server knows it, so the server decides; the CLI does not guess.
+  // A vault this full likely holds empty NAS folders an older push copied.
+  if (byId.size >= 9_000) {
+    status(
+      `note: your vault has ${byId.size} folders. If an earlier push copied NAS folders (@eaDir, #recycle), ` +
+        `run ${tidyHint(media, source)} to find the empty ones.`,
+    )
   }
 
   const topCreated = await ensure('', basename(source), null)

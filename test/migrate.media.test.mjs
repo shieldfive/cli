@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, test } from 'node:test'
 
-import { FOLDER_LIMIT, runPush, scanTree } from '../src/migrate.mjs'
+import { runPush, scanTree } from '../src/migrate.mjs'
 
 const rootKey = webcrypto.getRandomValues(new Uint8Array(32))
 const quiet = { log: () => {}, status: () => {}, progressEveryMs: 0, thumbnails: false }
@@ -18,7 +18,7 @@ let server
 // Mirrors /api/folders/create: one top-level Media per account (409
 // folderExists when the lookup of the winner fails), a per-account folder
 // ceiling (409 with the limit text), and the create body stored as-is.
-function stubServer({ mediaLookupFails = false, limit = FOLDER_LIMIT } = {}) {
+function stubServer({ mediaLookupFails = false, limit = 10_000 } = {}) {
   const folders = new Map()
   const calls = { create: 0 }
   globalThis.fetch = async (url, init = {}) => {
@@ -132,16 +132,15 @@ test('a 409 "already exists" for Media is resolved by looking Media up', async (
   assert.equal(up.find((u) => u.name === 'top.jpg').folderId, media[0].id)
 })
 
-test('the folder limit stops the run before creating anything, in plain words', async () => {
-  server = stubServer()
+test('a paid vault already past 10,000 folders pushes: the server, not the CLI, owns the limit', async () => {
+  server = stubServer({ limit: 100_000 })
   const src = await nasTree()
-  for (let i = 0; i < FOLDER_LIMIT; i += 1) server.folders.set(`x${i}`, { id: `x${i}`, name: '', parent_id: null, is_bin: false })
-  await assert.rejects(push(src, { uploadFn: uploader([]) }), (e) => {
-    assert.match(e.message, /folder limit/)
-    assert.doesNotMatch(e.message, /HTTP 409|\/api\//)
-    return true
-  })
-  assert.equal(server.calls.create, 0)
+  for (let i = 0; i < 10_000; i += 1) server.folders.set(`x${i}`, { id: `x${i}`, name: '', parent_id: null, is_bin: false })
+  const notes = []
+  const up = []
+  await push(src, { uploadFn: uploader(up), status: (m) => notes.push(m) })
+  assert.equal(up.length, 3)
+  assert.ok(notes.some((m) => m.includes('sf tidy --media --dry-run')))
 })
 
 test('a server folder-limit 409 is reported plainly, not as POST /api/folders/create', async () => {
@@ -149,6 +148,8 @@ test('a server folder-limit 409 is reported plainly, not as POST /api/folders/cr
   const src = await nasTree()
   await assert.rejects(push(src, { uploadFn: uploader([]) }), (e) => {
     assert.match(e.message, /could not create the folder "2024" in your vault: .*folder limit/)
+    assert.match(e.message, /sf tidy --media --dry-run/)
+    assert.doesNotMatch(e.message, /HTTP 409|\/api\//)
     return true
   })
 })
