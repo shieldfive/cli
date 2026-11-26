@@ -148,6 +148,7 @@ function mediaServer({ existingMedia = null } = {}) {
       folders.set(body.id, row)
       return json({ folder: row })
     }
+    if (path === '/api/files') return json({ files: [], pagination: { hasMore: false } })
     if (path === '/api/mobile/media/verify') return json({ verified: [] })
     return new Response('{}', { status: 404 })
   }

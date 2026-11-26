@@ -16,6 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   empty NAS/system-named folders, including ones an earlier tidy left in the
   Bin, and re-checks on the server right before each delete that nothing
   under the folder holds a file.
+- `sf push` without this machine's resume record (a new machine, the agent,
+  an older CLI's push) skips files already in the vault folder with the same
+  name and size instead of uploading a second copy.
 
 ## 0.6.1
 

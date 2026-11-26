@@ -46,6 +46,7 @@ function stubServer({ mediaLookupFails = false, limit = FOLDER_LIMIT } = {}) {
       return json({ folder: row })
     }
     if (path === '/api/mobile/media/verify') return json({ verified: [] })
+    if (path === '/api/files') return json({ files: [], pagination: { hasMore: false } })
     return json({ error: 'not stubbed' }, 404)
   }
   return { folders, calls }
@@ -150,4 +151,31 @@ test('a server folder-limit 409 is reported plainly, not as POST /api/folders/cr
     assert.match(e.message, /could not create the folder "2024" in your vault: .*folder limit/)
     return true
   })
+})
+
+test('a push with no local record skips files already in the vault (same name and size)', async () => {
+  server = stubServer()
+  const src = await nasTree()
+  const rows = []
+  await push(src, { uploadFn: async (a) => { rows.push(a); return { fileId: `f-${rows.length}` } } })
+  // The stub vault now "holds" those files: serve them from /api/files.
+  const { encryptNameV6 } = await import('@shieldfive/crypto/vault')
+  const { base64ToBytes } = await import('../src/uploadCrypto.mjs')
+  const listed = new Map()
+  for (const r of rows) {
+    const env = await encryptNameV6({ name: r.name, folderKey: base64ToBytes(Buffer.from(r.folderKey).toString('base64')), rowId: `row-${r.name}` })
+    if (!listed.has(r.folderId)) listed.set(r.folderId, [])
+    listed.get(r.folderId).push({ id: `row-${r.name}`, name: JSON.stringify(env), size_bytes: r.size })
+  }
+  const inner = globalThis.fetch
+  globalThis.fetch = async (url, init) => {
+    const u = new URL(url)
+    if (u.pathname === '/api/files') return new Response(JSON.stringify({ files: listed.get(u.searchParams.get('folderId')) ?? [], pagination: { hasMore: false } }), { status: 200 })
+    return inner(url, init)
+  }
+  await rm(join(dir, 'state.json'))
+  const again = []
+  const s = await push(src, { uploadFn: uploader(again) })
+  assert.equal(again.length, 0)
+  assert.equal(s.alreadyThere, 3)
 })
