@@ -73,10 +73,31 @@ const vaultName = (name) => name.normalize('NFC')
 // followed (it could point outside the folder). Dotfiles (.DS_Store, .git,
 // .env, ...) are skipped unless includeDotfiles. Directories are returned
 // parents first; relative paths use '/'.
+// Folders a NAS or OS keeps for itself, never the user's files. A Synology
+// share has an @eaDir next to every photo folder holding one subfolder per
+// photo (its index thumbnails), so pushing a photo library from one used to
+// create thousands of empty vault folders and run into the per-account folder
+// limit before a single photo of the folder went up.
+const SYSTEM_DIRS = new Set([
+  '@eadir',
+  '#recycle',
+  '#snapshot',
+  '@recycle',
+  '@recently-snapshot',
+  '@sharebin',
+  '$recycle.bin',
+  'system volume information',
+  'lost+found',
+])
+export const isSystemDir = (name) => SYSTEM_DIRS.has(name.toLowerCase())
+
+// The server's per-account folder ceiling (folders_row_and_name_caps.sql).
+export const FOLDER_LIMIT = 10_000
+
 export async function scanTree(source, { includeDotfiles = false } = {}) {
   const dirs = []
   const files = []
-  const skipped = { symlinks: [], dotfiles: [], other: [] }
+  const skipped = { symlinks: [], dotfiles: [], other: [], system: [] }
   async function walk(dir, rel) {
     const names = (await readdir(dir)).sort()
     for (const name of names) {
@@ -89,6 +110,10 @@ export async function scanTree(source, { includeDotfiles = false } = {}) {
       const info = await lstat(path)
       if (info.isSymbolicLink()) skipped.symlinks.push(relPath)
       else if (info.isDirectory()) {
+        if (isSystemDir(name)) {
+          skipped.system.push(relPath)
+          continue
+        }
         dirs.push(relPath)
         await walk(path, relPath)
       } else if (info.isFile()) {
@@ -174,6 +199,7 @@ export function isRunFatal(err) {
     err?.status === 401 ||
     err?.status === 402 ||
     err?.status === 412 ||
+    err?.serverCode === 'folderLimitReached' ||
     (err?.status === 413 && err?.serverCode !== 'too_many_parts') ||
     (err?.status === 403 && (err.serverCode === 'mfa_required' || /mfa|step/i.test(err.message ?? '')))
   )
@@ -241,16 +267,37 @@ async function prepareFolder({ rootKeyB64, name, parentId, parentKeyB64, isMedia
   return { id, key: folderKey, body, parentKeyB64 }
 }
 
+function useExistingMedia(f, prepared) {
+  const key = unwrapKeyB64({ wrappingKeyB64: prepared.parentKeyB64, wrappedKeyB64: f.fk_wrapped, ivB64: f.fk_iv })
+  return { id: f.id, key }
+}
+
 async function sendFolder({ apiBaseUrl, accessToken, prepared }) {
-  const res = await apiJson(apiBaseUrl, accessToken, '/api/folders/create', { method: 'POST', body: prepared.body })
+  let res
+  try {
+    res = await apiJson(apiBaseUrl, accessToken, '/api/folders/create', { method: 'POST', body: prepared.body })
+  } catch (err) {
+    // 409 "already exists". For Media (one per account) the folder is there:
+    // look it up and use it. For any other folder, a retry of our own create
+    // whose answer was lost: if the tree has our id under the right parent,
+    // it is made.
+    if (err?.status === 409 && err.serverCode === 'folderExists') {
+      const tree = await apiJson(apiBaseUrl, accessToken, '/api/folders/tree')
+      const nodes = [...flattenTree(tree.tree).values()]
+      if (prepared.body.isMedia) {
+        const m = nodes.find((n) => n.is_media && !n.parent_id)
+        if (m) return useExistingMedia(m, prepared)
+      } else {
+        const mine = nodes.find((n) => n.id === prepared.id && (n.parent_id ?? null) === prepared.body.parentFolderId)
+        if (mine) return { id: prepared.id, key: prepared.key }
+      }
+    }
+    throw err
+  }
   // The Media folder is one per account. If another client made it first, the
   // server answers with that one: use it, with its own key.
-  if (prepared.body.isMedia && res?.folder?.is_media && res.folder.id !== prepared.id) {
-    const f = res.folder
-    const key = unwrapKeyB64({ wrappingKeyB64: prepared.parentKeyB64, wrappedKeyB64: f.fk_wrapped, ivB64: f.fk_iv })
-    return { id: f.id, key }
-  }
-  if (res?.folder?.id !== prepared.id) throw new Error(`folders/create returned ${res?.folder?.id} for ${prepared.id}`)
+  if (prepared.body.isMedia && res?.folder?.is_media && res.folder.id !== prepared.id) return useExistingMedia(res.folder, prepared)
+  if (res?.folder?.id !== prepared.id) throw new Error('the server answered the folder create with a different folder')
   return { id: prepared.id, key: prepared.key }
 }
 
@@ -307,7 +354,8 @@ export async function runPush({
     `found ${scan.files.length} files (${fmtBytes(totalBytes)}) in ${scan.dirs.length} folders` +
       (scan.skipped.dotfiles.length ? `; skipping ${scan.skipped.dotfiles.length} hidden (use --include-dotfiles to send them)` : '') +
       (scan.skipped.symlinks.length ? `; skipping ${scan.skipped.symlinks.length} symlinks` : '') +
-      (scan.skipped.other.length ? `; skipping ${scan.skipped.other.length} special files` : ''),
+      (scan.skipped.other.length ? `; skipping ${scan.skipped.other.length} special files` : '') +
+      (scan.skipped.system.length ? `; skipping ${scan.skipped.system.length} NAS/system folders (like @eaDir, #recycle)` : ''),
   )
   for (const p of scan.skipped.symlinks) log(`skipped ${p}: symbolic link (not followed)`)
   for (const p of scan.skipped.other) log(`skipped ${p}: not a regular file`)
@@ -336,6 +384,24 @@ export async function runPush({
     state.pending = {}
   }
 
+  const childNames = new Map() // parent id -> Map(name -> node)
+  const findChild = async (parentId, want) => {
+    if (!childNames.has(parentId)) {
+      const { decryptStoredName } = await import('./thumbnailBackfill.mjs')
+      const parentKey = folderKeyFor(parentId, byId, rootKeyB64, keyCache)
+      const names = new Map()
+      for (const n of byId.values()) {
+        if (n.parent_id !== parentId || n.is_bin || !parentKey) continue
+        try {
+          const nm = (await decryptStoredName(n.name, parentKey, rootKeyB64, n.id))?.normalize('NFC')
+          if (nm && !names.has(nm)) names.set(nm, n)
+        } catch {}
+      }
+      childNames.set(parentId, names)
+    }
+    return childNames.get(parentId).get(want) ?? null
+  }
+
   const ensure = async (rel, name, parent) => {
     const recorded = rel === '' ? state.rootFolderId : state.folders[rel]
     const node = recorded ? byId.get(recorded) : null
@@ -347,6 +413,25 @@ export async function runPush({
       }
     }
     const topMedia = media && rel === ''
+    // Not recorded here (a fresh machine, a deleted state file, another
+    // client): a subfolder with this name already under the parent is the one
+    // to use, so a rerun never makes a second copy.
+    if (rel !== '' && parent) {
+      const existing = await findChild(parent.id, vaultName(name).normalize('NFC'))
+      if (existing) {
+        const key = folderKeyFor(existing.id, byId, rootKeyB64, keyCache)
+        if (key) {
+          folderIds.set(rel, { id: existing.id, key })
+          state.folders[rel] = existing.id
+          for (const k of Object.keys(state.files)) {
+            const cut = k.lastIndexOf('/')
+            if ((cut === -1 ? '' : k.slice(0, cut)) === rel) delete state.files[k]
+          }
+          await save()
+          return false
+        }
+      }
+    }
     const prepared = await prepareFolder({
       rootKeyB64,
       name: topMedia ? 'Media' : vaultName(name),
@@ -354,10 +439,18 @@ export async function runPush({
       parentKeyB64: parent?.key ?? rootKeyB64,
       isMedia: topMedia,
     })
-    const made = await withRetry(
-      () => sendFolder({ apiBaseUrl, accessToken, prepared }),
-      { onRetry: (e, _attempt, d) => status(`creating folder ${rel || name}: ${e.message}; retrying in ${Math.round(d / 1000)} s`) },
-    )
+    let made
+    try {
+      made = await withRetry(
+        () => sendFolder({ apiBaseUrl, accessToken, prepared }),
+        { onRetry: (e, _attempt, d) => status(`creating folder ${rel || name}: ${e.message}; retrying in ${Math.round(d / 1000)} s`) },
+      )
+    } catch (err) {
+      const what = topMedia ? 'your Media folder' : `the folder "${rel || name}"`
+      const e = new Error(`could not create ${what} in your vault: ${err.message}`)
+      Object.assign(e, { status: err.status, serverCode: err.serverCode, cause: err })
+      throw e
+    }
     folderIds.set(rel, made)
     if (rel === '') {
       state.rootFolderId = made.id
@@ -376,6 +469,23 @@ export async function runPush({
     }
     await save()
     return true
+  }
+
+  // Folders this run would have to make, against the account's ceiling: stop
+  // before making any rather than part-way through.
+  {
+    const live = [...byId.values()].filter((n) => !n.is_bin).length
+    const known = new Set(byId.keys())
+    const top = media ? mediaNode?.id : state.rootFolderId
+    const needed = (top && known.has(top) ? 0 : 1) + scan.dirs.filter((rel) => !known.has(state.folders[rel])).length
+    if (byId.size + needed > FOLDER_LIMIT) {
+      const e = new Error(
+        `this push needs ${needed} new vault folders, but your vault already has ${byId.size} of its ${FOLDER_LIMIT} folder limit ` +
+          `(${live} outside the Bin). Delete folders you do not need (and empty the Bin), or push a smaller folder.`,
+      )
+      e.serverCode = 'folderLimitReached'
+      throw e
+    }
   }
 
   const topCreated = await ensure('', basename(source), null)
