@@ -16,6 +16,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   9,000+ folders, push points at `sf tidy --media --dry-run` (or
   `sf tidy <folder> --dry-run`) to remove empty NAS folders an earlier push
   copied.
+- `sf tidy` is fast on large vaults: it finds NAS folders by keyed name hash
+  (no decrypting each name, ~90 ms apiece) and checks emptiness for 1,000
+  folders per request; `--delete` gathers them into one Bin folder and
+  deletes that once. 10,000 folders: about 37 minutes before, seconds now
+  (needs the current web API; older servers fall back to the slow path).
+- `sf push` finds existing subfolders and already-uploaded files by name hash
+  too, and its notes show through the agent.
 
 ## 0.6.2
 

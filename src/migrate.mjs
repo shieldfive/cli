@@ -78,26 +78,27 @@ const vaultName = (name) => name.normalize('NFC')
 // photo (its index thumbnails), so pushing a photo library from one used to
 // create thousands of empty vault folders and run into the per-account folder
 // limit before a single photo of the folder went up.
-const SYSTEM_DIRS = new Set([
-  '@eadir',
+export const SYSTEM_DIR_NAMES = [
+  '@eaDir',
   '#recycle',
   '#snapshot',
-  '@recycle',
-  '@recently-snapshot',
+  '@Recycle',
+  '@Recently-Snapshot',
   '@sharebin',
-  '$recycle.bin',
-  'system volume information',
+  '$RECYCLE.BIN',
+  'System Volume Information',
   'lost+found',
-  '@synoresource',
-  '@synoeastream',
+  '@SynoResource',
+  '@SynoEAStream',
   '@tmp',
-  '.ds_store',
-  '.appledouble',
-  '.trashes',
-  '.spotlight-v100',
+  '.DS_Store',
+  '.AppleDouble',
+  '.Trashes',
+  '.Spotlight-V100',
   '.fseventsd',
-  '.temporaryitems',
-])
+  '.TemporaryItems',
+]
+const SYSTEM_DIRS = new Set(SYSTEM_DIR_NAMES.map((n) => n.toLowerCase()))
 export const isSystemDir = (name) => SYSTEM_DIRS.has(name.toLowerCase())
 
 // The server's per-account folder ceiling (folders_row_and_name_caps.sql).
@@ -356,6 +357,15 @@ export async function runPush({
   progressEveryMs = 10_000,
 }) {
   source = resolve(source)
+  // Notes worth showing even where progress lines are not (through the agent).
+  const notes = []
+  {
+    const inner = status
+    status = (m) => {
+      if (/^note:|already in the vault/.test(m)) notes.push(m)
+      inner(m)
+    }
+  }
   const rootKeyB64 = bytesToBase64(rootKey)
   const scan = await scanTree(source, { includeDotfiles })
   const totalBytes = scan.files.reduce((s, f) => s + f.size, 0)
@@ -395,13 +405,40 @@ export async function runPush({
   }
 
   const childNames = new Map() // parent id -> Map(name -> node)
+  // Folder name hashes from /api/folders/index (one call): finding a child by
+  // name then decrypts only the one or two folders whose hash matches, not
+  // every sibling (~90 ms a name). Older servers: decrypt every sibling.
+  let hashOf
+  const folderHashes = async () => {
+    if (hashOf !== undefined) return hashOf
+    try {
+      const idx = await withRetry(() => apiJson(apiBaseUrl, accessToken, '/api/folders/index'))
+      hashOf = new Map((idx.folders ?? []).map((f) => [f.id, f.name_hash]))
+    } catch (err) {
+      if (err?.status !== 404 && err?.status !== 405) throw err
+      hashOf = null
+    }
+    return hashOf
+  }
   const findChild = async (parentId, want) => {
+    const { decryptStoredName } = await import('./thumbnailBackfill.mjs')
+    const parentKey = folderKeyFor(parentId, byId, rootKeyB64, keyCache)
+    if (!parentKey) return null
+    const hashes = await folderHashes()
+    if (hashes) {
+      const h = hashMetadataV4(want.toLowerCase(), rootKeyB64)
+      for (const n of byId.values()) {
+        if (n.parent_id !== parentId || n.is_bin || hashes.get(n.id) !== h) continue
+        try {
+          if ((await decryptStoredName(n.name, parentKey, rootKeyB64, n.id))?.normalize('NFC') === want) return n
+        } catch {}
+      }
+      return null
+    }
     if (!childNames.has(parentId)) {
-      const { decryptStoredName } = await import('./thumbnailBackfill.mjs')
-      const parentKey = folderKeyFor(parentId, byId, rootKeyB64, keyCache)
       const names = new Map()
       for (const n of byId.values()) {
-        if (n.parent_id !== parentId || n.is_bin || !parentKey) continue
+        if (n.parent_id !== parentId || n.is_bin) continue
         try {
           const nm = (await decryptStoredName(n.name, parentKey, rootKeyB64, n.id))?.normalize('NFC')
           if (nm && !names.has(nm)) names.set(nm, n)
@@ -514,7 +551,7 @@ export async function runPush({
     await save()
   }
 
-  const summary = { uploaded: 0, alreadyThere: 0, failed: [], changed: [], skippedEmpty: [], bytesUploaded: 0, foldersCreated, stoppedBy: null, interrupted: false }
+  const summary = { notes, uploaded: 0, alreadyThere: 0, failed: [], changed: [], skippedEmpty: [], bytesUploaded: 0, foldersCreated, stoppedBy: null, interrupted: false }
   const todo = []
   for (const f of scan.files) {
     const done = state.files[f.rel]
@@ -538,22 +575,36 @@ export async function runPush({
     for (const [dirRel, files] of byDir) {
       const { id, key } = folderIds.get(dirRel)
       const vault = new Map()
-      let cursor = null
-      do {
-        const q = new URLSearchParams({ limit: '100', folderId: id })
-        if (cursor) q.set('cursor', cursor)
-        const res = await withRetry(() => apiJson(apiBaseUrl, accessToken, `/api/files?${q}`))
+      // By keyed name hash and plaintext size: no decrypting. Older servers
+      // without /api/folders/file-index: list and decrypt each name.
+      let indexed = true
+      try {
+        const res = await withRetry(() => apiJson(apiBaseUrl, accessToken, `/api/folders/file-index?folderId=${id}`))
         for (const v of res.files ?? []) {
-          let nm = null
-          try {
-            nm = await decryptStoredName(v.name, key, rootKeyB64, v.id)
-          } catch {}
-          if (nm && v.size_declared != null) vault.set(`${nm.normalize("NFC")}\u0000${Number(v.size_declared)}`, v.id)
+          if (v.name_hash && v.size_declared != null) vault.set(`${v.name_hash}\u0000${Number(v.size_declared)}`, v.id)
         }
-        cursor = res.pagination?.hasMore ? res.pagination.nextCursor : null
-      } while (cursor)
+      } catch (err) {
+        if (err?.status !== 404 && err?.status !== 405) throw err
+        indexed = false
+      }
+      if (!indexed) {
+        let cursor = null
+        do {
+          const q = new URLSearchParams({ limit: '100', folderId: id })
+          if (cursor) q.set('cursor', cursor)
+          const res = await withRetry(() => apiJson(apiBaseUrl, accessToken, `/api/files?${q}`))
+          for (const v of res.files ?? []) {
+            let nm = null
+            try {
+              nm = await decryptStoredName(v.name, key, rootKeyB64, v.id)
+            } catch {}
+            if (nm && v.size_declared != null) vault.set(`${hashMetadataV4(nm.normalize('NFC').toLowerCase(), rootKeyB64)}\u0000${Number(v.size_declared)}`, v.id)
+          }
+          cursor = res.pagination?.hasMore ? res.pagination.nextCursor : null
+        } while (cursor)
+      }
       for (const f of files) {
-        const hit = vault.get(`${vaultName(f.name)}\u0000${f.size}`)
+        const hit = vault.get(`${hashMetadataV4(vaultName(f.name).toLowerCase(), rootKeyB64)}\u0000${f.size}`)
         if (hit) {
           state.files[f.rel] = { signature: signatureOf(f), fileId: hit }
           found.add(f)
