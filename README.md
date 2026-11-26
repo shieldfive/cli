@@ -153,6 +153,21 @@ cannot read (such as most HEIC), need `ffmpeg` on your PATH (`SF_FFMPEG` to poin
 at another binary). Without them those files upload without a preview and push
 says so once. `--no-thumbnails` skips previews entirely.
 
+`sf sync` and pushes through the agent make previews too; set
+`SF_NO_THUMBNAILS=1` to turn them off everywhere.
+
+Files pushed before previews existed can get them without uploading again:
+
+```sh
+sf thumbnails ~/Pictures --dry-run   # count: matched locally, already done, missing
+sf thumbnails ~/Pictures             # make, encrypt and send the previews only
+```
+
+Each photo or video in the vault copy of the folder (the one `sf push` made for
+it; `--media` or `--vault-folder=<a/b>` to name another) is matched to the local
+file at the same path with the same size. Nothing is downloaded. It resumes
+where it stopped (`~/.shieldfive/thumbnails/`, file ids only).
+
 Through the agent (`sf login`), `sf push` uploads only the files at the top of
 the folder, to the vault root, and refuses a folder with subfolders; use the
 environment variables below for a tree. `sf sync` is also top-level only and

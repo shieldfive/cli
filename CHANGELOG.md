@@ -21,6 +21,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   optional dependency `sharp`; video previews (and HEIC) need `ffmpeg` on PATH,
   and without it those files upload without a preview, with one note.
   `--no-thumbnails` turns previews off.
+- `sf sync` and pushes through the agent (`sf login`) make the same previews.
+  `SF_NO_THUMBNAILS=1` turns them off for every command.
+- `sf thumbnails <folder>` adds previews to photos and videos already in the
+  vault, from the originals still in `<folder>`: each vault file is matched to
+  the local file at the same path with the same size, and only the encrypted
+  preview is sent. No file is uploaded again and nothing is downloaded.
+  `--dry-run` counts first; `--media` or `--vault-folder=<a/b>` say which vault
+  folder holds the copy (default: the folder `sf push` made for it). Previews go
+  in batches when the server accepts them; reruns skip what is done.
 
 ## 0.5.3
 

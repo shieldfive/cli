@@ -15,7 +15,7 @@ import { open } from 'node:fs/promises'
 import { createHash, webcrypto } from 'node:crypto'
 
 import { encryptNameV6 } from '@shieldfive/crypto/vault'
-import { thumbnailFields } from './thumbnail.mjs'
+import { makeThumbnail, thumbnailFields } from './thumbnail.mjs'
 
 import {
   base64ToBytes,
@@ -588,12 +588,17 @@ async function serverAcceptsEmptyFiles({ apiBaseUrl, accessToken }) {
 // chunks to record what was actually uploaded; hashing the file separately,
 // before or after, cannot see a change made and undone while it was being read.
 // Bulk push supplies the row ID from its checkpoint. Other callers get a fresh UUIDv7.
-export async function uploadFile({ apiBaseUrl, accessToken, rootKey, name, path, size, onPlaintextChunk, onRetry, rowId = newRowBoundId(), folderId = null, folderKey = null, thumbnail = null }) {
+export async function uploadFile({ apiBaseUrl, accessToken, rootKey, name, path, size, onPlaintextChunk, onRetry, rowId = newRowBoundId(), folderId = null, folderKey = null, thumbnail }) {
   // Derived before anything is sent, so a vault whose identity cannot be
   // derived fails before a session (and a pending row) exists.
   const recipientPublicKey = await vaultMlKemPublicKey(rootKey)
   if (size === 0 && !(await serverAcceptsEmptyFiles({ apiBaseUrl, accessToken }))) {
     throw new EmptyFileUnsupportedError(name)
+  }
+  // Not given (sync, the agent): make the encrypted preview here for photos and
+  // videos. null means none. SF_NO_THUMBNAILS=1 turns it off everywhere.
+  if (thumbnail === undefined) {
+    thumbnail = process.env.SF_NO_THUMBNAILS === '1' ? null : await makeThumbnail({ path, name, size })
   }
   const { session, csk, nameEncryptedV6 } = await createUploadSession({
     apiBaseUrl,

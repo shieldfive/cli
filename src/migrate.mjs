@@ -549,4 +549,4 @@ export async function runPush({
   return summary
 }
 
-export const _internals = { flattenTree, folderKeyFor, signatureOf, relative, sep }
+export const _internals = { flattenTree, folderKeyFor, signatureOf, relative, sep, apiJson, withRetry }

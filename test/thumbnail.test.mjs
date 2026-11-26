@@ -226,3 +226,24 @@ test('push without --media still makes a Drive folder named after the source', a
   const top = server.created.find((c) => c.parentFolderId === null)
   assert.equal(top.isMedia, undefined)
 })
+
+test('uploadFile without an explicit thumbnail makes one (sync, agent); SF_NO_THUMBNAILS=1 turns it off', { skip: !sharp && 'sharp not installed' }, async () => {
+  const { uploadFile } = await import('../src/upload.mjs')
+  const path = join(dir, 'p.jpg')
+  await sharp({ create: { width: 800, height: 600, channels: 3, background: '#0a0' } }).jpeg().toFile(path)
+  const bodies = []
+  globalThis.fetch = async (_url, init) => {
+    bodies.push(JSON.parse(init.body))
+    return new Response(JSON.stringify({ error: 'stop here' }), { status: 400 })
+  }
+  const args = { apiBaseUrl: 'https://x.test', accessToken: 't', rootKey, name: 'p.jpg', path, size: 10 }
+  await assert.rejects(uploadFile(args))
+  assert.ok(bodies[0].thumbnail_ciphertext_b64)
+  process.env.SF_NO_THUMBNAILS = '1'
+  try {
+    await assert.rejects(uploadFile(args))
+  } finally {
+    delete process.env.SF_NO_THUMBNAILS
+  }
+  assert.equal(bodies[1].thumbnail_ciphertext_b64, null)
+})
