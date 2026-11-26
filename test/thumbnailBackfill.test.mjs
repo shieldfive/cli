@@ -41,7 +41,7 @@ async function file(name, folderId, folderKeyB64, size, hasThumb = false) {
   const csk = generateRandomKeyB64()
   const w = wrapKeyB64({ wrappingKeyB64: folderKeyB64, keyToWrapB64: csk })
   const env = await encryptNameV6({ name, folderKey: base64ToBytes(folderKeyB64), rowId: id })
-  return { row: { id, name: JSON.stringify(env), folder_id: folderId, size_bytes: size, has_thumbnail: hasThumb, csk_wrapped: w.wrapped, csk_iv: w.iv }, csk }
+  return { row: { id, name: JSON.stringify(env), folder_id: folderId, size_bytes: size + 1000, size_declared: size, has_thumbnail: hasThumb, csk_wrapped: w.wrapped, csk_iv: w.iv }, csk }
 }
 
 function server({ folders, files, batch = true }) {

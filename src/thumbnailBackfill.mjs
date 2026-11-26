@@ -172,7 +172,9 @@ export async function planBackfill({ source, apiBaseUrl, accessToken, rootKey, a
         counts.noLocal += 1
         continue
       }
-      if (st.size !== Number(f.size_bytes ?? f.size)) {
+      // size_declared is the plaintext size; size_bytes is the stored
+      // ciphertext (header and tags included), so it never equals the original.
+      if (f.size_declared == null || st.size !== Number(f.size_declared)) {
         counts.sizeDiffers += 1
         continue
       }
