@@ -7,6 +7,7 @@
 
 import assert from 'node:assert/strict'
 import { createHash, webcrypto } from 'node:crypto'
+import dns from 'node:dns'
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
@@ -26,7 +27,7 @@ const PROOF_KEY = 'ab'.repeat(32)
 // faults: { [route]: array of actions consumed per request, then 'ok' }.
 // Actions: 'ok', 'stall', 'reset' (destroy the socket), 'cut' (200 with a truncated
 // body), or a number (that HTTP status, JSON body).
-async function startServer(faults = {}, { direct = false, folderTree = [], clockOffset = 0, mode, allFail = false } = {}) {
+async function startServer(faults = {}, { direct = false, folderTree = [], clockOffset = 0, mode, allFail = false, storageHost } = {}) {
   const hits = {}
   const auth = []
   const manifests = []
@@ -36,7 +37,8 @@ async function startServer(faults = {}, { direct = false, folderTree = [], clock
     if (mode === 'dns' && (allFail || fileId === sessions[0]?.clientUploadId)) {
       return 'http://shieldfive-storage-test.invalid/secret-key?signature=private'
     }
-    return `${base}/storage/${fileId}?signature=private`
+    const origin = storageHost ? base.replace('127.0.0.1', storageHost) : base
+    return `${origin}/storage/${fileId}?signature=private`
   }
   const server = createServer((req, res) => {
     const chunks = []
@@ -139,6 +141,27 @@ async function upload(t, server, extra = {}) {
   })
   return { result, messages }
 }
+
+test('a storage connection falls back to IPv4 when its first IPv6 address cannot connect', async (t) => {
+  const storageHost = 'shieldfive-dual-stack.test'
+  const server = await startServer({}, { direct: true, storageHost })
+  t.after(server.close)
+  const lookup = dns.lookup
+  let dualStackLookups = 0
+  t.mock.method(dns, 'lookup', (hostname, options, callback) => {
+    if (hostname !== storageHost) return lookup(hostname, options, callback)
+    assert.equal(options.all, true)
+    dualStackLookups++
+    process.nextTick(callback, null, [
+      { address: '::1', family: 6 },
+      { address: '127.0.0.1', family: 4 },
+    ])
+  })
+  await upload(t, server)
+  assert.equal(dualStackLookups, 1)
+  assert.equal(server.hits.storage, 1)
+  assert.equal(server.hits['/api/files/complete-upload'], 1)
+})
 
 test('a stalled part is retried using fresh credentials', { timeout: 5000 }, async (t) => {
   const server = await startServer({ storage: ['stall'] })
@@ -338,12 +361,19 @@ test('doctor reports API time, DNS, TLS, one real PUT, completion and Bin deleti
   t.after(server.close)
   const report = await runDoctor({
     apiBaseUrl: server.base, getSession: () => ({ rootKey, accessToken: 'private-token' }),
-    tlsCheck: async (url) => assert.equal(url.origin, server.base),
+    dnsCheck: async () => [{ address: '127.0.0.1', family: 4 }, { address: '::1', family: 6 }],
+    tlsCheck: async (url, { address }) => {
+      assert.equal(url.origin, server.base)
+      if (address === '::1') throw Object.assign(new Error(), { code: 'ETIMEDOUT' })
+      assert.equal(address, '127.0.0.1')
+    },
   })
   assert.deepEqual(report.map((line) => line.split(' (')[0]), [
-    'PASS API reachability', 'PASS Clock skew', 'PASS Storage DNS', 'PASS Storage TLS',
+    'PASS API reachability', 'PASS Clock skew', 'PASS Storage DNS', 'PASS Storage TLS IPv4', 'WARN Storage TLS IPv6',
     'PASS Test upload', 'PASS Delete test upload',
   ])
+  assert.match(report.join('\n'), /PASS Storage TLS IPv4.*127\.0\.0\.1/)
+  assert.match(report.join('\n'), /WARN Storage TLS IPv6.*ETIMEDOUT.*::1/)
   assert.equal(server.sessions[0].folderId, bin.id)
   assert.equal(server.hits.storage, 1)
   assert.equal(server.manifests.length, 1)
@@ -362,7 +392,7 @@ test('doctor reports skew and DNS failures without exposing signed URL or provid
   const skewSeconds = Number(report.find((line) => line.startsWith('FAIL Clock skew'))?.match(/\((-?\d+) s/)?.[1])
   assert.ok(Math.abs(skewSeconds - 300) <= 2, `reported skew: ${skewSeconds} s`)
   assert.match(report.join('\n'), /FAIL Storage DNS.*ENOTFOUND/)
-  assert.match(report.join('\n'), /FAIL Storage TLS.*TLS_REQUIRED/)
+  assert.match(report.join('\n'), /SKIP Storage TLS IPv4/)
   assert.match(report.join('\n'), /FAIL Test upload \/ Send storage part.*ENOTFOUND/)
   assert.doesNotMatch(report.join('\n'), /signature|private|secret-key/)
 })
