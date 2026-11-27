@@ -7,7 +7,7 @@
 import assert from 'node:assert/strict'
 import { execFile, spawn } from 'node:child_process'
 import { webcrypto } from 'node:crypto'
-import { mkdtemp, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { createServer } from 'node:http'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -56,6 +56,13 @@ test('the agent runs as a separate process; status, verify and logout reach it',
       if (req.url.startsWith('/auth/v1/logout')) {
         calls.logout.push(req.headers.authorization)
         return res.writeHead(204).end()
+      }
+      if (req.url === '/api/folders/tree') {
+        return res.writeHead(200, { 'content-type': 'application/json' }).end('{"tree":[]}')
+      }
+      if (req.url === '/api/folders/create') {
+        // The old agent sent no output while waiting on this API.
+        return setTimeout(() => res.writeHead(403, { 'content-type': 'application/json' }).end('{"error":"fixture refused folder"}'), 150)
       }
       if (req.url === '/api/mobile/media/verify') {
         calls.verify++
@@ -106,6 +113,24 @@ test('the agent runs as a separate process; status, verify and logout reach it',
     assert.match(verify.stdout, /no upload record/)
     assert.equal(calls.verify, 0, 'nothing in the ledger, so the server is not asked')
 
+    const source = join(home, 'source')
+    await mkdir(source)
+    const push = spawn(process.execPath, [CLI, 'push', '--media', source], { env })
+    const finished = exited(push, 10_000)
+    let output = ''
+    push.stderr.setEncoding('utf8')
+    const preparing = new Promise((resolve) => {
+      push.stderr.on('data', (chunk) => {
+        output += chunk
+        if (output.includes('Preparing 1 vault folders')) resolve()
+      })
+    })
+    await Promise.race([preparing, finished.then(() => assert.fail('push exited before directory progress'))])
+    assert.equal(push.exitCode, null)
+    assert.equal(await finished, 1)
+    assert.match(output, /push summary: stopped.*HTTP 403/)
+    assert.match(output, /Run the same command again to resume/)
+
     const logout = await run(process.execPath, [CLI, 'logout'], { env })
     assert.match(logout.stdout, /revoked on the server/)
     assert.deepEqual(calls.logout, ['Bearer at-1'])
@@ -116,5 +141,6 @@ test('the agent runs as a separate process; status, verify and logout reach it',
   } finally {
     agent.kill()
     stub.close()
+    await Promise.all([home, tmp].map((dir) => rm(dir, { recursive: true, force: true })))
   }
 })

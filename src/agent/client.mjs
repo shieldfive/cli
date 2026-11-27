@@ -27,7 +27,7 @@ export class AgentRequestError extends Error {
  * `timeoutMs: 0` disables the timeout, which uploads and syncs need: a large
  * file can take longer than any fixed number.
  */
-export function request(op, args = {}, { path, timeoutMs = 10_000 } = {}) {
+export function request(op, args = {}, { path, timeoutMs = 10_000, onProgress, signal } = {}) {
   return new Promise((resolve, reject) => {
     // Resolved here rather than as a default parameter, so a platform the agent
     // does not support rejects this promise instead of throwing out of it.
@@ -46,6 +46,7 @@ export function request(op, args = {}, { path, timeoutMs = 10_000 } = {}) {
       if (settled) return
       settled = true
       clearTimeout(timer)
+      signal?.removeEventListener('abort', abort)
       socket.destroy()
       fn(value)
     }
@@ -57,6 +58,10 @@ export function request(op, args = {}, { path, timeoutMs = 10_000 } = {}) {
         )
       : null
 
+    const abort = () => settle(reject, new AgentRequestError('interrupted', 'Push interrupted. Run the same command again to resume.'))
+    if (signal?.aborted) return abort()
+    signal?.addEventListener('abort', abort, { once: true })
+
     socket.on('error', (err) => {
       if (err.code === 'ENOENT' || err.code === 'ECONNREFUSED') {
         settle(reject, new AgentUnavailableError('The ShieldFive agent is not running. Run sf login.'))
@@ -66,19 +71,24 @@ export function request(op, args = {}, { path, timeoutMs = 10_000 } = {}) {
     })
 
     socket.setEncoding('utf8')
-    socket.on(
-      'data',
-      lineSplitter((line) => {
-        let message
-        try {
-          message = JSON.parse(line)
-        } catch {
-          return settle(reject, new AgentRequestError('bad_response', 'Agent sent something that is not JSON.'))
-        }
-        if (message.ok) settle(resolve, message.result)
-        else settle(reject, new AgentRequestError(message.error?.code ?? 'error', message.error?.message ?? 'Agent refused.'))
-      }),
-    )
+    const feed = lineSplitter((line) => {
+      let message
+      try {
+        message = JSON.parse(line)
+      } catch {
+        return settle(reject, new AgentRequestError('bad_response', 'Agent sent something that is not JSON.'))
+      }
+      if (typeof message.progress === 'string') return onProgress?.(message.progress)
+      if (message.ok) settle(resolve, message.result)
+      else settle(reject, new AgentRequestError(message.error?.code ?? 'error', message.error?.message ?? 'Agent refused.'))
+    })
+    socket.on('data', (chunk) => {
+      try {
+        feed(chunk)
+      } catch (err) {
+        settle(reject, err)
+      }
+    })
     socket.on('close', () =>
       settle(reject, new AgentRequestError('closed', 'Agent closed the connection without answering.')),
     )

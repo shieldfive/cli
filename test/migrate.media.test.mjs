@@ -180,3 +180,39 @@ test('a push with no local record skips files already in the vault (same name an
   assert.equal(again.length, 0)
   assert.equal(s.alreadyThere, 3)
 })
+
+test('Media push reports totals and resolves a pending finalize on resume', async () => {
+  server = stubServer()
+  const src = await nasTree()
+  const controller = new AbortController()
+  const reports = []
+  let pendingId
+  const s = await push(src, {
+    concurrency: 1,
+    signal: controller.signal,
+    progress: (message) => reports.push(message),
+    uploadFn: async ({ rowId }) => {
+      pendingId = rowId
+      controller.abort()
+      throw Object.assign(new Error('completion response lost'), { finalizeOutcomeUnknown: true })
+    },
+  })
+  assert.equal(s.total, 3)
+  assert.equal(s.uploaded, 0)
+  assert.equal(s.failed.length, 1)
+  assert.equal(s.notStarted, 2)
+  assert.equal(s.interrupted, true)
+  assert.ok(reports.some((message) => message.includes('0/3 files uploaded')))
+
+  const fetch = globalThis.fetch
+  globalThis.fetch = (url, init) => {
+    if (new URL(url).pathname !== '/api/mobile/media/verify') return fetch(url, init)
+    assert.deepEqual(JSON.parse(init.body).fileIds, [pendingId])
+    return Promise.resolve(Response.json({ verified: [pendingId] }))
+  }
+  const resumed = await push(src, { uploadFn: uploader([]), progress: (message) => reports.push(message) })
+  assert.equal(resumed.alreadyThere, 1)
+  assert.equal(resumed.uploaded, 2)
+  assert.equal(resumed.foldersCreated, 0)
+  assert.ok(reports.some((message) => message.includes('2/3 files uploaded (1 already in the vault')))
+})
