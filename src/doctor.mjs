@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { lookup } from 'node:dns/promises'
+import { lookup, Resolver } from 'node:dns/promises'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -16,12 +16,24 @@ const MAX_CLOCK_SKEW_MS = 120_000
 async function checkDns(hostname) {
   let timer
   try {
-    return await Promise.race([
+    const addresses = await Promise.race([
       lookup(hostname, { all: true }),
       new Promise((_, reject) => {
         timer = setTimeout(() => reject(Object.assign(new Error(), { code: 'ETIMEDOUT' })), PROBE_TIMEOUT_MS)
       }),
     ])
+    clearTimeout(timer)
+    if (isIP(hostname)) return addresses
+    // getaddrinfo can suppress AAAA records on a machine with no IPv6
+    // route. Query DNS for any missing family so the probe exposes that.
+    const resolver = new Resolver({ timeout: 2000, tries: 1 })
+    const missing = [4, 6].filter((family) => !addresses.some((entry) => entry.family === family))
+    const extra = await Promise.all(missing.map(async (family) => {
+      const records = await (family === 4 ? resolver.resolve4(hostname) : resolver.resolve6(hostname))
+        .catch(() => [])
+      return records.map((address) => ({ address, family }))
+    }))
+    return [...addresses, ...extra.flat()]
   } finally {
     clearTimeout(timer)
   }
