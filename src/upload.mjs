@@ -40,6 +40,7 @@ import {
 
 const CREATE_SESSION_PATH = '/api/files/create-upload-session'
 const COMPLETE_PATH = '/api/files/complete-upload'
+const NATIVE_UPLOAD_PATH = '/api/files/upload-native'
 const PART_URL_PATH = '/api/files/upload-part-url'
 const DELETE_PATH = '/api/files/delete'
 const CAPABILITIES_PATH = '/api/files/upload-capabilities'
@@ -82,10 +83,11 @@ export function responseError(operation, res, body, { status = res.status, fallb
 // (when the caller supplied a refreshable getter) and the call is repeated; if
 // that refresh fails, or the repeat is refused too, the 401 surfaces with its
 // sign-in-again guidance. Other statuses are left to the caller.
-async function apiRequest({ url, accessToken, body, operation, auth, timeoutMs }) {
+async function apiRequest({ url, accessToken, body, operation, auth, timeoutMs, contentType = 'application/json' }) {
   const send = async (token) => networkRequest(url, {
     method: 'POST',
-    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': contentType },
+    redirect: 'error',
     body,
   }, operation, timeoutMs)
   const res = await send(await resolveToken(accessToken))
@@ -101,7 +103,7 @@ async function apiRequest({ url, accessToken, body, operation, auth, timeoutMs }
   return send(fresh)
 }
 
-async function withUploadRetry(send, onRetry, attempts = MAX_PART_ATTEMPTS) {
+async function withUploadRetry(send, onRetry, attempts = MAX_PART_ATTEMPTS, stopRetrying) {
   let refreshedAuth = false
   let lastStorageError
   for (let attempt = 1; ; attempt += 1) {
@@ -114,7 +116,7 @@ async function withUploadRetry(send, onRetry, attempts = MAX_PART_ATTEMPTS) {
         throw lastStorageError
       }
       const authRejected = error.storageAuthRejected && !refreshedAuth
-      if (attempt >= attempts || error.uploadRetriesExhausted ||
+      if (attempt >= attempts || error.uploadRetriesExhausted || stopRetrying?.(error) ||
           !(authRejected || error.uploadNetworkError || error.storageBusy || isRetryableStatus(error.status))) throw error
       refreshedAuth ||= authRejected
       const delay = authRejected ? Math.min(error.retryAfterMs ?? 0, MAX_RETRY_DELAY_MS) : retryDelayMs(attempt, error.retryAfterMs)
@@ -337,7 +339,31 @@ async function sendStorage(url, init, operation) {
   throw error
 }
 
-async function putDirectPresigned({ context, session, ciphertext, onRetry, beforeStorage }) {
+function canFallback(error) {
+  return error.storageFailure && ['ETIMEDOUT', 'ECONNRESET', 'EPIPE'].includes(error.networkCode)
+}
+
+async function postNative({ apiBaseUrl, accessToken, fileId, ciphertext, onRetry, beforeStorage }) {
+  const url = new URL(NATIVE_UPLOAD_PATH, apiBaseUrl)
+  url.searchParams.set('fileId', fileId)
+  const operation = 'Native upload via ShieldFive'
+  const auth = { refreshed: false }
+  await beforeStorage?.(url)
+  await withUploadRetry(async () => {
+    try {
+      const res = await apiRequest({
+        url, accessToken, body: ciphertext, operation, auth,
+        contentType: 'application/octet-stream', timeoutMs: STORAGE_REQUEST_TIMEOUT_MS,
+      })
+      if (res.status !== 204) throw responseError(operation, res, await readJson(res, operation))
+    } catch (err) {
+      err.storageFailure = true
+      throw err
+    }
+  }, onRetry, STORAGE_ATTEMPTS)
+}
+
+async function putDirectPresigned({ context, session, ciphertext, onRetry, beforeStorage, directUpload }) {
   await withUploadRetry(async (attempt) => {
     const credentials = attempt === 1
       ? session
@@ -345,11 +371,14 @@ async function putDirectPresigned({ context, session, ciphertext, onRetry, befor
     await beforeStorage?.(new URL(credentials.uploadUrl))
     const res = await sendStorage(credentials.uploadUrl, {
       method: 'PUT',
-      headers: { 'Content-Type': session.contentType || 'application/octet-stream' },
+      headers: {
+        'Content-Type': session.contentType || 'application/octet-stream',
+        'Content-Length': String(ciphertext.byteLength),
+      },
       body: ciphertext,
     }, 'Direct upload')
     void res.body?.cancel().catch(() => {})
-  }, onRetry, STORAGE_ATTEMPTS)
+  }, onRetry, STORAGE_ATTEMPTS, directUpload.mode === 's3' ? undefined : canFallback)
 }
 
 async function finalizeUpload({
@@ -397,7 +426,7 @@ async function finalizeUpload({
 // Single-chunk file: one part (header || frame_0), SHA-1 + proof, PUT it at
 // the presigned URL, finalize. No b2FileId is sent -- the server HEADs the
 // stored object and derives the storage id itself.
-async function uploadDirect({ apiBaseUrl, accessToken, session, parts, nameEncryptedV6, onRetry, onPartUploaded, beforeStorage, empty = false }) {
+async function uploadDirect({ apiBaseUrl, accessToken, session, parts, nameEncryptedV6, onRetry, onPartUploaded, beforeStorage, directUpload, empty = false }) {
   let ciphertext = null
   for await (const part of parts) {
     if (ciphertext !== null) {
@@ -413,10 +442,26 @@ async function uploadDirect({ apiBaseUrl, accessToken, session, parts, nameEncry
     ? computeV3EmptyUploadProof({ proofKeyHex: session.proofKey, header: ciphertext })
     : await computeV3UploadProof({ proofKeyHex: session.proofKey, part0: ciphertext })
 
-  await putDirectPresigned({
-    context: { apiBaseUrl, accessToken, fileId: session.fileId, auth: { refreshed: false } },
-    session, ciphertext, onRetry, beforeStorage,
-  })
+  if (directUpload.mode !== 'native') {
+    try {
+      await putDirectPresigned({
+        context: { apiBaseUrl, accessToken, fileId: session.fileId, auth: { refreshed: false } },
+        session, ciphertext, onRetry, beforeStorage, directUpload,
+      })
+    } catch (err) {
+      if (directUpload.mode === 's3' || !canFallback(err)) throw err
+      onRetry?.(`${err.message}; trying native upload via ShieldFive`)
+      try {
+        await postNative({ apiBaseUrl, accessToken, fileId: session.fileId, ciphertext, onRetry, beforeStorage })
+      } catch (nativeError) {
+        nativeError.message = `${err.message}; ${nativeError.message}`
+        throw nativeError
+      }
+      directUpload.mode = 'native'
+    }
+  } else {
+    await postNative({ apiBaseUrl, accessToken, fileId: session.fileId, ciphertext, onRetry, beforeStorage })
+  }
   onPartUploaded?.()
 
   // b2FileId is deliberately omitted. JSON.stringify drops the undefined key,
@@ -632,7 +677,7 @@ async function serverAcceptsEmptyFiles({ apiBaseUrl, accessToken }) {
 // chunks to record what was actually uploaded; hashing the file separately,
 // before or after, cannot see a change made and undone while it was being read.
 // Bulk push supplies the row ID from its checkpoint. Other callers get a fresh UUIDv7.
-export async function uploadFile({ apiBaseUrl, accessToken, rootKey, name, path, size, onPlaintextChunk, onPartUploaded, onRetry, beforeStorage, rowId = newRowBoundId(), folderId = null, folderKey = null, thumbnail }) {
+export async function uploadFile({ apiBaseUrl, accessToken, rootKey, name, path, size, onPlaintextChunk, onPartUploaded, onRetry, beforeStorage, directUpload = {}, rowId = newRowBoundId(), folderId = null, folderKey = null, thumbnail }) {
   // Derived before anything is sent, so a vault whose identity cannot be
   // derived fails before a session (and a pending row) exists.
   const recipientPublicKey = await vaultMlKemPublicKey(rootKey)
@@ -668,7 +713,7 @@ export async function uploadFile({ apiBaseUrl, accessToken, rootKey, name, path,
         'The upload session returned an unexpected file ID. This ShieldFive server may be too old for this client.',
       )
     }
-    await sendUpload({ apiBaseUrl, accessToken, path, size, onPlaintextChunk, onPartUploaded, onRetry, beforeStorage, session, envelopeKey, recipientPublicKey, nameEncryptedV6 })
+    await sendUpload({ apiBaseUrl, accessToken, path, size, onPlaintextChunk, onPartUploaded, onRetry, beforeStorage, directUpload, session, envelopeKey, recipientPublicKey, nameEncryptedV6 })
   } catch (err) {
     if (err && typeof err === 'object') err.uploadRetriesExhausted = true
     if (err.storageFailure) onRetry?.(`${err.message}; cleaning up the upload session`)
@@ -683,7 +728,7 @@ export async function uploadFile({ apiBaseUrl, accessToken, rootKey, name, path,
   return { fileId: session.fileId }
 }
 
-async function sendUpload({ apiBaseUrl, accessToken, path, size, onPlaintextChunk, onPartUploaded, onRetry, beforeStorage, session, envelopeKey, recipientPublicKey, nameEncryptedV6 }) {
+async function sendUpload({ apiBaseUrl, accessToken, path, size, onPlaintextChunk, onPartUploaded, onRetry, beforeStorage, directUpload, session, envelopeKey, recipientPublicKey, nameEncryptedV6 }) {
   if (!session.proofKey) throw new Error('Upload session is missing its proof key.')
 
   // The server's v1 chunk size (5 MiB): each encrypted chunk is one storage part.
@@ -708,7 +753,7 @@ async function sendUpload({ apiBaseUrl, accessToken, path, size, onPlaintextChun
     if (!session.uploadUrl) {
       throw new Error('Direct upload session is missing an upload URL.')
     }
-    await uploadDirect({ apiBaseUrl, accessToken, session, parts, nameEncryptedV6, onRetry, onPartUploaded, beforeStorage, empty: size === 0 })
+    await uploadDirect({ apiBaseUrl, accessToken, session, parts, nameEncryptedV6, onRetry, onPartUploaded, beforeStorage, directUpload, empty: size === 0 })
   } else if (session.uploadKind === 'large' || session.uploadKind === 's3-multipart') {
     if (session.uploadKind === 'large' && (!session.uploadUrl || !session.authToken)) {
       throw new Error('Multipart upload session is missing credentials.')

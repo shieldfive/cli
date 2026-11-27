@@ -218,9 +218,9 @@ password. It never reads them from the environment and there is no flag for
 them. It then starts an agent in the background and exits; every later command
 talks to that agent and needs nothing exported.
 
-If `SF_EMAIL` and `SF_PASSWORD` are also set, `sf push` and `sf sync` sign in
-with those instead and tell you an agent is running, so a script written for one
-account is never sent to another. `sf push` exits 2 if a file changed while it
+If `SF_EMAIL` and `SF_PASSWORD` are also set, the CLI uses the agent's account
+and reminds you to remove the variables from your environment and shell startup
+files. `sf push` exits 2 if a file changed while it
 was being uploaded: the vault then holds the version that was read, not the file
 as it is now.
 

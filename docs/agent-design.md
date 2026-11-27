@@ -36,9 +36,9 @@ A long-running `sf agent`, in the style of `ssh-agent`.
   agent also locks itself after an idle period in which nothing was uploaded,
   synced or verified; `status` does not count, so a prompt polling it cannot keep
   the agent unlocked.
-- When `SF_EMAIL` and `SF_PASSWORD` are both set, `push` and `sync` sign in from
-  them as before and say so if an agent is running. A script that names an
-  account is never redirected to whichever account the agent holds.
+- When the agent is unlocked, it takes priority over environment credentials.
+  If both `SF_EMAIL` and `SF_PASSWORD` are set, the CLI displays the agent account
+  and asks you to remove the environment credentials.
 
 ### Why not store the credential in the OS keychain
 

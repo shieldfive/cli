@@ -362,6 +362,7 @@ export async function runPush({
   source = resolve(source)
   // Notes worth showing even where progress lines are not (through the agent).
   const notes = []
+  const directUpload = {}
   {
     const inner = status
     status = (m) => {
@@ -718,6 +719,7 @@ export async function runPush({
               folderId: folder.id,
               folderKey: base64ToBytes(folder.key),
               thumbnail,
+              directUpload,
               onRetry: (message) => progress(`${f.rel}: ${message}`),
               onPartUploaded: () => { lastUploadProgress = Date.now() },
               onPlaintextChunk: (c) => {

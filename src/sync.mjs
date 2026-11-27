@@ -117,6 +117,7 @@ export async function syncOnce({
   manifestPath,
   manifest,
   uploadFn,
+  directUpload = {},
   log = () => {},
 }) {
   const entries = await scanFiles(folder, { exclude: [MANIFEST_NAME] })
@@ -142,6 +143,7 @@ export async function syncOnce({
         name: entry.name,
         path: entry.path,
         size: entry.size,
+        directUpload,
         onRetry: (message) => log(`${entry.name}: ${message}`),
       })
       manifest.files[entry.name] = {
@@ -256,6 +258,7 @@ export async function runSync({
   if (watch) process.on('SIGINT', onSigint)
 
   let summary
+  const directUpload = {}
   try {
     do {
       summary = await syncOnce({
@@ -266,6 +269,7 @@ export async function runSync({
         manifestPath,
         manifest,
         uploadFn,
+        directUpload,
         log,
       })
       status(

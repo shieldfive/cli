@@ -115,7 +115,9 @@ test('the agent runs as a separate process; status, verify and logout reach it',
 
     const source = join(home, 'source')
     await mkdir(source)
-    const push = spawn(process.execPath, [CLI, 'push', '--media', source], { env })
+    const push = spawn(process.execPath, [CLI, 'push', '--media', source], {
+      env: { ...env, SF_EMAIL: 'different@example.test', SF_PASSWORD: 'ignored-secret' },
+    })
     const finished = exited(push, 10_000)
     let output = ''
     push.stderr.setEncoding('utf8')
@@ -128,6 +130,8 @@ test('the agent runs as a separate process; status, verify and logout reach it',
     await Promise.race([preparing, finished.then(() => assert.fail('push exited before directory progress'))])
     assert.equal(push.exitCode, null)
     assert.equal(await finished, 1)
+    assert.match(output, /Using the signed-in agent.*Remove SF_EMAIL and SF_PASSWORD/)
+    assert.doesNotMatch(output, /ignored-secret|different@example/)
     assert.match(output, /push summary: stopped.*HTTP 403/)
     assert.match(output, /Run the same command again to resume/)
 
