@@ -9,10 +9,7 @@
 //   sf sync <folder> [--watch]   upload new and changed files
 //   sf verify <file>...          is each file safely stored in your vault
 //
-// push and sync use a running agent when there is one. When SF_EMAIL and
-// SF_PASSWORD are set they sign in from those instead, exactly as before, so a
-// script written for one account is never quietly redirected to an agent
-// signed in as another. See docs/agent-design.md.
+// Push and sync use the signed-in agent when available. See docs/agent-design.md.
 
 import { webcrypto } from 'node:crypto'
 import { lstat, readFile, readdir } from 'node:fs/promises'
@@ -56,8 +53,8 @@ function usage() {
       'computer has signed in to with a login secret. Refused by default.',
       '',
       'After sf login, push / sync / verify go through the agent and need nothing',
-      'in the environment. Without an agent, or when SF_EMAIL and SF_PASSWORD are',
-      'set, push and sync sign in from those [SF_VAULT_PASSWORD if your vault',
+      'in the environment. Without an agent, push and sync use SF_EMAIL and',
+      'SF_PASSWORD [SF_VAULT_PASSWORD if your vault',
       'password differs]. On Windows, set SF_EMAIL and SF_PASSWORD before',
       'running push or sync.',
       '',
@@ -201,24 +198,19 @@ async function runningAgent() {
   return status?.unlocked ? status : null
 }
 
-/**
- * Decide how push and sync authenticate. Environment credentials win when both
- * are set: that is how these commands behaved before the agent existed, and it
- * keeps a script that names an account from being redirected to whichever
- * account the agent happens to hold.
- */
-async function chooseAuth() {
+async function runningAgentWithWarning() {
   const agent = await runningAgent()
-  if (envCredentialsSet()) {
-    if (agent) {
-      process.stderr.write(
-        `SF_EMAIL and SF_PASSWORD are set, so this signs in with them rather than ` +
-          `through the running agent (account ${agent.account}). Unset them to use the agent.\n`,
-      )
-    }
-    return { agent: null }
+  if (agent && envCredentialsSet()) {
+    process.stderr.write(
+      `Using the signed-in agent (account ${agent.account}). Remove SF_EMAIL and SF_PASSWORD from your environment and shell startup files.\n`,
+    )
   }
-  if (agent && !agent.storageAddressFamilies) {
+  return agent
+}
+
+async function chooseAuth() {
+  const agent = await runningAgentWithWarning()
+  if (agent && !agent.nativeDirectFallback) {
     throw new Error('Your agent is from an earlier CLI version. Run sf logout, then sf login to start the upgraded agent.')
   }
   return { agent }
@@ -452,15 +444,15 @@ async function cmdDoctor(flags) {
   let report
   let rootKey
   try {
-    const agent = envCredentialsSet() ? null : await runningAgent()
-    if (agent?.storageAddressFamilies) {
+    const agent = await runningAgentWithWarning()
+    if (agent?.nativeDirectFallback) {
       const { request } = await import('./agent/client.mjs')
       report = await request('doctor', {}, { timeoutMs: 9 * 60_000 })
     } else {
       const { createSessionTokens } = await import('./sync.mjs')
       report = await runDoctor({
         apiBaseUrl: backendConfig().apiBaseUrl,
-        getSession: envCredentialsSet() ? async () => {
+        getSession: !agent && envCredentialsSet() ? async () => {
           const session = await authAndUnlock(readLiveConfig(flags), { quiet: true })
           rootKey = session.rootKey
           return {
@@ -538,11 +530,12 @@ async function pushFolder(folder, flags) {
     let differs = 0
     let uploaded = 0
     let stoppedBy
+    let nativeDirect = false
     process.stderr.write(`Starting uploads: 0/${files.length} files uploaded.\n`)
     for (const { name, path } of files) {
       let result
       try {
-        result = await request('upload', { path, progress: true }, {
+        result = await request('upload', { path, progress: true, nativeDirect }, {
           timeoutMs: 0,
           onProgress: (message) => process.stderr.write(`${name}: ${message}\n`),
         })
@@ -555,6 +548,7 @@ async function pushFolder(folder, flags) {
         continue
       }
       storageFailures.record()
+      nativeDirect ||= result.nativeDirect === true
       if (result.matchesFileNow) {
         uploaded++
         process.stdout.write(`[${uploaded}/${files.length}] pushed ${name}\n`)
@@ -779,11 +773,12 @@ async function syncViaAgent(folder, { watch, intervalMs }, agent) {
   if (watch) process.on('SIGINT', onSigint)
   process.stderr.write(`syncing to account ${agent.account} through the agent\n`)
 
+  let nativeDirect = false
   try {
     do {
       let summary
       try {
-        summary = await request('sync', { folder, progress: true }, {
+        summary = await request('sync', { folder, progress: true, nativeDirect }, {
           timeoutMs: 0,
           onProgress: (message) => process.stderr.write(`${message}\n`),
         })
@@ -793,6 +788,7 @@ async function syncViaAgent(folder, { watch, intervalMs }, agent) {
         }
         throw err
       }
+      nativeDirect ||= summary.nativeDirect === true
       for (const e of summary.errors) process.stdout.write(`failed ${e.path}: ${e.message}\n`)
       process.stderr.write(
         `pass: ${summary.uploaded} synced, ${summary.skipped} unchanged` +

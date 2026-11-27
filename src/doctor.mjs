@@ -91,10 +91,22 @@ export async function runDoctor({
   }
   if (!session) {
     if (!report.some((line) => line.startsWith('FAIL Sign-in'))) fail('Sign-in', 'run sf login and retry')
-    for (const label of ['Storage DNS', 'Storage TLS IPv4', 'Storage TLS IPv6', 'Test upload', 'Delete test upload']) skip(label)
+    for (const label of ['S3 PUT', 'Native direct']) {
+      skip(`Test upload ${label}`)
+      skip(`Delete test upload ${label}`)
+    }
     return report
   }
 
+  for (const [mode, label] of [['s3', 'S3 PUT'], ['native', 'Native direct']]) {
+    await probeUpload({ apiBaseUrl, session, mode, label, dnsCheck, tlsCheck, report, pass, fail, skip })
+  }
+  return report
+}
+
+async function probeUpload({ apiBaseUrl, session, mode, label, dnsCheck, tlsCheck, report, pass, fail, skip }) {
+  const test = `Test upload ${label}`
+  const cleanup = `Delete test upload ${label}`
   const { accessToken, rootKey } = session
   const rowId = newRowBoundId()
   const name = `ShieldFive doctor ${randomUUID()}.txt`
@@ -124,7 +136,7 @@ export async function runDoctor({
     try {
       await uploadFile({
         apiBaseUrl, accessToken, rootKey, name, path, size: 10, rowId,
-        folderId: bin?.id ?? null, folderKey,
+        folderId: bin?.id ?? null, folderKey, directUpload: { mode },
         beforeStorage: async (url) => {
           if (host !== url.host) {
             host = url.host
@@ -160,7 +172,7 @@ export async function runDoctor({
         },
         onPartUploaded: () => { step = 'Complete upload' },
       })
-      pass('Test upload', `session, one part, complete, ${host}`)
+      pass(test, `session, one part, complete, ${host}`)
     } finally {
       folderKey?.fill(0)
     }
@@ -170,17 +182,16 @@ export async function runDoctor({
       skip('Storage TLS IPv4')
       skip('Storage TLS IPv6')
     }
-    fail(`Test upload / ${step}`, detail(err))
+    fail(`${test} / ${step}`, detail(err))
   } finally {
     if (startedUpload) {
       try {
         await deleteUpload({ apiBaseUrl, accessToken, fileId: rowId })
-        pass('Delete test upload')
+        pass(cleanup)
       } catch (err) {
-        fail('Delete test upload', detail(err))
+        fail(cleanup, detail(err))
       }
-    } else skip('Delete test upload')
+    } else skip(cleanup)
     if (directory) await rm(directory, { recursive: true, force: true }).catch(() => {})
   }
-  return report
 }

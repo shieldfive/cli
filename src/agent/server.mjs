@@ -192,7 +192,7 @@ export function createAgent({
     return Array.isArray(body.verified) ? body.verified : []
   }
 
-  async function upload(path, onRetry) {
+  async function upload(path, onRetry, directUpload) {
     // lstat: a symlink is refused, not followed (and readFileChunks opens with
     // O_NOFOLLOW, so a swap after this check fails too).
     const before = await lstat(path)
@@ -225,6 +225,7 @@ export function createAgent({
         path,
         size: before.size,
         onRetry,
+        directUpload,
         onPlaintextChunk: (chunk) => {
           hmac.update(chunk)
           streamed += chunk.length
@@ -272,7 +273,7 @@ export function createAgent({
     return { fileId, size: streamed, matchesFileNow, mac }
   }
 
-  async function sync(folder, progress) {
+  async function sync(folder, progress, directUpload) {
     const st = await stat(folder)
     if (!st.isDirectory()) throw new AgentError('not_a_directory', `${folder} is not a directory.`)
 
@@ -295,7 +296,7 @@ export function createAgent({
           skipped++
           continue
         }
-        const r = await upload(f.path, (message) => progress?.(`${f.path}: ${message}`))
+        const r = await upload(f.path, (message) => progress?.(`${f.path}: ${message}`), directUpload)
         storageFailures.record()
         uploaded++
         done.add(`${f.path}\u0000${r.mac}`)
@@ -311,7 +312,7 @@ export function createAgent({
         }
       }
     }
-    return { uploaded, skipped, failed, changed, errors, ...(stoppedBy && { stoppedBy }) }
+    return { uploaded, skipped, failed, changed, errors, ...(directUpload.mode === 'native' && { nativeDirect: true }), ...(stoppedBy && { stoppedBy }) }
   }
 
   async function handle(req, { progress, signal }) {
@@ -321,6 +322,7 @@ export function createAgent({
           unlocked: !stopping,
           networkDeadlines: true,
           storageAddressFamilies: true,
+          nativeDirectFallback: true,
           account: session.userId,
           idleLocksInSec: Math.max(0, Math.round((idleDeadline - now()) / 1000)),
           pid: process.pid,
@@ -335,13 +337,14 @@ export function createAgent({
         }
       }
       case 'upload': {
+        const directUpload = { mode: req.args.nativeDirect ? 'native' : undefined }
         // The MAC stays in the ledger. A process on the socket has no use for a
         // keyed digest.
-        const { fileId, size, matchesFileNow } = await upload(req.args.path, progress)
-        return { fileId, size, matchesFileNow }
+        const { fileId, size, matchesFileNow } = await upload(req.args.path, progress, directUpload)
+        return { fileId, size, matchesFileNow, ...(directUpload.mode === 'native' && { nativeDirect: true }) }
       }
       case 'sync':
-        return sync(req.args.folder, progress)
+        return sync(req.args.folder, progress, { mode: req.args.nativeDirect ? 'native' : undefined })
       // Tree push, tidy and preview backfill run here with the agent's session,
       // so a signed-in user needs no SF_EMAIL / SF_PASSWORD. Each gets its own
       // copy of the root key, wiped when it returns.

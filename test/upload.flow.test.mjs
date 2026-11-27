@@ -509,8 +509,8 @@ test('direct push: presigned PUT, no Authorization, no b2FileId at finalize', as
   )
   assert.deepEqual(
     Object.keys(putHeaders).map((k) => k.toLowerCase()),
-    ['content-type'],
-    'Content-Type is the only header the presigned PUT may carry',
+    ['content-type', 'content-length'],
+    'The presigned PUT carries only content type and length',
   )
 
   assert.equal(createBody.cipherVersion, 3)

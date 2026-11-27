@@ -102,9 +102,9 @@ export function parseRequest(line) {
 
   switch (op) {
     case 'upload':
-      return { id, op, args: { path: absolutePath(args.path, 'path'), ...(args.progress === true ? { progress: true } : {}) } }
+      return { id, op, args: { path: absolutePath(args.path, 'path'), ...(args.progress === true ? { progress: true } : {}), ...(args.nativeDirect === true ? { nativeDirect: true } : {}) } }
     case 'sync':
-      return { id, op, args: { folder: absolutePath(args.folder, 'folder'), ...(args.progress === true ? { progress: true } : {}) } }
+      return { id, op, args: { folder: absolutePath(args.folder, 'folder'), ...(args.progress === true ? { progress: true } : {}), ...(args.nativeDirect === true ? { nativeDirect: true } : {}) } }
     case 'push':
       return {
         id,

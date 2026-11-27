@@ -218,9 +218,9 @@ password. It never reads them from the environment and there is no flag for
 them. It then starts an agent in the background and exits; every later command
 talks to that agent and needs nothing exported.
 
-If `SF_EMAIL` and `SF_PASSWORD` are also set, `sf push` and `sf sync` sign in
-with those instead and tell you an agent is running, so a script written for one
-account is never sent to another. `sf push` exits 2 if a file changed while it
+If `SF_EMAIL` and `SF_PASSWORD` are also set, the CLI uses the agent's account
+and reminds you to remove the variables from your environment and shell startup
+files. `sf push` exits 2 if a file changed while it
 was being uploaded: the vault then holds the version that was read, not the file
 as it is now.
 
@@ -396,6 +396,9 @@ this client no longer writes it.
   the server compares the client's `ciphertextHash` against the client's own
   `partSha1Array[0]`, so they always agree. Integrity here rests on the upload
   proof and on the header MAC and chunk tags at download, not on a wire checksum.
+  On a PUT timeout or connection reset, the CLI requests a native upload target
+  and sends the same ciphertext directly to storage for the rest of the run.
+  `sf doctor` tests both transports.
 - **Multipart** (> 5 MiB) — the file is streamed one 5 MiB chunk at a time (never
   loaded whole into memory). The server can allocate signed part URLs or native
   multipart credentials. The server finishes the file with the ordered part
