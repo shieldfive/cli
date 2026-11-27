@@ -26,12 +26,11 @@ import { basename, join, relative, resolve, sep } from 'node:path'
 import { encryptNameV6 } from '@shieldfive/crypto/vault'
 
 import {
-  API_REQUEST_TIMEOUT_MS,
   EmptyFileUnsupportedError,
   isRetryableStatus,
   newRowBoundId,
-  resolveToken,
   responseError,
+  storageFailureLimit,
   retryDelayMs,
   uploadFile,
 } from './upload.mjs'
@@ -44,6 +43,7 @@ import {
   wrapKeyB64,
 } from './uploadCrypto.mjs'
 import { makeThumbnail, mediaKindOf, thumbnailSupport } from './thumbnail.mjs'
+import { networkRequest, readJson, resolveToken } from './network.mjs'
 
 const STATE_VERSION = 1
 const DEFAULT_CONCURRENCY = 3
@@ -177,19 +177,18 @@ export async function saveState(statePath, state) {
 }
 
 async function apiJson(apiBaseUrl, accessToken, path, { method = 'GET', body } = {}) {
-  const res = await fetch(new URL(path, apiBaseUrl), {
+  const operation = `${method} ${path.split('?')[0]}`
+  const res = await networkRequest(new URL(path, apiBaseUrl), {
     method,
-    signal: AbortSignal.timeout(API_REQUEST_TIMEOUT_MS),
     headers: {
       Authorization: `Bearer ${await resolveToken(accessToken)}`,
       ...(body ? { 'Content-Type': 'application/json' } : {}),
     },
     body: body ? JSON.stringify(body) : undefined,
-  })
-  if (!res.ok) {
-    throw responseError(`${method} ${path}`, res, await res.json().catch(() => ({})))
-  }
-  return res.json()
+  }, operation)
+  const json = await readJson(res, operation)
+  if (!res.ok) throw responseError(operation, res, json)
+  return json
 }
 
 export function isTransient(err) {
@@ -207,7 +206,8 @@ export function isTransient(err) {
 
 // A refusal that every remaining file would meet too: stop the run.
 export function isRunFatal(err) {
-  return (
+  return !err?.storageFailure && (
+    err?.code === 'session_revoked' || err?.code === 'locked' ||
     err?.status === 401 ||
     err?.status === 402 ||
     err?.status === 412 ||
@@ -222,7 +222,7 @@ async function withRetry(fn, { onRetry = () => {}, attempts = MAX_FILE_ATTEMPTS 
     try {
       return await fn(attempt)
     } catch (err) {
-      if (attempt >= attempts || err?.finalizeOutcomeUnknown || !isTransient(err) || isRunFatal(err)) throw err
+      if (attempt >= attempts || err?.finalizeOutcomeUnknown || err?.uploadRetriesExhausted || err?.storageFailure || !isTransient(err) || isRunFatal(err)) throw err
       const delay = retryDelayMs(attempt, err.retryAfterMs)
       onRetry(err, attempt, delay)
       await sleep(delay)
@@ -643,17 +643,15 @@ export async function runPush({
     }
   }
   if (summary.alreadyThere) status(`${summary.alreadyThere} files already uploaded by an earlier run; skipping them`)
-  let support = { image: false, video: false }
-  if (thumbnails) {
-    support = await thumbnailSupportFn()
-    const kinds = new Set(todo.map((f) => mediaKindOf(f.name)))
-    if (kinds.has('image') && !support.image) {
-      status('note: photos will upload without previews (install ffmpeg, or reinstall the CLI so its optional image encoder loads)')
-    }
-    if (kinds.has('video') && !support.video) {
-      status('note: videos will upload without previews; install ffmpeg (e.g. brew install ffmpeg) for video previews')
-    }
+  let previewNoteShown = false
+  const notePreviewSkipped = () => {
+    if (previewNoteShown) return
+    previewNoteShown = true
+    status('note: some files will upload without previews because an encoder was unavailable or could not finish')
   }
+  const support = thumbnails && todo.some((f) => mediaKindOf(f.name))
+    ? await thumbnailSupportFn().catch(() => ({ image: false, video: false }))
+    : { image: false, video: false }
   const todoBytes = todo.reduce((s, f) => s + f.size, 0)
   const counts = () => `${summary.uploaded}/${summary.total} files uploaded (${summary.alreadyThere} already in the vault, ${summary.failed.length} failed)`
   progress(`Starting uploads: ${counts()}. ${todo.length} queued, up to ${concurrency} at a time.`)
@@ -661,33 +659,45 @@ export async function runPush({
   let inFlightBytes = 0
   let completed = 0
   const started = Date.now()
+  let lastUploadProgress = started
+  let lastWatchdogNotice = started
+  const watchdogMs = 2 * 60_000
   const timer = progressEveryMs
     ? setInterval(() => {
-        const secs = (Date.now() - started) / 1000
+        const now = Date.now()
+        if (now - Math.max(lastUploadProgress, lastWatchdogNotice) >= watchdogMs) {
+          lastWatchdogNotice = now
+          progress(`No upload progress for ${Math.floor((now - lastUploadProgress) / 60_000)} min. Upload workers are still running.`)
+        }
+        const secs = (now - started) / 1000
         const sent = summary.bytesUploaded + inFlightBytes
         progress(
-          `progress: ${counts()}, ${fmtBytes(sent)} of ${fmtBytes(todoBytes)}` +
-            (secs > 0 ? `, ${fmtBytes(sent / secs)}/s` : ''),
+          `progress: ${counts()}, ${fmtBytes(sent)} of ${fmtBytes(todoBytes)} read` +
+            (secs > 0 ? `, ${fmtBytes(sent / secs)}/s read` : ''),
         )
       }, progressEveryMs)
     : null
   timer?.unref?.()
 
   let next = 0
+  const storageFailures = storageFailureLimit()
   const stopping = () => summary.stoppedBy || signal?.aborted
 
   const uploadOne = async (f) => {
     const before = await lstat(f.path).catch(() => null)
     if (!before?.isFile()) {
       summary.failed.push({ rel: f.rel, message: 'file disappeared or is no longer a regular file' })
-      log(`failed ${f.rel}: file disappeared or is no longer a regular file`)
+      progress(`failed ${f.rel}: file disappeared or is no longer a regular file`)
       return
     }
     const entry = { ...f, size: before.size, mtimeMs: before.mtimeMs }
     const folder = folderIds.get(f.dir)
     const kind = thumbnails ? mediaKindOf(f.name) : null
     // Made once per file, before any retry; a failure just means no preview.
-    const thumbnail = kind && support[kind] ? await makeThumbnailFn({ path: f.path, name: f.name, size: entry.size }) : null
+    const thumbnail = kind && support[kind]
+      ? await makeThumbnailFn({ path: f.path, name: f.name, size: entry.size }).catch(() => null)
+      : null
+    if (kind && !thumbnail) notePreviewSkipped()
     let progressed = 0
     try {
       await withRetry(
@@ -708,7 +718,8 @@ export async function runPush({
               folderId: folder.id,
               folderKey: base64ToBytes(folder.key),
               thumbnail,
-              onRetry: (message) => status(`${f.rel}: ${message}`),
+              onRetry: (message) => progress(`${f.rel}: ${message}`),
+              onPartUploaded: () => { lastUploadProgress = Date.now() },
               onPlaintextChunk: (c) => {
                 progressed += c.length
                 inFlightBytes += c.length
@@ -751,10 +762,13 @@ export async function runPush({
         return
       }
       summary.failed.push({ rel: f.rel, message: err.message })
-      log(`failed ${f.rel}: ${err.message}`)
+      progress(`failed ${f.rel}: ${err.message}`)
+      summary.stoppedBy ??= storageFailures.record(err)
       return
     }
+    storageFailures.record()
     summary.uploaded += 1
+    lastUploadProgress = Date.now()
     summary.bytesUploaded += entry.size
     completed += 1
     const after = await lstat(f.path).catch(() => null)

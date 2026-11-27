@@ -18,7 +18,7 @@ const req = (obj) => JSON.stringify(obj)
 test('the operation list is exactly the write-only set', () => {
   // push / thumbnails write; tidy only moves or deletes EMPTY NAS/system
   // folders. None returns a name, a key or file contents: counts only.
-  assert.deepEqual([...OPS].sort(), ['lock', 'logout', 'push', 'status', 'sync', 'thumbnails', 'tidy', 'upload', 'verify'])
+  assert.deepEqual([...OPS].sort(), ['doctor', 'lock', 'logout', 'push', 'status', 'sync', 'thumbnails', 'tidy', 'upload', 'verify'])
 })
 
 test('operations that would read, list, decrypt or export are refused', () => {

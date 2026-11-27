@@ -22,6 +22,7 @@
 import { spawn } from 'node:child_process'
 import { webcrypto } from 'node:crypto'
 import { extname } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 import { aesGcmEncrypt, bytesToBase64 } from './uploadCrypto.mjs'
 
@@ -34,6 +35,8 @@ const IV_BYTES = 12
 // there anyway, so do not send it.
 const MAX_CIPHERTEXT_BYTES = 200 * 1024
 const FFMPEG_TIMEOUT_MS = 30_000
+const PREVIEW_TIMEOUT_MS = 35_000
+const PROBE_TIMEOUT_MS = 5_000
 // Larger images are not decoded (memory); they upload without a thumbnail.
 const MAX_IMAGE_SOURCE_BYTES = 200 * 1024 * 1024
 
@@ -75,45 +78,65 @@ async function loadSharp() {
   return sharpModule
 }
 
-let ffmpegAvailable
 export async function hasFfmpeg(bin = process.env.SF_FFMPEG || 'ffmpeg') {
-  if (ffmpegAvailable === undefined) {
-    ffmpegAvailable = await new Promise((resolve) => {
-      const child = spawn(bin, ['-version'], { stdio: 'ignore' })
-      child.on('error', () => resolve(false))
-      child.on('close', (code) => resolve(code === 0))
-    })
-  }
-  return ffmpegAvailable
+  return (await runEncoder(bin, ['-version'], PROBE_TIMEOUT_MS, 1024 * 1024)) !== null
 }
 
 /** What this machine can make: { image, video } booleans. */
-export async function thumbnailSupport() {
-  const sharp = await loadSharp()
-  const ffmpeg = await hasFfmpeg()
+export async function probeThumbnailSupport() {
+  const [sharp, ffmpeg] = await Promise.all([loadSharp(), hasFfmpeg()])
   return { image: Boolean(sharp) || ffmpeg, video: ffmpeg }
 }
 
-function runFfmpeg(args, timeoutMs = FFMPEG_TIMEOUT_MS) {
+function runEncoder(bin, args, timeoutMs, maxBytes, { processGroup = true } = {}) {
   return new Promise((resolve) => {
-    const child = spawn(process.env.SF_FFMPEG || 'ffmpeg', args, { stdio: ['ignore', 'pipe', 'ignore'] })
+    const detached = processGroup && process.platform !== 'win32'
+    const child = spawn(bin, args, { detached, stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true })
     const chunks = []
     let size = 0
+    const finish = (result) => {
+      clearTimeout(timer)
+      resolve(result)
+    }
+    const stop = () => {
+      try {
+        if (detached && child.pid) process.kill(-child.pid, 'SIGKILL')
+        else child.kill('SIGKILL')
+      } catch {
+        // The process may have exited while a descendant still had stdout open.
+      }
+      child.stdout.destroy()
+      child.unref()
+      finish(null)
+    }
+    const timer = setTimeout(stop, timeoutMs)
     child.stdout.on('data', (c) => {
       size += c.length
-      if (size > 20 * 1024 * 1024) child.kill('SIGKILL')
+      if (size > maxBytes) stop()
       else chunks.push(c)
     })
-    const timer = setTimeout(() => child.kill('SIGKILL'), timeoutMs)
-    child.on('error', () => {
-      clearTimeout(timer)
-      resolve(null)
-    })
-    child.on('close', (code) => {
-      clearTimeout(timer)
-      resolve(code === 0 && size > 0 ? new Uint8Array(Buffer.concat(chunks)) : null)
-    })
+    child.once('error', () => finish(null))
+    child.once('close', (code) => finish(code === 0 ? Buffer.concat(chunks) : null))
   })
+}
+
+function runFfmpeg(args) {
+  // The encoder inherits the preview worker's process group so the parent
+  // can stop both even when native image processing gets stuck.
+  return runEncoder(process.env.SF_FFMPEG || 'ffmpeg', ['-nostdin', ...args], FFMPEG_TIMEOUT_MS,
+    20 * 1024 * 1024, { processGroup: false })
+}
+
+const previewWorker = fileURLToPath(new URL('./thumbnailWorker.mjs', import.meta.url))
+
+export async function thumbnailSupport() {
+  try {
+    const output = await runEncoder(process.execPath, [previewWorker], PROBE_TIMEOUT_MS + 2_000, 1024)
+    if (output?.length) return JSON.parse(output.toString())
+  } catch {
+    // An unavailable encoder must not stop its caller.
+  }
+  return { image: false, video: false }
 }
 
 // Quality 0..1 to ffmpeg's mjpeg qscale (2 best .. 31 worst).
@@ -195,7 +218,7 @@ async function videoThumbnail(path) {
  * The plaintext JPEG thumbnail for `path`, or null (not an image or video,
  * cannot decode, no encoder). Never throws.
  */
-export async function makeThumbnail({ path, name, size }) {
+export async function encodeThumbnail({ path, name, size }) {
   try {
     const kind = mediaKindOf(name)
     if (kind === 'image') return await imageThumbnail(path, size)
@@ -204,4 +227,15 @@ export async function makeThumbnail({ path, name, size }) {
     // best-effort
   }
   return null
+}
+
+export async function makeThumbnail({ path, name, size }) {
+  if (!mediaKindOf(name)) return null
+  try {
+    const output = await runEncoder(process.execPath, [previewWorker, JSON.stringify({ path, name, size })],
+      PREVIEW_TIMEOUT_MS, MAX_CIPHERTEXT_BYTES)
+    return output?.length ? new Uint8Array(output) : null
+  } catch {
+    return null
+  }
 }

@@ -602,7 +602,7 @@ test('signed multipart refreshes credentials across storage and allocation fault
   const parts = [1, 2, 3].map((partNumber) => sentParts.get(partNumber))
   assert.deepEqual(manifests[0].partSha1Array, parts.map(sha1HexOf))
   assert.deepEqual(manifests[0].partETags, parts.map((part) => createHash('md5').update(part).digest('hex')))
-  assert.ok(messages.includes('Upload part 1 failed (HTTP 503), retrying'))
+  assert.ok(messages.includes('Upload part 1 failed (HTTP 503) at storage.test (ServiceUnavailable), retrying'))
   assert.ok(messages.includes('Get upload credentials failed (HTTP 429), retrying'))
   assert.doesNotMatch(messages.join('\n'), /Backblaze|\bB2\b/i)
 })

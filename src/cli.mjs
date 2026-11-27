@@ -29,6 +29,7 @@ function usage() {
       '',
       '  login [--idle=<hours>]      sign in once and start an agent (default: locks after 8 h without use)',
       '  status                      show whether an agent is running',
+      '  doctor                      test API, clock, and storage connectivity',
       '  logout [--everywhere]       revoke the session and stop the agent',
       '                              --everywhere also signs out your browser and phone',
       '  push <folder>               encrypt and upload every file in <folder>',
@@ -162,12 +163,12 @@ async function readTotpCode() {
 // Sign in (Supabase -> Bearer, with 2FA step-up if enabled) then fetch + unlock
 // the vault root key. Shared by `push` and `sync`. Network deps are imported
 // lazily so `sf encrypt` runs without @supabase/supabase-js.
-async function authAndUnlock(cfg) {
+async function authAndUnlock(cfg, { quiet = false } = {}) {
   const { signIn } = await import('./auth.mjs')
   const { fileAuthPin } = await import('./authPin.mjs')
   const { fetchAndUnlockVault } = await import('./vault.mjs')
 
-  process.stderr.write('signing in…\n')
+  if (!quiet) process.stderr.write('signing in…\n')
   const { accessToken, refreshToken, expiresAt } = await signIn({
     apiBaseUrl: cfg.apiBaseUrl,
     supabaseUrl: cfg.supabaseUrl,
@@ -179,7 +180,7 @@ async function authAndUnlock(cfg) {
     allowLegacyLogin: cfg.allowLegacyLogin === true,
   })
 
-  process.stderr.write('unlocking vault…\n')
+  if (!quiet) process.stderr.write('unlocking vault…\n')
   const rootKey = await fetchAndUnlockVault({
     apiBaseUrl: cfg.apiBaseUrl,
     accessToken,
@@ -216,6 +217,9 @@ async function chooseAuth() {
       )
     }
     return { agent: null }
+  }
+  if (agent && !agent.networkDeadlines) {
+    throw new Error('Your agent is from an earlier CLI version. Run sf logout, then sf login to start the upgraded agent.')
   }
   return { agent }
 }
@@ -443,6 +447,39 @@ function printPushSummary(summary) {
 }
 
 
+async function cmdDoctor(flags) {
+  const { runDoctor } = await import('./doctor.mjs')
+  let report
+  let rootKey
+  try {
+    const agent = envCredentialsSet() ? null : await runningAgent()
+    if (agent?.networkDeadlines) {
+      const { request } = await import('./agent/client.mjs')
+      report = await request('doctor', {}, { timeoutMs: 9 * 60_000 })
+    } else {
+      const { createSessionTokens } = await import('./sync.mjs')
+      report = await runDoctor({
+        apiBaseUrl: backendConfig().apiBaseUrl,
+        getSession: envCredentialsSet() ? async () => {
+          const session = await authAndUnlock(readLiveConfig(flags), { quiet: true })
+          rootKey = session.rootKey
+          return {
+            rootKey,
+            accessToken: createSessionTokens({ ...session, refresh: session.refreshSession }),
+          }
+        } : undefined,
+      })
+      if (agent) report.push('FAIL Agent version (run sf logout, then sf login)')
+    }
+  } catch {
+    report = ['FAIL Doctor (agent unavailable or diagnostic deadline reached)']
+  } finally {
+    rootKey?.fill(0)
+  }
+  process.stdout.write(report.join('\n') + '\n')
+  if (report.some((line) => line.startsWith('FAIL '))) process.exitCode = 1
+}
+
 async function cmdPush(folder, flags) {
   try {
     await pushFolder(folder, flags)
@@ -494,21 +531,30 @@ async function pushFolder(folder, flags) {
     }
     const { request } = await import('./agent/client.mjs')
     process.stderr.write(`pushing to account ${agent.account} through the agent\n`)
+    const { storageFailureLimit } = await import('./upload.mjs')
+    const storageFailures = storageFailureLimit()
     const files = []
     for await (const file of filesIn(resolve(folder), pushListOptions(flags))) files.push(file)
     let differs = 0
     let uploaded = 0
+    let stoppedBy
     process.stderr.write(`Starting uploads: 0/${files.length} files uploaded.\n`)
     for (const { name, path } of files) {
       let result
       try {
-        result = await request('upload', { path }, { timeoutMs: 0 })
+        result = await request('upload', { path, progress: true }, {
+          timeoutMs: 0,
+          onProgress: (message) => process.stderr.write(`${name}: ${message}\n`),
+        })
       } catch (err) {
-        if (err.code !== 'empty_file_unsupported') throw err
-        process.stdout.write(`skipped ${name}: ${err.message}\n`)
+        if (['session_revoked', 'locked', 'agent_unavailable'].includes(err.code)) throw err
+        process.stderr.write(`${err.code === 'empty_file_unsupported' ? 'skipped' : 'failed'} ${name}: ${err.message}\n`)
         differs++
+        stoppedBy = storageFailures.record(err)
+        if (stoppedBy) break
         continue
       }
+      storageFailures.record()
       if (result.matchesFileNow) {
         uploaded++
         process.stdout.write(`[${uploaded}/${files.length}] pushed ${name}\n`)
@@ -523,6 +569,7 @@ async function pushFolder(folder, flags) {
     // Non-zero so a script does not treat a file whose current contents are not
     // in the vault as pushed.
     process.stderr.write(`push summary: ${uploaded}/${files.length} files uploaded, ${differs} changed or skipped\n`)
+    if (stoppedBy) throw stoppedBy
     if (differs) process.exitCode = 2
     return
   }
@@ -594,8 +641,8 @@ async function cmdThumbnails(folder, flags) {
     process.stderr.write(`adding previews for account ${agent.account} through the agent; prints a summary at the end\n`)
     const s = await request(
       'thumbnails',
-      { folder: resolve(folder), media: flags.media === true, vaultFolder: typeof flags['vault-folder'] === 'string' ? flags['vault-folder'] : null, dryRun: flags['dry-run'] === true },
-      { timeoutMs: 0 },
+      { folder: resolve(folder), media: flags.media === true, vaultFolder: typeof flags['vault-folder'] === 'string' ? flags['vault-folder'] : null, dryRun: flags['dry-run'] === true, progress: true },
+      { timeoutMs: 0, onProgress: (message) => process.stderr.write(`${message}\n`) },
     )
     printThumbnailSummary(s, flags)
     return
@@ -736,7 +783,10 @@ async function syncViaAgent(folder, { watch, intervalMs }, agent) {
     do {
       let summary
       try {
-        summary = await request('sync', { folder }, { timeoutMs: 0 })
+        summary = await request('sync', { folder, progress: true }, {
+          timeoutMs: 0,
+          onProgress: (message) => process.stderr.write(`${message}\n`),
+        })
       } catch (err) {
         if (err instanceof AgentUnavailableError || err.code === 'locked') {
           throw new Error('The agent was locked or logged out. Run sf login to continue.')
@@ -750,6 +800,8 @@ async function syncViaAgent(folder, { watch, intervalMs }, agent) {
           (summary.failed ? `, ${summary.failed} failed` : '') +
           '\n',
       )
+      if (summary.stoppedBy) throw new Error(summary.stoppedBy)
+      if (!watch && summary.failed) process.exitCode = 2
       if (!watch || controller.signal.aborted) break
       await new Promise((r) => {
         const timer = setTimeout(r, intervalMs)
@@ -846,6 +898,8 @@ async function main() {
     await cmdLogin(flags)
   } else if (cmd === 'status') {
     await cmdStatus()
+  } else if (cmd === 'doctor') {
+    await cmdDoctor(flags)
   } else if (cmd === 'logout') {
     await cmdLogout(flags)
   } else if (cmd === 'encrypt') {

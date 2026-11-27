@@ -105,6 +105,7 @@ sf status                                    is an agent running, and for which 
 sf logout [--everywhere]                     revoke the session and stop the agent; --everywhere signs out every device
 sf push <folder> [--include-dotfiles]        copy a whole folder tree into a new vault folder; rerun to resume
                  [--media] [--no-thumbnails] into Media instead; skip encrypted previews
+sf doctor                                    check API, clock, and storage connectivity
 sf sync <folder> [--watch] [--interval=N]    upload new/changed files; --watch keeps a poll loop (N seconds, default 5)
 sf verify <file>...                          report whether each file is safely stored in your vault
 sf encrypt <folder>                          encrypt each file locally, upload nothing (no account needed)
@@ -185,6 +186,16 @@ With an agent running, `sf sync` records uploads in the agent's ledger (see
 manifest in the target folder that records what has already been uploaded (by
 size and mtime), so unchanged files are skipped and an interrupted run does not
 re-upload everything; `sf verify` needs the agent.
+
+### Diagnosing storage failures
+
+Run `sf doctor` on the machine that uploads. It checks API reachability, clock
+skew, and storage DNS and TLS. With a signed-in session, it uploads one tiny
+encrypted test file and deletes it. You can share the report without sharing
+credentials or file names.
+
+After upgrading from 0.6.4, run `sf logout` and `sf login` if the CLI reports
+that an earlier agent is still running.
 
 ## Running the live commands
 

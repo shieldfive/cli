@@ -16,6 +16,7 @@
 // already have one. Previews are sent in batches when the server accepts them
 // (one at a time otherwise), and 429s are waited out.
 
+import { MAX_RETRY_DELAY_MS } from './network.mjs'
 import { createHash } from 'node:crypto'
 import { lstat, mkdir, open, readdir, readFile, rename } from 'node:fs/promises'
 import { homedir } from 'node:os'
@@ -201,9 +202,9 @@ async function sendPreviews({ apiBaseUrl, accessToken, items, state, onWait }) {
         return await apiJson(apiBaseUrl, accessToken, '/api/files/thumbnail', { method: 'POST', body })
       } catch (err) {
         if (err?.status === 409) return { exists: true }
-        const transient = err?.status === 429 || err?.status === undefined || err?.status >= 500
+        const transient = err?.status === 408 || err?.status === 429 || err?.uploadNetworkError || err?.status >= 500
         if (!transient || attempt >= 8) throw err
-        const wait = err?.status === 429 ? Math.max(err.retryAfterMs ?? 0, 20_000) : 2000 * attempt
+        const wait = err?.status === 429 ? Math.min(MAX_RETRY_DELAY_MS, Math.max(err.retryAfterMs ?? 0, 20_000)) : 2000 * attempt
         onWait?.(err, wait)
         await sleep(wait)
       }
@@ -218,7 +219,7 @@ async function sendPreviews({ apiBaseUrl, accessToken, items, state, onWait }) {
         return outcome
       }
     } catch (err) {
-      if (err?.status !== 400) throw err
+      if (err?.status !== 400) return new Map(items.map(({ fileId }) => [fileId, err.message]))
     }
     state.batch = false // an older server: one at a time from here on
   }
@@ -227,8 +228,7 @@ async function sendPreviews({ apiBaseUrl, accessToken, items, state, onWait }) {
       const res = await post(it)
       outcome.set(it.fileId, res?.exists ? 'exists' : 'ok')
     } catch (err) {
-      if (err?.status === 404 || err?.status === 400) outcome.set(it.fileId, 'failed')
-      else throw err
+      outcome.set(it.fileId, err.message)
     }
   }
   return outcome
@@ -281,7 +281,7 @@ export async function runBackfill({
       else if (o === 'exists') summary.exists += 1
       else {
         summary.failed += 1
-        log(`failed ${name}`)
+        log(`failed ${name}: ${o}`)
         continue
       }
       done.add(fileId)

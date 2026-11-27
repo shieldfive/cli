@@ -17,6 +17,7 @@ import {
   encryptThumbnail,
   makeThumbnail,
   mediaKindOf,
+  thumbnailSupport,
   THUMBNAIL_MAX_BYTES,
   THUMBNAIL_MAX_SIDE,
 } from '../src/thumbnail.mjs'
@@ -106,6 +107,21 @@ test('video poster via ffmpeg', { skip: !hasFfmpeg && 'ffmpeg not on PATH' }, as
   if (sharp) {
     const meta = await jpegSize(out)
     assert.deepEqual([meta.width, meta.height], [512, 288])
+  }
+})
+
+test('a hung ffmpeg probe falls back without blocking preview detection', {
+  skip: process.platform === 'win32', timeout: 10_000,
+}, async () => {
+  const bin = join(dir, 'ffmpeg')
+  await writeFile(bin, '#!/bin/sh\nsleep 60 &\nwait\n', { mode: 0o700 })
+  const previous = process.env.SF_FFMPEG
+  process.env.SF_FFMPEG = bin
+  try {
+    assert.deepEqual(await thumbnailSupport(), { image: Boolean(sharp), video: false })
+  } finally {
+    if (previous === undefined) delete process.env.SF_FFMPEG
+    else process.env.SF_FFMPEG = previous
   }
 })
 
@@ -212,6 +228,26 @@ test('push --media creates the Media folder when the account has none; --no-thum
   assert.equal(uploads.find((u) => u.name === 'a.jpg').folderId, top.id)
   assert.equal(made, 0)
   assert.ok(uploads.every((u) => u.thumbnail === null))
+})
+
+test('push continues when preview generation throws and reports it once', async () => {
+  mediaServer()
+  const src = await mediaSource()
+  const notes = []
+  const summary = await runPush({
+    source: src, apiBaseUrl: 'https://x.test', accessToken: 't', rootKey, account: 'a@x', media: true,
+    statePath: join(dir, 'state.json'),
+    thumbnailSupportFn: async () => ({ image: true, video: true }),
+    makeThumbnailFn: async () => { throw new Error('encoder failed') },
+    uploadFn: async ({ rowId, thumbnail }) => {
+      assert.equal(thumbnail, null)
+      return { fileId: rowId }
+    },
+    ...quiet,
+    status: (line) => notes.push(line),
+  })
+  assert.equal(summary.uploaded, 3)
+  assert.equal(notes.filter((line) => line.startsWith('note:')).length, 1)
 })
 
 test('push without --media still makes a Drive folder named after the source', async () => {

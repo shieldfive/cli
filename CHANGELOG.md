@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## 0.6.5
+
+- Upload requests and cancellation have deadlines and bounded retries.
+  Push and sync report failed files and stop after three consecutive storage
+  failures. The error includes the upload step, storage host, and error code.
+- `sf doctor` checks API reachability, clock skew, storage DNS and TLS, and
+  completes and deletes a tiny encrypted test upload.
+- Timed-out preview encoders release the upload worker so the file can upload.
+
 ## 0.6.4
 
 - Tree and Media pushes through the sign-in agent show scan, folder preparation,
