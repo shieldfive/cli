@@ -218,7 +218,7 @@ async function chooseAuth() {
     }
     return { agent: null }
   }
-  if (agent && !agent.networkDeadlines) {
+  if (agent && !agent.storageAddressFamilies) {
     throw new Error('Your agent is from an earlier CLI version. Run sf logout, then sf login to start the upgraded agent.')
   }
   return { agent }
@@ -235,7 +235,7 @@ async function launchAgent({ session, rootKey, config, idleMs }) {
   const env = {}
   for (const name of [
     'PATH', 'HOME', 'USER', 'LOGNAME', 'LANG',
-    'SF_API_BASE_URL', 'SF_SUPABASE_URL', 'SF_SUPABASE_ANON_KEY',
+    'SF_API_BASE_URL', 'SF_SUPABASE_URL', 'SF_SUPABASE_ANON_KEY', 'SF_STORAGE_IPV4',
     'HTTPS_PROXY', 'HTTP_PROXY', 'NO_PROXY', 'NODE_EXTRA_CA_CERTS',
   ]) {
     if (process.env[name]) env[name] = process.env[name]
@@ -453,7 +453,7 @@ async function cmdDoctor(flags) {
   let rootKey
   try {
     const agent = envCredentialsSet() ? null : await runningAgent()
-    if (agent?.networkDeadlines) {
+    if (agent?.storageAddressFamilies) {
       const { request } = await import('./agent/client.mjs')
       report = await request('doctor', {}, { timeoutMs: 9 * 60_000 })
     } else {

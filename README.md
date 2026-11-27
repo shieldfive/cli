@@ -190,16 +190,15 @@ re-upload everything; `sf verify` needs the agent.
 ### Diagnosing storage failures
 
 Run `sf doctor` on the machine that uploads. It checks API reachability, clock
-skew, and storage DNS and TLS for each resolved IPv4 and IPv6 address. With
-a signed-in session, it uploads one tiny
-encrypted test file and deletes it. You can share the report without sharing
+skew, and storage DNS and TLS for each resolved IPv4 and IPv6 address. With a
+signed-in session, it uploads one tiny encrypted test file and deletes it. You can share the report without sharing
 credentials or file names.
 
 If IPv4 TLS passes and IPv6 TLS times out, the storage client can fall back to
 IPv4. To force IPv4 for storage, run `sf logout` and then
 `SF_STORAGE_IPV4=1 sf login`.
 
-After upgrading from 0.6.4, run `sf logout` and `sf login` if the CLI reports
+After upgrading, run `sf logout` and `sf login` if the CLI reports
 that an earlier agent is still running.
 
 ## Running the live commands

@@ -320,6 +320,7 @@ export function createAgent({
         return {
           unlocked: !stopping,
           networkDeadlines: true,
+          storageAddressFamilies: true,
           account: session.userId,
           idleLocksInSec: Math.max(0, Math.round((idleDeadline - now()) / 1000)),
           pid: process.pid,
