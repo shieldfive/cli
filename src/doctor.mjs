@@ -1,8 +1,9 @@
 import { randomUUID } from 'node:crypto'
-import { lookup } from 'node:dns/promises'
+import { lookup, Resolver } from 'node:dns/promises'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { isIP } from 'node:net'
 import { connect } from 'node:tls'
 import { _internals } from './migrate.mjs'
 import { networkCode, networkRequest } from './network.mjs'
@@ -15,18 +16,30 @@ const MAX_CLOCK_SKEW_MS = 120_000
 async function checkDns(hostname) {
   let timer
   try {
-    await Promise.race([
-      lookup(hostname),
+    const addresses = await Promise.race([
+      lookup(hostname, { all: true }),
       new Promise((_, reject) => {
         timer = setTimeout(() => reject(Object.assign(new Error(), { code: 'ETIMEDOUT' })), PROBE_TIMEOUT_MS)
       }),
     ])
+    clearTimeout(timer)
+    if (isIP(hostname)) return addresses
+    // getaddrinfo can suppress AAAA records on a machine with no IPv6
+    // route. Query DNS for any missing family so the probe exposes that.
+    const resolver = new Resolver({ timeout: 2000, tries: 1 })
+    const missing = [4, 6].filter((family) => !addresses.some((entry) => entry.family === family))
+    const extra = await Promise.all(missing.map(async (family) => {
+      const records = await (family === 4 ? resolver.resolve4(hostname) : resolver.resolve6(hostname))
+        .catch(() => [])
+      return records.map((address) => ({ address, family }))
+    }))
+    return [...addresses, ...extra.flat()]
   } finally {
     clearTimeout(timer)
   }
 }
 
-function checkTls(url) {
+function checkTls(url, { address, family }) {
   return new Promise((resolve, reject) => {
     if (url.protocol !== 'https:') {
       reject(Object.assign(new Error(), { code: 'TLS_REQUIRED' }))
@@ -34,8 +47,8 @@ function checkTls(url) {
     }
     const hostname = url.hostname.replace(/^\[|\]$/g, '')
     const socket = connect({
-      host: hostname, port: Number(url.port || 443),
-      servername: hostname.includes(':') || /^\d+\.\d+\.\d+\.\d+$/.test(hostname) ? undefined : hostname,
+      host: address, family, port: Number(url.port || 443),
+      servername: isIP(hostname) ? undefined : hostname,
       signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
     })
     socket.once('error', reject)
@@ -78,7 +91,7 @@ export async function runDoctor({
   }
   if (!session) {
     if (!report.some((line) => line.startsWith('FAIL Sign-in'))) fail('Sign-in', 'run sf login and retry')
-    for (const label of ['Storage DNS', 'Storage TLS', 'Test upload', 'Delete test upload']) skip(label)
+    for (const label of ['Storage DNS', 'Storage TLS IPv4', 'Storage TLS IPv6', 'Test upload', 'Delete test upload']) skip(label)
     return report
   }
 
@@ -115,17 +128,32 @@ export async function runDoctor({
         beforeStorage: async (url) => {
           if (host !== url.host) {
             host = url.host
+            let addresses
             try {
-              await dnsCheck(url.hostname.replace(/^\[|\]$/g, ''))
+              addresses = await dnsCheck(url.hostname.replace(/^\[|\]$/g, ''))
               pass('Storage DNS', host)
             } catch (err) {
               fail('Storage DNS', `${networkCode(err)}, ${host}`)
             }
-            try {
-              await tlsCheck(url)
-              pass('Storage TLS', host)
-            } catch (err) {
-              fail('Storage TLS', `${networkCode(err)}, ${host}`)
+            const probes = await Promise.all((addresses ?? []).map(async (entry) => {
+              try {
+                await tlsCheck(url, entry)
+                return entry
+              } catch (err) {
+                return { ...entry, error: networkCode(err) }
+              }
+            }))
+            const reachable = probes.some(({ error }) => !error)
+            for (const family of [4, 6]) {
+              const label = `Storage TLS IPv${family}`
+              const results = probes.filter((probe) => probe.family === family)
+              if (!results.length) skip(label)
+              for (const { address, error } of results) {
+                const target = `${host}, ${address}`
+                if (!error) pass(label, target)
+                else if (reachable) report.push(`WARN ${label} (${error}, ${target})`)
+                else fail(label, `${error}, ${target}`)
+              }
             }
           }
           step = 'Send storage part'
@@ -139,7 +167,8 @@ export async function runDoctor({
   } catch (err) {
     if (!host) {
       skip('Storage DNS')
-      skip('Storage TLS')
+      skip('Storage TLS IPv4')
+      skip('Storage TLS IPv6')
     }
     fail(`Test upload / ${step}`, detail(err))
   } finally {

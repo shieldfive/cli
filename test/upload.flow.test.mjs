@@ -547,7 +547,7 @@ test('signed multipart refreshes credentials across storage and allocation fault
   t.mock.method(globalThis, 'fetch', async (input, init) => {
     const url = new URL(input)
     if (url.pathname === '/api/files/create-upload-session') {
-      assert.equal(JSON.parse(init.body).vaultS3Multipart, true)
+      assert.equal(JSON.parse(init.body).vaultS3Multipart, false)
       return Response.json({
         uploadKind: 's3-multipart', fileId: FILE_ID, b2FileId: 'storage-id', chunkSize: 8,
         framesPerPart: 1, proofKey: PROOF_KEY,

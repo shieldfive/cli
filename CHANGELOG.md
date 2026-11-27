@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## 0.6.6
+
+- Restore the native multipart upload path with file-scoped credentials.
+- Enable IPv4 and IPv6 connection fallback for storage requests. Set
+  `SF_STORAGE_IPV4=1` when signing in to use IPv4 for storage connections.
+- Report each IPv4 and IPv6 address and its TLS probe result in `sf doctor`.
+
 ## 0.6.5
 
 - Upload requests and cancellation have deadlines and bounded retries.

@@ -14,6 +14,7 @@ import { constants as fsConstants } from 'node:fs'
 import { open } from 'node:fs/promises'
 import { createHash, webcrypto } from 'node:crypto'
 
+import { Agent } from 'undici'
 import { encryptNameV6 } from '@shieldfive/crypto/vault'
 import { makeThumbnail, thumbnailFields } from './thumbnail.mjs'
 import { MAX_RETRY_DELAY_MS, STORAGE_REQUEST_TIMEOUT_MS, networkRequest, readJson, resolveToken } from './network.mjs'
@@ -223,7 +224,9 @@ export async function createUploadSession({
   // Replays of this row ID must carry the same encrypted name and wrapped key.
   const payload = JSON.stringify({
     clientUploadId: rowId,
-    vaultS3Multipart: true,
+    // Use file-scoped native B2 credentials for multipart. The regional
+    // S3 endpoint can be unreachable even when B2's upload pods work.
+    vaultS3Multipart: false,
     name_encrypted: JSON.stringify(nameEnvelopeV6),
     nameHash: hashMetadataV4(name.toLowerCase(), rootKeyB64),
     csk_wrapped: cskEnvelope.wrapped,
@@ -305,11 +308,17 @@ const STORAGE_CODES = new Set([
   'bad_auth_token', 'expired_auth_token', 'too_busy', 'unauthorized',
 ])
 
+const storageDispatcher = new Agent({
+  connect: process.env.SF_STORAGE_IPV4 === '1'
+    ? { family: 4 }
+    : { autoSelectFamily: true, autoSelectFamilyAttemptTimeout: 250 },
+})
+
 async function sendStorage(url, init, operation) {
   const host = new URL(url).host
   let res
   try {
-    res = await networkRequest(url, { ...init, redirect: 'error' }, operation, STORAGE_REQUEST_TIMEOUT_MS)
+    res = await networkRequest(url, { ...init, redirect: 'error', dispatcher: storageDispatcher }, operation, STORAGE_REQUEST_TIMEOUT_MS)
   } catch (err) {
     err.storageFailure = true
     throw err
