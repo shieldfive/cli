@@ -26,6 +26,7 @@ import { basename, join, relative, resolve, sep } from 'node:path'
 import { encryptNameV6 } from '@shieldfive/crypto/vault'
 
 import {
+  API_REQUEST_TIMEOUT_MS,
   EmptyFileUnsupportedError,
   isRetryableStatus,
   newRowBoundId,
@@ -178,17 +179,17 @@ export async function saveState(statePath, state) {
 async function apiJson(apiBaseUrl, accessToken, path, { method = 'GET', body } = {}) {
   const res = await fetch(new URL(path, apiBaseUrl), {
     method,
+    signal: AbortSignal.timeout(API_REQUEST_TIMEOUT_MS),
     headers: {
       Authorization: `Bearer ${await resolveToken(accessToken)}`,
       ...(body ? { 'Content-Type': 'application/json' } : {}),
     },
     body: body ? JSON.stringify(body) : undefined,
   })
-  const json = await res.json().catch(() => ({}))
   if (!res.ok) {
-    throw responseError(`${method} ${path}`, res, json)
+    throw responseError(`${method} ${path}`, res, await res.json().catch(() => ({})))
   }
-  return json
+  return res.json()
 }
 
 export function isTransient(err) {
@@ -196,6 +197,7 @@ export function isTransient(err) {
     // Network / transport failures only (fetch throws TypeError 'fetch failed').
     return (
       err?.name === 'TypeError' ||
+      err?.name === 'TimeoutError' ||
       err?.uploadNetworkError === true ||
       /fetch failed|ECONNRESET|ETIMEDOUT|EPIPE|ENOTFOUND|EAI_AGAIN|socket|network/i.test(err?.message ?? '')
     )
@@ -355,6 +357,7 @@ export async function runPush({
   status = (m) => process.stderr.write(`${m}\n`),
   signal,
   progressEveryMs = 10_000,
+  progress = status,
 }) {
   source = resolve(source)
   // Notes worth showing even where progress lines are not (through the agent).
@@ -367,9 +370,10 @@ export async function runPush({
     }
   }
   const rootKeyB64 = bytesToBase64(rootKey)
+  progress('Scanning local folders and files…')
   const scan = await scanTree(source, { includeDotfiles })
   const totalBytes = scan.files.reduce((s, f) => s + f.size, 0)
-  status(
+  progress(
     `found ${scan.files.length} files (${fmtBytes(totalBytes)}) in ${scan.dirs.length} folders` +
       (scan.skipped.dotfiles.length ? `; skipping ${scan.skipped.dotfiles.length} hidden (use --include-dotfiles to send them)` : '') +
       (scan.skipped.symlinks.length ? `; skipping ${scan.skipped.symlinks.length} symlinks` : '') +
@@ -530,15 +534,28 @@ export async function runPush({
     )
   }
 
+  progress(`Preparing ${scan.dirs.length + 1} vault folders…`)
   const topCreated = await ensure('', basename(source), null)
   if (media) status(topCreated ? 'created your Media folder; uploading into it' : 'uploading into Media')
   else status(`${topCreated ? 'created' : 'resuming into'} vault folder "${vaultName(basename(source))}"`)
   let foldersCreated = 0
+  let checkedFolders = 0
+  let lastProgress = Date.now()
   for (const rel of scan.dirs) {
+    if (signal?.aborted) break
     const cut = rel.lastIndexOf('/')
     const parent = folderIds.get(cut === -1 ? '' : rel.slice(0, cut))
     if (await ensure(rel, cut === -1 ? rel : rel.slice(cut + 1), parent)) foldersCreated += 1
+    checkedFolders++
+    if (progressEveryMs && Date.now() - lastProgress >= progressEveryMs) {
+      progress(`Prepared ${checkedFolders}/${scan.dirs.length} subfolders`)
+      lastProgress = Date.now()
+    }
   }
+
+  const summary = { notes, total: scan.files.length, uploaded: 0, alreadyThere: 0, failed: [], changed: [], skippedEmpty: [], bytesUploaded: 0, foldersCreated, stoppedBy: null, interrupted: false }
+  const interrupted = () => ({ ...summary, interrupted: true, notStarted: summary.total - summary.alreadyThere })
+  if (signal?.aborted) return interrupted()
 
   // Settle uploads a previous run started but may not have seen finish.
   const pendingEntries = Object.entries(state.pending)
@@ -551,7 +568,6 @@ export async function runPush({
     await save()
   }
 
-  const summary = { notes, uploaded: 0, alreadyThere: 0, failed: [], changed: [], skippedEmpty: [], bytesUploaded: 0, foldersCreated, stoppedBy: null, interrupted: false }
   const todo = []
   for (const f of scan.files) {
     const done = state.files[f.rel]
@@ -572,7 +588,15 @@ export async function runPush({
   if (byDir.size) {
     const { decryptStoredName } = await import('./thumbnailBackfill.mjs')
     const found = new Set()
+    let checked = 0
+    progress(`Checking existing uploads in ${byDir.size} vault folders…`)
     for (const [dirRel, files] of byDir) {
+      if (signal?.aborted) return interrupted()
+      if (progressEveryMs && Date.now() - lastProgress >= progressEveryMs) {
+        progress(`Checked ${checked}/${byDir.size} vault folders for existing uploads`)
+        lastProgress = Date.now()
+      }
+      checked++
       const { id, key } = folderIds.get(dirRel)
       const vault = new Map()
       // By keyed name hash and plaintext size: no decrypting. Older servers
@@ -631,7 +655,8 @@ export async function runPush({
     }
   }
   const todoBytes = todo.reduce((s, f) => s + f.size, 0)
-  status(`uploading ${todo.length} files (${fmtBytes(todoBytes)}), ${concurrency} at a time`)
+  const counts = () => `${summary.uploaded}/${summary.total} files uploaded (${summary.alreadyThere} already in the vault, ${summary.failed.length} failed)`
+  progress(`Starting uploads: ${counts()}. ${todo.length} queued, up to ${concurrency} at a time.`)
 
   let inFlightBytes = 0
   let completed = 0
@@ -640,8 +665,8 @@ export async function runPush({
     ? setInterval(() => {
         const secs = (Date.now() - started) / 1000
         const sent = summary.bytesUploaded + inFlightBytes
-        status(
-          `progress: ${completed}/${todo.length} files, ${fmtBytes(sent)} of ${fmtBytes(todoBytes)}` +
+        progress(
+          `progress: ${counts()}, ${fmtBytes(sent)} of ${fmtBytes(todoBytes)}` +
             (secs > 0 ? `, ${fmtBytes(sent / secs)}/s` : ''),
         )
       }, progressEveryMs)
@@ -748,7 +773,11 @@ export async function runPush({
   const worker = async () => {
     while (!stopping() && next < todo.length) {
       const f = todo[next++]
-      await uploadOne(f)
+      try {
+        await uploadOne(f)
+      } catch (err) {
+        summary.stoppedBy ??= err
+      }
     }
   }
   try {
@@ -758,6 +787,7 @@ export async function runPush({
   }
   summary.interrupted = Boolean(signal?.aborted)
   summary.notStarted = todo.length - next
+  progress(counts())
   return summary
 }
 

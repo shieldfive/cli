@@ -114,6 +114,7 @@ export function parseRequest(line) {
           media: args.media === true,
           includeDotfiles: args.includeDotfiles === true,
           thumbnails: args.thumbnails !== false,
+          ...(args.progress === true ? { progress: true } : {}),
         },
       }
     case 'tidy':

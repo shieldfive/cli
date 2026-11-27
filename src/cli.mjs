@@ -411,18 +411,23 @@ async function cmdLogout(flags) {
 
 // login -> unlock -> encrypt -> upload every file in the folder, once.
 function printPushSummary(summary) {
-  for (const f of summary.failed ?? []) process.stdout.write(`failed ${f.rel}: ${f.message}\n`)
+  const failed = summary.failedCount ?? summary.failed.length
+  const changed = summary.changedCount ?? summary.changed.length
+  const skippedEmpty = summary.skippedEmptyCount ?? summary.skippedEmpty.length
+  if (summary.failedCount !== undefined && failed) {
+    process.stderr.write(`example upload failure: ${summary.failed[0]?.message}\n`)
+  }
   const fmt = (n) => `${(n / 1e9).toFixed(2)} GB`
   process.stderr.write(
-    `done: ${summary.uploaded} uploaded (${fmt(summary.bytesUploaded)}), ` +
+    `push summary: ${summary.uploaded}${summary.total == null ? '' : `/${summary.total}`} files uploaded (${fmt(summary.bytesUploaded)}), ` +
       `${summary.alreadyThere} already there, ${summary.foldersCreated} folders created` +
-      (summary.failed.length ? `, ${summary.failed.length} failed` : '') +
-      (summary.changed.length ? `, ${summary.changed.length} changed while uploading` : '') +
-      (summary.skippedEmpty.length ? `, ${summary.skippedEmpty.length} empty skipped` : '') +
+      (failed ? `, ${failed} failed` : '') +
+      (changed ? `, ${changed} changed while uploading` : '') +
+      (skippedEmpty ? `, ${skippedEmpty} empty skipped` : '') +
       '\n',
   )
   if (summary.stoppedBy) {
-    process.stderr.write(`stopped: ${summary.stoppedBy.message}\n`)
+    process.stderr.write(`stopped: ${summary.stoppedBy.message}\nRun the same command again to resume.\n`)
     process.exitCode = 1
     return
   }
@@ -431,7 +436,7 @@ function printPushSummary(summary) {
     process.exitCode = 130
     return
   }
-  if (summary.failed.length || summary.changed.length || summary.skippedEmpty.length) {
+  if (failed || changed || skippedEmpty) {
     process.stderr.write('some files are not in the vault; run the same command again to retry them\n')
     process.exitCode = 2
   }
@@ -439,6 +444,17 @@ function printPushSummary(summary) {
 
 
 async function cmdPush(folder, flags) {
+  try {
+    await pushFolder(folder, flags)
+  } catch (err) {
+    const interrupted = err.code === 'interrupted'
+    process.stderr.write(`push summary: ${interrupted ? 'interrupted' : 'stopped'} (${err.message})\n`)
+    if (!interrupted) process.stderr.write('Run the same command again to resume.\n')
+    process.exitCode = interrupted ? 130 : 1
+  }
+}
+
+async function pushFolder(folder, flags) {
   const { agent } = await chooseAuth()
   if (agent) {
     const { readdir: readDir } = await import('node:fs/promises')
@@ -447,27 +463,43 @@ async function cmdPush(folder, flags) {
     if (tree) {
       const { request } = await import('./agent/client.mjs')
       process.stderr.write(
-        `pushing ${flags.media === true ? 'into Media' : 'the folder tree'} for account ${agent.account} through the agent; ` +
-          'this can take a long time and prints a summary at the end\n',
+        `pushing ${flags.media === true ? 'into Media' : 'the folder tree'} through the agent\n`,
       )
-      const summary = await request(
-        'push',
-        {
-          folder: resolve(folder),
-          media: flags.media === true,
-          includeDotfiles: flags['include-dotfiles'] === true,
-          thumbnails: flags['no-thumbnails'] !== true && process.env.SF_NO_THUMBNAILS !== '1',
-        },
-        { timeoutMs: 0 },
-      )
+      const controller = new AbortController()
+      const interrupt = () => controller.abort()
+      process.once('SIGINT', interrupt)
+      let summary
+      try {
+        summary = await request(
+          'push',
+          {
+            folder: resolve(folder),
+            media: flags.media === true,
+            includeDotfiles: flags['include-dotfiles'] === true,
+            thumbnails: flags['no-thumbnails'] !== true && process.env.SF_NO_THUMBNAILS !== '1',
+            progress: true,
+          },
+          {
+            timeoutMs: 0,
+            signal: controller.signal,
+            onProgress: (message) => process.stderr.write(`${message}\n`),
+          },
+        )
+      } finally {
+        process.off('SIGINT', interrupt)
+      }
       for (const n of summary.notes ?? []) process.stderr.write(`${n}\n`)
       printPushSummary(summary)
       return
     }
     const { request } = await import('./agent/client.mjs')
     process.stderr.write(`pushing to account ${agent.account} through the agent\n`)
+    const files = []
+    for await (const file of filesIn(resolve(folder), pushListOptions(flags))) files.push(file)
     let differs = 0
-    for await (const { name, path } of filesIn(resolve(folder), pushListOptions(flags))) {
+    let uploaded = 0
+    process.stderr.write(`Starting uploads: 0/${files.length} files uploaded.\n`)
+    for (const { name, path } of files) {
       let result
       try {
         result = await request('upload', { path }, { timeoutMs: 0 })
@@ -478,7 +510,8 @@ async function cmdPush(folder, flags) {
         continue
       }
       if (result.matchesFileNow) {
-        process.stdout.write(`pushed ${name}\n`)
+        uploaded++
+        process.stdout.write(`[${uploaded}/${files.length}] pushed ${name}\n`)
       } else {
         differs++
         process.stdout.write(
@@ -489,6 +522,7 @@ async function cmdPush(folder, flags) {
     }
     // Non-zero so a script does not treat a file whose current contents are not
     // in the vault as pushed.
+    process.stderr.write(`push summary: ${uploaded}/${files.length} files uploaded, ${differs} changed or skipped\n`)
     if (differs) process.exitCode = 2
     return
   }

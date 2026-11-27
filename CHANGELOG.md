@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## 0.6.4
+
+- Tree and Media pushes through the sign-in agent show scan, folder preparation,
+  existing-file checks, upload totals, and a final summary. Large failure
+  summaries no longer overflow the agent socket.
+- An interrupted push stops scheduling new uploads. Rerun the same command
+  to resume after in-flight uploads settle.
+
 ## 0.6.3
 
 - `sf push` no longer stops itself at 10,000 folders: the limit depends on

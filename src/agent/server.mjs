@@ -113,6 +113,7 @@ export function createAgent({
   let server = null
   let idleTimer = null
   let inFlight = 0
+  const activePushes = new Set()
   let stopping = null
   let idleDeadline = 0
 
@@ -303,7 +304,7 @@ export function createAgent({
     return { uploaded, skipped, failed, changed, errors }
   }
 
-  async function handle(req) {
+  async function handle(req, { progress, signal }) {
     switch (req.op) {
       case 'status':
         return {
@@ -326,12 +327,17 @@ export function createAgent({
       case 'push':
       case 'tidy':
       case 'thumbnails': {
+        const pushKey = req.op === 'push' ? JSON.stringify([req.args.folder, req.args.media]) : null
+        if (activePushes.has(pushKey)) {
+          throw new AgentError('push_busy', 'A push is still running for this folder. Wait for its active uploads to finish.')
+        }
+        if (pushKey) activePushes.add(pushKey)
         const k = Buffer.from(key)
         const account = session.email ?? session.userId
         const quiet = () => {}
         try {
           if (req.op === 'push') {
-            const { runPush } = await import('../migrate.mjs')
+            const { defaultStatePath, runPush } = await import('../migrate.mjs')
             const s = await runPush({
               source: req.args.folder,
               apiBaseUrl: config.apiBaseUrl,
@@ -344,8 +350,20 @@ export function createAgent({
               uploadFn: (a) => uploadFile({ ...a, accessToken }),
               log: quiet,
               status: quiet,
+              progress,
+              signal,
+              statePath: defaultStatePath(req.args.folder, home, { media: req.args.media }),
             })
-            return { ...s, failed: s.failed.map((f) => ({ rel: f.rel, message: f.message ?? String(f.error?.message ?? f.error ?? '') })), stoppedBy: s.stoppedBy ? { message: s.stoppedBy.message } : null }
+            return {
+              ...s,
+              failedCount: s.failed.length,
+              changedCount: s.changed.length,
+              skippedEmptyCount: s.skippedEmpty.length,
+              failed: s.failed.slice(0, 1).map((f) => ({ rel: f.rel, message: f.message.slice(0, 500) })),
+              changed: s.changed.slice(0, 1),
+              skippedEmpty: s.skippedEmpty.slice(0, 1),
+              stoppedBy: s.stoppedBy ? { message: s.stoppedBy.message } : null,
+            }
           }
           if (req.op === 'tidy') {
             const { runTidy } = await import('../tidy.mjs')
@@ -375,6 +393,7 @@ export function createAgent({
         } catch (err) {
           throw new AgentError(err.code ?? err.serverCode ?? 'failed', err.message)
         } finally {
+          activePushes.delete(pushKey)
           k.fill(0)
         }
       }
@@ -423,7 +442,12 @@ export function createAgent({
       inFlight++
       let succeeded = false
       try {
-        reply(ok(req.id, await handle(req)))
+        const controller = new AbortController()
+        conn.once('close', () => controller.abort())
+        const progress = req.args.progress ? (message) => {
+          if (!conn.destroyed && !conn.writableNeedDrain) conn.write(encode({ id: req.id, progress: message }))
+        } : undefined
+        reply(ok(req.id, await handle(req, { progress, signal: controller.signal })))
         succeeded = true
       } catch (err) {
         reply(fail(req.id, err.code ?? 'error', err.message))
