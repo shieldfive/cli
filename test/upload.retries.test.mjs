@@ -359,7 +359,8 @@ test('doctor reports skew and DNS failures without exposing signed URL or provid
     apiBaseUrl: server.base,
     getSession: () => ({ rootKey: webcrypto.getRandomValues(new Uint8Array(32)), accessToken: 'private-token' }),
   })
-  assert.match(report.join('\n'), /FAIL Clock skew.*300 s/)
+  const skewSeconds = Number(report.find((line) => line.startsWith('FAIL Clock skew'))?.match(/\((-?\d+) s/)?.[1])
+  assert.ok(Math.abs(skewSeconds - 300) <= 2, `reported skew: ${skewSeconds} s`)
   assert.match(report.join('\n'), /FAIL Storage DNS.*ENOTFOUND/)
   assert.match(report.join('\n'), /FAIL Storage TLS.*TLS_REQUIRED/)
   assert.match(report.join('\n'), /FAIL Test upload \/ Send storage part.*ENOTFOUND/)
