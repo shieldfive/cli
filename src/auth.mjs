@@ -117,6 +117,14 @@ export async function signIn({
     throw new Error(response.status === 429 ? 'Too many sign-in attempts. Try again shortly.' : 'Sign-in failed. Check your credentials and try again.')
   }
   const supabase = createClientImpl(supabaseUrl, anonKey, {
+    global: {
+      fetch: (url, init) => fetch(url, {
+        ...init,
+        signal: init?.signal
+          ? AbortSignal.any([init.signal, AbortSignal.timeout(30_000)])
+          : AbortSignal.timeout(30_000),
+      }),
+    },
     auth: {
       persistSession: false,
       autoRefreshToken: false,
@@ -173,7 +181,7 @@ export async function refreshAccessToken({
   anonKey,
   refreshToken,
   fetchImpl = fetch,
-  signal,
+  signal = AbortSignal.timeout(30_000),
 }) {
   if (!refreshToken) {
     throw new Error('No refresh token is held. Run sf login again.')

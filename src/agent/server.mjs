@@ -11,6 +11,7 @@ import { basename, dirname, join } from 'node:path'
 
 import { refreshAccessToken, revokeSession } from '../auth.mjs'
 import { MANIFEST_NAME, scanFiles } from '../sync.mjs'
+import { storageFailureLimit } from '../upload.mjs'
 import { appendEntry, classify, deriveLedgerKey, ledgerPath, macFile, readEntries } from './ledger.mjs'
 import { ensurePrivateDir, ledgerDir } from './paths.mjs'
 import { encode, fail, lineSplitter, ok, parseRequest } from './protocol.mjs'
@@ -29,7 +30,7 @@ const STOP_NETWORK_BUDGET_MS = 5_000
 // Only these count as use for the idle lock. A status probe does no work; if it
 // counted, a shell prompt or a health check polling `sf status` would keep the
 // agent unlocked forever.
-const USE_OPS = new Set(['upload', 'sync', 'push', 'tidy', 'thumbnails', 'verify'])
+const USE_OPS = new Set(['doctor', 'upload', 'sync', 'push', 'tidy', 'thumbnails', 'verify'])
 
 class AgentError extends Error {
   constructor(code, message) {
@@ -191,7 +192,7 @@ export function createAgent({
     return Array.isArray(body.verified) ? body.verified : []
   }
 
-  async function upload(path) {
+  async function upload(path, onRetry) {
     // lstat: a symlink is refused, not followed (and readFileChunks opens with
     // O_NOFOLLOW, so a swap after this check fails too).
     const before = await lstat(path)
@@ -223,6 +224,7 @@ export function createAgent({
         name: basename(path),
         path,
         size: before.size,
+        onRetry,
         onPlaintextChunk: (chunk) => {
           hmac.update(chunk)
           streamed += chunk.length
@@ -270,7 +272,7 @@ export function createAgent({
     return { fileId, size: streamed, matchesFileNow, mac }
   }
 
-  async function sync(folder) {
+  async function sync(folder, progress) {
     const st = await stat(folder)
     if (!st.isDirectory()) throw new AgentError('not_a_directory', `${folder} is not a directory.`)
 
@@ -283,6 +285,8 @@ export function createAgent({
     let failed = 0
     let changed = 0
     const errors = []
+    const storageFailures = storageFailureLimit()
+    let stoppedBy = null
     for (const f of files) {
       assertRunning(`during sync, after uploading ${uploaded} file(s)`)
       try {
@@ -291,7 +295,8 @@ export function createAgent({
           skipped++
           continue
         }
-        const r = await upload(f.path)
+        const r = await upload(f.path, (message) => progress?.(`${f.path}: ${message}`))
+        storageFailures.record()
         uploaded++
         done.add(`${f.path}\u0000${r.mac}`)
         if (!r.matchesFileNow) changed++
@@ -299,9 +304,14 @@ export function createAgent({
         if (err.code === 'session_revoked' || err.code === 'locked') throw err
         failed++
         errors.push({ path: f.path, message: err.message })
+        const stop = storageFailures.record(err)
+        if (stop) {
+          stoppedBy = stop.message
+          break
+        }
       }
     }
-    return { uploaded, skipped, failed, changed, errors }
+    return { uploaded, skipped, failed, changed, errors, ...(stoppedBy && { stoppedBy }) }
   }
 
   async function handle(req, { progress, signal }) {
@@ -309,18 +319,28 @@ export function createAgent({
       case 'status':
         return {
           unlocked: !stopping,
+          networkDeadlines: true,
           account: session.userId,
           idleLocksInSec: Math.max(0, Math.round((idleDeadline - now()) / 1000)),
           pid: process.pid,
         }
+      case 'doctor': {
+        const { runDoctor } = await import('../doctor.mjs')
+        const rootKey = Buffer.from(key)
+        try {
+          return await runDoctor({ apiBaseUrl: config.apiBaseUrl, getSession: () => ({ accessToken, rootKey }) })
+        } finally {
+          rootKey.fill(0)
+        }
+      }
       case 'upload': {
         // The MAC stays in the ledger. A process on the socket has no use for a
         // keyed digest.
-        const { fileId, size, matchesFileNow } = await upload(req.args.path)
+        const { fileId, size, matchesFileNow } = await upload(req.args.path, progress)
         return { fileId, size, matchesFileNow }
       }
       case 'sync':
-        return sync(req.args.folder)
+        return sync(req.args.folder, progress)
       // Tree push, tidy and preview backfill run here with the agent's session,
       // so a signed-in user needs no SF_EMAIL / SF_PASSWORD. Each gets its own
       // copy of the root key, wiped when it returns.
@@ -389,6 +409,8 @@ export function createAgent({
             media: req.args.media,
             vaultFolder: req.args.vaultFolder,
             dryRun: req.args.dryRun,
+            log: progress,
+            status: progress,
           })
         } catch (err) {
           throw new AgentError(err.code ?? err.serverCode ?? 'failed', err.message)
@@ -450,7 +472,7 @@ export function createAgent({
         reply(ok(req.id, await handle(req, { progress, signal: controller.signal })))
         succeeded = true
       } catch (err) {
-        reply(fail(req.id, err.code ?? 'error', err.message))
+        reply(fail(req.id, err.storageFailure ? 'storage_failure' : (err.code ?? 'error'), err.message))
       } finally {
         inFlight--
         if (!stopping && succeeded && USE_OPS.has(req.op)) touch()

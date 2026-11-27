@@ -65,11 +65,11 @@ test('a failed upload cancels its pending session', async () => {
       () =>
         assert.rejects(
           uploadFile({ apiBaseUrl: API, accessToken: 'tok', rootKey: rootKey(), name: 'a.bin', path, size: 5, rowId: FILE_ID }),
-          { message: 'Direct upload failed (HTTP 400)' },
+          { message: 'Direct upload failed (HTTP 400) at s3.test' },
         ),
     )
   })
-  assert.deepEqual(deletes, [{ body: { ids: [FILE_ID] }, auth: 'Bearer tok' }])
+  assert.deepEqual(deletes, [{ body: { ids: [FILE_ID], preserveUploadId: true }, auth: 'Bearer tok' }])
 })
 
 test('a lost finalize answer preserves the pending row after a terminal retry', async (t) => {
@@ -224,5 +224,5 @@ test('a server that ignores clientUploadId is refused and its row cancelled', as
         ),
     )
   })
-  assert.deepEqual(deletes, [{ ids: ['957a1070-c734-4d7b-9430-27df8de29d58'] }])
+  assert.deepEqual(deletes, [{ ids: ['957a1070-c734-4d7b-9430-27df8de29d58'], preserveUploadId: true }])
 })

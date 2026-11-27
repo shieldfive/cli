@@ -11,7 +11,7 @@
 
 import { isAbsolute } from 'node:path'
 
-export const OPS = Object.freeze(['status', 'upload', 'sync', 'push', 'tidy', 'thumbnails', 'verify', 'lock', 'logout'])
+export const OPS = Object.freeze(['status', 'doctor', 'upload', 'sync', 'push', 'tidy', 'thumbnails', 'verify', 'lock', 'logout'])
 const OP_SET = new Set(OPS)
 
 export const MAX_LINE_BYTES = 1_000_000
@@ -102,9 +102,9 @@ export function parseRequest(line) {
 
   switch (op) {
     case 'upload':
-      return { id, op, args: { path: absolutePath(args.path, 'path') } }
+      return { id, op, args: { path: absolutePath(args.path, 'path'), ...(args.progress === true ? { progress: true } : {}) } }
     case 'sync':
-      return { id, op, args: { folder: absolutePath(args.folder, 'folder') } }
+      return { id, op, args: { folder: absolutePath(args.folder, 'folder'), ...(args.progress === true ? { progress: true } : {}) } }
     case 'push':
       return {
         id,
@@ -129,6 +129,7 @@ export function parseRequest(line) {
           apply: args.apply === true,
           purge: args.purge === true,
           dryRun: args.dryRun === true,
+          ...(args.progress === true ? { progress: true } : {}),
         },
       }
     case 'verify': {

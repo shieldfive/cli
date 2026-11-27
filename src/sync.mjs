@@ -19,6 +19,8 @@
 
 import { lstat, open, readFile, readdir, rename } from 'node:fs/promises'
 import { join } from 'node:path'
+import { resolveToken } from './network.mjs'
+import { storageFailureLimit } from './upload.mjs'
 
 export const MANIFEST_NAME = '.shieldfive-sync.json'
 const MANIFEST_VERSION = 1
@@ -123,12 +125,14 @@ export async function syncOnce({
   let uploaded = 0
   let failed = 0
   const errors = []
+  const storageFailures = storageFailureLimit()
+  let stoppedBy = null
 
   const tokenFor = typeof accessToken === 'function' ? accessToken : async () => accessToken
   for (const entry of toUpload) {
     // Resolve once up front so a session that cannot be refreshed stops the
     // pass here, outside the per-file isolation below.
-    await tokenFor()
+    await resolveToken(tokenFor)
     try {
       // Pass the getter so a long upload refreshes its token per request.
       const { fileId } = await uploadFn({
@@ -138,6 +142,7 @@ export async function syncOnce({
         name: entry.name,
         path: entry.path,
         size: entry.size,
+        onRetry: (message) => log(`${entry.name}: ${message}`),
       })
       manifest.files[entry.name] = {
         signature: signatureOf(entry),
@@ -147,16 +152,19 @@ export async function syncOnce({
         uploadedAt: new Date().toISOString(),
       }
       await saveManifest(manifestPath, manifest)
+      storageFailures.record()
       uploaded += 1
       log(`synced ${entry.name}`)
     } catch (err) {
       failed += 1
       errors.push({ name: entry.name, message: err.message })
       log(`failed ${entry.name}: ${err.message}`)
+      stoppedBy = storageFailures.record(err)
+      if (stoppedBy) break
     }
   }
 
-  return { uploaded, skipped: unchanged.length, failed, errors }
+  return { uploaded, skipped: unchanged.length, failed, errors, ...(stoppedBy && { stoppedBy }) }
 }
 
 function sleep(ms, signal) {
@@ -264,6 +272,7 @@ export async function runSync({
         `pass: ${summary.uploaded} synced, ${summary.skipped} unchanged` +
           (summary.failed ? `, ${summary.failed} failed` : ''),
       )
+      if (summary.stoppedBy) throw summary.stoppedBy
       if (!watch || controller.signal.aborted) break
       await sleep(intervalMs, controller.signal)
     } while (!controller.signal.aborted)
