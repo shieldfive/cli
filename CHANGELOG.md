@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## 0.6.7
 
-- Fall back to a native upload via ShieldFive after a single-part PUT times out
+- Fall back to a direct native upload after a single-part PUT times out
   or loses its connection. Reuse the working transport for the rest of the run.
 - Test both single-part transports in `sf doctor`.
 - Prefer the running agent over environment credentials and warn when both are set.

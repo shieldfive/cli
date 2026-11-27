@@ -91,14 +91,14 @@ export async function runDoctor({
   }
   if (!session) {
     if (!report.some((line) => line.startsWith('FAIL Sign-in'))) fail('Sign-in', 'run sf login and retry')
-    for (const label of ['S3 PUT', 'Native via ShieldFive']) {
+    for (const label of ['S3 PUT', 'Native direct']) {
       skip(`Test upload ${label}`)
       skip(`Delete test upload ${label}`)
     }
     return report
   }
 
-  for (const [mode, label] of [['s3', 'S3 PUT'], ['native', 'Native via ShieldFive']]) {
+  for (const [mode, label] of [['s3', 'S3 PUT'], ['native', 'Native direct']]) {
     await probeUpload({ apiBaseUrl, session, mode, label, dnsCheck, tlsCheck, report, pass, fail, skip })
   }
   return report

@@ -396,6 +396,9 @@ this client no longer writes it.
   the server compares the client's `ciphertextHash` against the client's own
   `partSha1Array[0]`, so they always agree. Integrity here rests on the upload
   proof and on the header MAC and chunk tags at download, not on a wire checksum.
+  On a PUT timeout or connection reset, the CLI requests a native upload target
+  and sends the same ciphertext directly to storage for the rest of the run.
+  `sf doctor` tests both transports.
 - **Multipart** (> 5 MiB) — the file is streamed one 5 MiB chunk at a time (never
   loaded whole into memory). The server can allocate signed part URLs or native
   multipart credentials. The server finishes the file with the ordered part

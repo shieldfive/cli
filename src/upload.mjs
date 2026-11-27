@@ -40,7 +40,7 @@ import {
 
 const CREATE_SESSION_PATH = '/api/files/create-upload-session'
 const COMPLETE_PATH = '/api/files/complete-upload'
-const NATIVE_UPLOAD_PATH = '/api/files/upload-native'
+const NATIVE_UPLOAD_PATH = '/api/files/upload-native-target'
 const PART_URL_PATH = '/api/files/upload-part-url'
 const DELETE_PATH = '/api/files/delete'
 const CAPABILITIES_PATH = '/api/files/upload-capabilities'
@@ -343,19 +343,38 @@ function canFallback(error) {
   return error.storageFailure && ['ETIMEDOUT', 'ECONNRESET', 'EPIPE'].includes(error.networkCode)
 }
 
-async function postNative({ apiBaseUrl, accessToken, fileId, ciphertext, onRetry, beforeStorage }) {
-  const url = new URL(NATIVE_UPLOAD_PATH, apiBaseUrl)
-  url.searchParams.set('fileId', fileId)
-  const operation = 'Native upload via ShieldFive'
+async function postNative({ apiBaseUrl, accessToken, fileId, ciphertext, sha1, onRetry, beforeStorage }) {
+  const operation = 'Get native upload target'
   const auth = { refreshed: false }
-  await beforeStorage?.(url)
   await withUploadRetry(async () => {
     try {
       const res = await apiRequest({
-        url, accessToken, body: ciphertext, operation, auth,
-        contentType: 'application/octet-stream', timeoutMs: STORAGE_REQUEST_TIMEOUT_MS,
+        url: new URL(NATIVE_UPLOAD_PATH, apiBaseUrl), accessToken,
+        body: JSON.stringify({ fileId }), operation, auth,
       })
-      if (res.status !== 204) throw responseError(operation, res, await readJson(res, operation))
+      const target = await readJson(res, operation)
+      if (!res.ok) throw responseError(operation, res, target)
+      const url = URL.canParse(target?.uploadUrl ?? '') ? new URL(target.uploadUrl) : null
+      if (!url || url.protocol !== 'https:' || url.port || url.username || url.password ||
+          !/^pod-[a-z0-9-]+\.backblazeb2\.com$/.test(url.hostname) ||
+          !/^\/b2api\/v[1-4]\/b2_upload_file\//.test(url.pathname) ||
+          typeof target.authorizationToken !== 'string' || !target.authorizationToken ||
+          typeof target.objectKey !== 'string' || !target.objectKey) {
+        throw new Error('Native direct upload target is invalid.')
+      }
+      await beforeStorage?.(url)
+      const uploaded = await sendStorage(url, {
+        method: 'POST',
+        headers: {
+          Authorization: target.authorizationToken,
+          'X-Bz-File-Name': encodeURIComponent(target.objectKey),
+          'X-Bz-Content-Sha1': sha1,
+          'Content-Type': 'application/octet-stream',
+          'Content-Length': String(ciphertext.byteLength),
+        },
+        body: ciphertext,
+      }, 'Native direct upload')
+      void uploaded.body?.cancel().catch(() => {})
     } catch (err) {
       err.storageFailure = true
       throw err
@@ -450,9 +469,9 @@ async function uploadDirect({ apiBaseUrl, accessToken, session, parts, nameEncry
       })
     } catch (err) {
       if (directUpload.mode === 's3' || !canFallback(err)) throw err
-      onRetry?.(`${err.message}; trying native upload via ShieldFive`)
+      onRetry?.(`${err.message}; trying a direct native upload`)
       try {
-        await postNative({ apiBaseUrl, accessToken, fileId: session.fileId, ciphertext, onRetry, beforeStorage })
+        await postNative({ apiBaseUrl, accessToken, fileId: session.fileId, ciphertext, sha1, onRetry, beforeStorage })
       } catch (nativeError) {
         nativeError.message = `${err.message}; ${nativeError.message}`
         throw nativeError
@@ -460,7 +479,7 @@ async function uploadDirect({ apiBaseUrl, accessToken, session, parts, nameEncry
       directUpload.mode = 'native'
     }
   } else {
-    await postNative({ apiBaseUrl, accessToken, fileId: session.fileId, ciphertext, onRetry, beforeStorage })
+    await postNative({ apiBaseUrl, accessToken, fileId: session.fileId, ciphertext, sha1, onRetry, beforeStorage })
   }
   onPartUploaded?.()
 

@@ -22,6 +22,8 @@ import { uploadFile } from '../src/upload.mjs'
 import { createSessionTokens } from '../src/sync.mjs'
 
 const FILE_ID = '01928c3a-1b2c-7d3e-8f40-123456789abc'
+const POD = 'https://pod-test.backblazeb2.com'
+const NATIVE_TARGET = '/api/files/upload-native-target'
 const PROOF_KEY = 'ab'.repeat(32)
 
 // faults: { [route]: array of actions consumed per request, then 'ok' }.
@@ -49,7 +51,7 @@ async function startServer(faults = {}, { direct = false, folderTree = [], clock
       const url = new URL(req.url, 'http://x')
       const route = url.pathname.startsWith('/storage/') ? 'storage' : url.pathname
       hits[route] = (hits[route] ?? 0) + 1
-      if (route !== 'storage') auth.push(req.headers.authorization)
+      if (route !== 'storage' && !route.startsWith('/b2api/')) auth.push(req.headers.authorization)
       if (route === 'storage') storageRequests.push({ method: req.method, headers: req.headers, body: Buffer.concat(chunks) })
       const firstUpload = allFail || url.pathname === `/storage/${sessions[0]?.clientUploadId}`
       const action = faults[route]?.shift() ?? (route === 'storage' && firstUpload ? mode : null) ?? 'ok'
@@ -105,9 +107,17 @@ async function startServer(faults = {}, { direct = false, folderTree = [], clock
         res.writeHead(200, { ETag: `"${createHash('md5').update(body).digest('hex')}"` })
         return res.end()
       }
-      if (route === '/api/files/upload-native' && direct) {
-        nativeRequests.push({ method: req.method, headers: req.headers, body, fileId: url.searchParams.get('fileId') })
-        return res.writeHead(204).end()
+      if (route === NATIVE_TARGET && direct) {
+        const { fileId } = JSON.parse(body)
+        assert.deepEqual(JSON.parse(body), { fileId })
+        return json({
+          uploadUrl: `${POD}/b2api/v4/b2_upload_file/${fileId}`,
+          authorizationToken: 'pod-token', objectKey: fileId,
+        })
+      }
+      if (route.startsWith('/b2api/v4/b2_upload_file/')) {
+        nativeRequests.push({ method: req.method, headers: req.headers, body, fileId: route.split('/').at(-1) })
+        return res.writeHead(200).end()
       }
       if (route === '/api/files/complete-upload') {
         manifests.push(JSON.parse(body))
@@ -124,6 +134,14 @@ async function startServer(faults = {}, { direct = false, folderTree = [], clock
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
   const base = `http://127.0.0.1:${server.address().port}`
   return { base, hits, auth, manifests, sessions, deleted, storageRequests, nativeRequests, close: () => new Promise((r) => { server.closeAllConnections(); server.close(r) }) }
+}
+
+function connectPodToTestServer(t, server) {
+  const fetch = globalThis.fetch
+  t.mock.method(globalThis, 'fetch', (url, init) => {
+    const target = new URL(url)
+    return fetch(target.origin === POD ? new URL(target.pathname, server.base) : url, init)
+  })
 }
 
 async function upload(t, server, extra = {}) {
@@ -301,7 +319,7 @@ for (const [mode, diagnostic] of failureModes) {
   test(`Media push reports ${mode}, bounds stalled cleanup, and continues`, { timeout: 12_000 }, async (t) => {
     shortenDeadlines(t)
     const rootKey = webcrypto.getRandomValues(new Uint8Array(32))
-    const server = await startServer({ '/api/files/delete': ['stall', 'stall'], '/api/files/upload-native': [404] }, {
+    const server = await startServer({ '/api/files/delete': ['stall', 'stall'], [NATIVE_TARGET]: [404] }, {
       direct: true, mode, folderTree: [vaultFolder(rootKey)],
     })
     t.after(server.close)
@@ -347,9 +365,10 @@ for (const mode of ['stall', 'reset']) {
     const rootKey = webcrypto.getRandomValues(new Uint8Array(32))
     const server = await startServer({}, { direct: true, mode, allFail: true, folderTree: [vaultFolder(rootKey)] })
     t.after(server.close)
+    connectPodToTestServer(t, server)
     const source = await mkdtemp(join(tmpdir(), 'sf-cli-native-'))
     t.after(() => rm(source, { recursive: true, force: true }))
-    await writeFile(join(source, 'a.txt'), 'first file')
+    await writeFile(join(source, 'a.txt'), Buffer.alloc(5 * 1024 * 1024))
     await writeFile(join(source, 'b.txt'), 'second file')
     const summary = await runPush({
       source, statePath: join(source, '.state.json'), apiBaseUrl: server.base,
@@ -369,7 +388,9 @@ for (const mode of ['stall', 'reset']) {
     assert.deepEqual(server.nativeRequests[0].body, s3.body)
     for (const [index, request] of server.nativeRequests.entries()) {
       assert.equal(request.method, 'POST')
-      assert.equal(request.headers.authorization, 'Bearer secret-token')
+      assert.equal(request.headers.authorization, 'pod-token')
+      assert.equal(request.headers['x-bz-file-name'], request.fileId)
+      assert.equal(request.headers['x-bz-content-sha1'], server.manifests[index].ciphertextHash)
       assert.equal(request.headers['content-length'], String(request.body.length))
       assert.equal(request.fileId, server.manifests[index].fileId)
       assert.equal(createHash('sha1').update(request.body).digest('hex'), server.manifests[index].ciphertextHash)
@@ -403,11 +424,12 @@ test('doctor reports API time, DNS, TLS, both upload paths and Bin deletion', as
   const bin = vaultFolder(rootKey, { isMedia: false, isBin: true })
   const server = await startServer({}, { direct: true, folderTree: [bin] })
   t.after(server.close)
+  connectPodToTestServer(t, server)
   const report = await runDoctor({
     apiBaseUrl: server.base, getSession: () => ({ rootKey, accessToken: 'private-token' }),
     dnsCheck: async () => [{ address: '127.0.0.1', family: 4 }, { address: '::1', family: 6 }],
     tlsCheck: async (url, { address }) => {
-      assert.equal(url.origin, server.base)
+      assert.ok([server.base, POD].includes(url.origin))
       if (address === '::1') throw Object.assign(new Error(), { code: 'ETIMEDOUT' })
       assert.equal(address, '127.0.0.1')
     },
@@ -416,7 +438,7 @@ test('doctor reports API time, DNS, TLS, both upload paths and Bin deletion', as
     'PASS API reachability', 'PASS Clock skew', 'PASS Storage DNS', 'PASS Storage TLS IPv4', 'WARN Storage TLS IPv6',
     'PASS Test upload S3 PUT', 'PASS Delete test upload S3 PUT',
     'PASS Storage DNS', 'PASS Storage TLS IPv4', 'WARN Storage TLS IPv6',
-    'PASS Test upload Native via ShieldFive', 'PASS Delete test upload Native via ShieldFive',
+    'PASS Test upload Native direct', 'PASS Delete test upload Native direct',
   ])
   assert.match(report.join('\n'), /PASS Storage TLS IPv4.*127\.0\.0\.1/)
   assert.match(report.join('\n'), /WARN Storage TLS IPv6.*ETIMEDOUT.*::1/)
@@ -432,6 +454,7 @@ test('doctor reports skew and DNS failures without exposing signed URL or provid
   shortenDeadlines(t)
   const server = await startServer({}, { direct: true, mode: 'dns', clockOffset: 300_000 })
   t.after(server.close)
+  connectPodToTestServer(t, server)
   const report = await runDoctor({
     apiBaseUrl: server.base,
     getSession: () => ({ rootKey: webcrypto.getRandomValues(new Uint8Array(32)), accessToken: 'private-token' }),
@@ -441,7 +464,7 @@ test('doctor reports skew and DNS failures without exposing signed URL or provid
   assert.match(report.join('\n'), /FAIL Storage DNS.*ENOTFOUND/)
   assert.match(report.join('\n'), /SKIP Storage TLS IPv4/)
   assert.match(report.join('\n'), /FAIL Test upload S3 PUT \/ Send storage part.*ENOTFOUND/)
-  assert.match(report.join('\n'), /PASS Test upload Native via ShieldFive/)
+  assert.match(report.join('\n'), /PASS Test upload Native direct/)
   assert.doesNotMatch(report.join('\n'), /signature|private|secret-key/)
 })
 
