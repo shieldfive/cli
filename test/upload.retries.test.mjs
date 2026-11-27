@@ -108,8 +108,13 @@ async function startServer(faults = {}, { direct = false, folderTree = [], clock
         return res.end()
       }
       if (route === NATIVE_TARGET && direct) {
-        const { fileId } = JSON.parse(body)
-        assert.deepEqual(JSON.parse(body), { fileId })
+        const { fileId, sha1, stagedFileId, objectKey } = JSON.parse(body)
+        if (stagedFileId) {
+          assert.equal(objectKey, fileId)
+          assert.equal(stagedFileId, 'staging-version')
+          return res.writeHead(204).end()
+        }
+        assert.match(sha1, /^[a-f0-9]{40}$/)
         return json({
           uploadUrl: `${POD}/b2api/v4/b2_upload_file/${fileId}`,
           authorizationToken: 'pod-token', objectKey: fileId,
@@ -117,7 +122,7 @@ async function startServer(faults = {}, { direct = false, folderTree = [], clock
       }
       if (route.startsWith('/b2api/v4/b2_upload_file/')) {
         nativeRequests.push({ method: req.method, headers: req.headers, body, fileId: route.split('/').at(-1) })
-        return res.writeHead(200).end()
+        return json({ fileId: 'staging-version' })
       }
       if (route === '/api/files/complete-upload') {
         manifests.push(JSON.parse(body))
@@ -294,9 +299,9 @@ test('a 401 that survives the refresh, or a failed refresh, says to sign in agai
   await plain.close()
 })
 
-function shortenDeadlines(t) {
+function shortenDeadlines(t, timeout = 250) {
   const deadline = AbortSignal.timeout.bind(AbortSignal)
-  t.mock.method(AbortSignal, 'timeout', (ms) => deadline(Math.min(ms, 250)))
+  t.mock.method(AbortSignal, 'timeout', (ms) => deadline(Math.min(ms, timeout)))
   t.mock.method(Math, 'random', () => 0)
 }
 
@@ -361,9 +366,9 @@ for (const [mode, diagnostic] of failureModes) {
 
 for (const mode of ['stall', 'reset']) {
   test(`Media push falls back after an S3 PUT ${mode} and reuses the working native path`, async (t) => {
-    shortenDeadlines(t)
+    shortenDeadlines(t, 2000)
     const rootKey = webcrypto.getRandomValues(new Uint8Array(32))
-    const server = await startServer({}, { direct: true, mode, allFail: true, folderTree: [vaultFolder(rootKey)] })
+    const server = await startServer({ [NATIVE_TARGET]: ['ok', 503] }, { direct: true, mode, allFail: true, folderTree: [vaultFolder(rootKey)] })
     t.after(server.close)
     connectPodToTestServer(t, server)
     const source = await mkdtemp(join(tmpdir(), 'sf-cli-native-'))
@@ -379,6 +384,7 @@ for (const mode of ['stall', 'reset']) {
     assert.equal(summary.failed.length, 0)
     assert.equal(server.storageRequests.length, 1)
     assert.equal(server.nativeRequests.length, 2)
+    assert.equal(server.hits[NATIVE_TARGET], 5, 'retry promotion without sending ciphertext again')
     const [s3] = server.storageRequests
     assert.equal(s3.method, 'PUT')
     assert.equal(s3.headers['content-length'], String(s3.body.length))

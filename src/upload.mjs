@@ -350,14 +350,14 @@ async function postNative({ apiBaseUrl, accessToken, fileId, ciphertext, sha1, o
     try {
       const res = await apiRequest({
         url: new URL(NATIVE_UPLOAD_PATH, apiBaseUrl), accessToken,
-        body: JSON.stringify({ fileId }), operation, auth,
+        body: JSON.stringify({ fileId, sha1 }), operation, auth,
       })
       const target = await readJson(res, operation)
       if (!res.ok) throw responseError(operation, res, target)
       const url = URL.canParse(target?.uploadUrl ?? '') ? new URL(target.uploadUrl) : null
       if (!url || url.protocol !== 'https:' || url.port || url.username || url.password ||
-          !/^pod-[a-z0-9-]+\.backblazeb2\.com$/.test(url.hostname) ||
-          !/^\/b2api\/v[1-4]\/b2_upload_file\//.test(url.pathname) ||
+          !/^pod-[a-z0-9-]+\.backblaze(?:b2)?\.com$/.test(url.hostname) ||
+          !/^\/b2api\/v[1-4]\/b2_upload_file(?:\/|$)/.test(url.pathname) ||
           typeof target.authorizationToken !== 'string' || !target.authorizationToken ||
           typeof target.objectKey !== 'string' || !target.objectKey) {
         throw new Error('Native direct upload target is invalid.')
@@ -374,7 +374,20 @@ async function postNative({ apiBaseUrl, accessToken, fileId, ciphertext, sha1, o
         },
         body: ciphertext,
       }, 'Native direct upload')
-      void uploaded.body?.cancel().catch(() => {})
+      const receipt = await readJson(uploaded, 'Native direct upload')
+      if (typeof receipt?.fileId !== 'string' ||
+          !/^[a-zA-Z0-9_-]{1,200}$/.test(receipt.fileId)) {
+        throw new Error('Native direct upload returned an invalid version ID.')
+      }
+      await withUploadRetry(async () => {
+        const operation = 'Promote native upload'
+        const promoted = await apiRequest({
+          url: new URL(NATIVE_UPLOAD_PATH, apiBaseUrl), accessToken,
+          body: JSON.stringify({ fileId, objectKey: target.objectKey, stagedFileId: receipt.fileId }),
+          operation, auth,
+        })
+        if (!promoted.ok) throw responseError(operation, promoted, await readJson(promoted, operation))
+      }, onRetry, STORAGE_ATTEMPTS)
     } catch (err) {
       err.storageFailure = true
       throw err
