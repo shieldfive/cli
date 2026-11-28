@@ -48,6 +48,9 @@ import { networkRequest, readJson, resolveToken } from './network.mjs'
 const STATE_VERSION = 1
 const DEFAULT_CONCURRENCY = 3
 const MAX_CONCURRENCY = 8
+const NATIVE_DIRECT_MAX_BYTES = 5 * 1024 ** 2
+const NATIVE_RAMP_SUCCESSES = 3
+const NATIVE_COOLDOWN_MS = 30_000
 const MAX_FILE_ATTEMPTS = 8
 const VERIFY_BATCH = 100
 
@@ -351,7 +354,7 @@ export async function runPush({
   includeDotfiles = false,
   makeThumbnailFn = makeThumbnail,
   thumbnailSupportFn = thumbnailSupport,
-  concurrency = resolvePushConcurrency(),
+  concurrency,
   uploadFn = uploadFile,
   log = (m) => process.stdout.write(`${m}\n`),
   status = (m) => process.stderr.write(`${m}\n`),
@@ -362,7 +365,22 @@ export async function runPush({
   source = resolve(source)
   // Notes worth showing even where progress lines are not (through the agent).
   const notes = []
-  const directUpload = {}
+  const adaptive = concurrency === undefined && !process.env.SF_PUSH_CONCURRENCY
+  concurrency ??= resolvePushConcurrency()
+  let uploadMode
+  let nativeLimit = concurrency
+  let cleanNative = 0
+  let cooldownUntil = 0
+  const workers = Array.from({ length: adaptive ? MAX_CONCURRENCY : concurrency }, () => ({
+    get mode() { return uploadMode },
+    set mode(mode) { uploadMode = mode },
+    reuseTargets: true,
+    onCongestion() {
+      cleanNative = 0
+      nativeLimit = concurrency
+      cooldownUntil = Date.now() + NATIVE_COOLDOWN_MS
+    },
+  }))
   {
     const inner = status
     status = (m) => {
@@ -387,9 +405,18 @@ export async function runPush({
   const state = await loadState(statePath, { account, source })
   const save = (() => {
     let chain = Promise.resolve()
-    // Serialised; one failed write (disk full) fails its caller but does not
-    // poison every later save.
-    return () => (chain = chain.catch(() => {}).then(() => saveState(statePath, state)))
+    let queued
+    // Coalesce checkpoint requests made before the next write starts. A worker
+    // still waits for its pending row to reach disk before it uploads anything.
+    return () => {
+      if (queued) return queued
+      queued = chain.catch(() => {}).then(() => {
+        queued = undefined
+        return saveState(statePath, state)
+      })
+      chain = queued
+      return queued
+    }
   })()
 
   // Folders: resume into the ones recorded, create the rest.
@@ -655,7 +682,7 @@ export async function runPush({
     : { image: false, video: false }
   const todoBytes = todo.reduce((s, f) => s + f.size, 0)
   const counts = () => `${summary.uploaded}/${summary.total} files uploaded (${summary.alreadyThere} already in the vault, ${summary.failed.length} failed)`
-  progress(`Starting uploads: ${counts()}. ${todo.length} queued, up to ${concurrency} at a time.`)
+  progress(`Starting uploads: ${counts()}. ${todo.length} queued, up to ${workers.length} at a time.`)
 
   let inFlightBytes = 0
   let completed = 0
@@ -684,7 +711,7 @@ export async function runPush({
   const storageFailures = storageFailureLimit()
   const stopping = () => summary.stoppedBy || signal?.aborted
 
-  const uploadOne = async (f) => {
+  const uploadOne = async (f, directUpload) => {
     const before = await lstat(f.path).catch(() => null)
     if (!before?.isFile()) {
       summary.failed.push({ rel: f.rel, message: 'file disappeared or is no longer a regular file' })
@@ -769,6 +796,11 @@ export async function runPush({
       return
     }
     storageFailures.record()
+    if (adaptive && entry.size <= NATIVE_DIRECT_MAX_BYTES && uploadMode === 'native' &&
+        Date.now() >= cooldownUntil && nativeLimit < workers.length && ++cleanNative >= NATIVE_RAMP_SUCCESSES) {
+      nativeLimit++
+      cleanNative = 0
+    }
     summary.uploaded += 1
     lastUploadProgress = Date.now()
     summary.bytesUploaded += entry.size
@@ -786,18 +818,28 @@ export async function runPush({
     }
   }
 
-  const worker = async () => {
-    while (!stopping() && next < todo.length) {
-      const f = todo[next++]
-      try {
-        await uploadOne(f)
-      } catch (err) {
-        summary.stoppedBy ??= err
-      }
-    }
-  }
+  const inFlight = new Set()
+  const idle = [...workers]
   try {
-    await Promise.all(Array.from({ length: Math.min(concurrency, todo.length || 1) }, worker))
+    while (inFlight.size || (!stopping() && next < todo.length)) {
+      while (!stopping() && next < todo.length) {
+        const f = todo[next]
+        const limit = uploadMode === 'native' && f.size <= NATIVE_DIRECT_MAX_BYTES
+          ? nativeLimit
+          : concurrency
+        if (inFlight.size >= limit) break
+        next++
+        const worker = idle.pop()
+        const task = uploadOne(f, worker).catch((err) => {
+          summary.stoppedBy ??= err
+        }).finally(() => {
+          idle.push(worker)
+          inFlight.delete(task)
+        })
+        inFlight.add(task)
+      }
+      if (inFlight.size) await Promise.race(inFlight)
+    }
   } finally {
     if (timer) clearInterval(timer)
   }

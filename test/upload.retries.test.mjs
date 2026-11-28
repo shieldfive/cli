@@ -29,7 +29,7 @@ const PROOF_KEY = 'ab'.repeat(32)
 // faults: { [route]: array of actions consumed per request, then 'ok' }.
 // Actions: 'ok', 'stall', 'reset' (destroy the socket), 'cut' (200 with a truncated
 // body), or a number (that HTTP status, JSON body).
-async function startServer(faults = {}, { direct = false, folderTree = [], clockOffset = 0, mode, allFail = false, storageHost } = {}) {
+async function startServer(faults = {}, { direct = false, folderTree = [], clockOffset = 0, mode, allFail = false, storageHost, reuseNative = false } = {}) {
   const hits = {}
   const auth = []
   const manifests = []
@@ -37,6 +37,7 @@ async function startServer(faults = {}, { direct = false, folderTree = [], clock
   const deleted = []
   const storageRequests = []
   const nativeRequests = []
+  const nativeTargets = []
   const storageUrl = (fileId) => {
     if (mode === 'dns' && (allFail || fileId === sessions[0]?.clientUploadId)) {
       return 'http://shieldfive-storage-test.invalid/secret-key?signature=private'
@@ -108,13 +109,15 @@ async function startServer(faults = {}, { direct = false, folderTree = [], clock
         return res.end()
       }
       if (route === NATIVE_TARGET && direct) {
-        const { fileId, sha1, stagedFileId, objectKey } = JSON.parse(body)
+        const { fileId, sha1, stagedFileId, objectKey, reuseUploadTarget } = JSON.parse(body)
         if (stagedFileId) {
           assert.equal(objectKey, fileId)
           assert.equal(stagedFileId, 'staging-version')
           return res.writeHead(204).end()
         }
         assert.match(sha1, /^[a-f0-9]{40}$/)
+        nativeTargets.push(reuseUploadTarget === true)
+        if (reuseNative && reuseUploadTarget) return json({ objectKey: fileId })
         return json({
           uploadUrl: `${POD}/b2api/v4/b2_upload_file/${fileId}`,
           authorizationToken: 'pod-token', objectKey: fileId,
@@ -138,7 +141,7 @@ async function startServer(faults = {}, { direct = false, folderTree = [], clock
   })
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
   const base = `http://127.0.0.1:${server.address().port}`
-  return { base, hits, auth, manifests, sessions, deleted, storageRequests, nativeRequests, close: () => new Promise((r) => { server.closeAllConnections(); server.close(r) }) }
+  return { base, hits, auth, manifests, sessions, deleted, storageRequests, nativeRequests, nativeTargets, close: () => new Promise((r) => { server.closeAllConnections(); server.close(r) }) }
 }
 
 function connectPodToTestServer(t, server) {
@@ -404,6 +407,49 @@ for (const mode of ['stall', 'reset']) {
     assert.equal(server.deleted.length, 0)
   })
 }
+
+test('reuses a worker target until the pod rejects it, then rotates credentials', async (t) => {
+  const rootKey = webcrypto.getRandomValues(new Uint8Array(32))
+  const dir = await mkdtemp(join(tmpdir(), 'sf-cli-native-reuse-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const server = await startServer({}, { direct: true, reuseNative: true })
+  t.after(server.close)
+  connectPodToTestServer(t, server)
+  const path = join(dir, 'photo.jpg')
+  await writeFile(path, Buffer.alloc(128 * 1024))
+  let congestion = 0
+  const directUpload = { mode: 'native', reuseTargets: true, onCongestion: () => congestion++ }
+  const send = () => uploadFile({
+    apiBaseUrl: server.base, accessToken: 'token', rootKey, name: 'photo.jpg',
+    path, size: 128 * 1024, thumbnail: null, directUpload,
+  })
+  const first = await send()
+  const second = await send()
+  const rejectedRoute = '/b2api/v4/b2_upload_file/' + first.fileId
+  // The rejected response retains no upload receipt.
+  const cachedFetch = globalThis.fetch
+  let reject = true
+  t.mock.method(globalThis, 'fetch', (url, init) => {
+    if (reject && new URL(url).pathname === rejectedRoute) {
+      reject = false
+      return Promise.resolve(new Response('{"code":"service_unavailable"}', {
+        status: 503, headers: { 'Retry-After': '0' },
+      }))
+    }
+    return cachedFetch(url, init)
+  })
+  const third = await send()
+  assert.equal(congestion, 1)
+  assert.deepEqual(server.nativeTargets, [false, true, true, false])
+  assert.deepEqual(server.nativeRequests.map(({ fileId }) => fileId), [
+    first.fileId, first.fileId, third.fileId,
+  ])
+  assert.equal(server.nativeRequests[1].headers['x-bz-file-name'], second.fileId)
+  assert.deepEqual(server.manifests.map(({ fileId }) => fileId), [
+    first.fileId, second.fileId, third.fileId,
+  ])
+  assert.equal(server.storageRequests.length, 0)
+})
 
 test('three consecutive file failures stop scheduling with the last storage diagnostic', async (t) => {
   shortenDeadlines(t)

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## 0.6.8
+
+- Reuse a native upload target per push worker and rotate it if the pod rejects an upload.
+- Scale small native uploads from three to eight workers and back off when storage is busy.
+- Coalesce concurrent push checkpoints while keeping the pending record durable before each upload.
+
 ## 0.6.7
 
 - Fall back to a direct native upload after a single-part PUT times out

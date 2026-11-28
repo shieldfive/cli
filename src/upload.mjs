@@ -343,56 +343,104 @@ function canFallback(error) {
   return error.storageFailure && ['ETIMEDOUT', 'ECONNRESET', 'EPIPE'].includes(error.networkCode)
 }
 
-async function postNative({ apiBaseUrl, accessToken, fileId, ciphertext, sha1, onRetry, beforeStorage }) {
+async function timeUpload(phase, run) {
+  if (process.env.SF_UPLOAD_TIMINGS !== '1') return run()
+  const started = performance.now()
+  try {
+    return await run()
+  } finally {
+    process.stderr.write(`upload timing ${phase} ${Math.round(performance.now() - started)} ms\n`)
+  }
+}
+
+async function postNative({ apiBaseUrl, accessToken, fileId, ciphertext, sha1, onRetry, beforeStorage, directUpload }) {
   const operation = 'Get native upload target'
   const auth = { refreshed: false }
-  await withUploadRetry(async () => {
+  const { objectKey, stagedFileId } = await withUploadRetry(async () => {
     try {
-      const res = await apiRequest({
-        url: new URL(NATIVE_UPLOAD_PATH, apiBaseUrl), accessToken,
-        body: JSON.stringify({ fileId, sha1 }), operation, auth,
+      const cached = directUpload.target
+      const reuse = cached?.apiBaseUrl === String(apiBaseUrl) && cached.expiresAt > Date.now()
+      const target = await timeUpload('native_target', async () => {
+        const res = await apiRequest({
+          url: new URL(NATIVE_UPLOAD_PATH, apiBaseUrl), accessToken,
+          body: JSON.stringify({ fileId, sha1, ...(reuse && { reuseUploadTarget: true }) }), operation, auth,
+        })
+        const target = await readJson(res, operation)
+        if (!res.ok) throw responseError(operation, res, target)
+        return target
       })
-      const target = await readJson(res, operation)
-      if (!res.ok) throw responseError(operation, res, target)
-      const url = URL.canParse(target?.uploadUrl ?? '') ? new URL(target.uploadUrl) : null
+      const credentials = reuse && target?.uploadUrl === undefined && target?.authorizationToken === undefined
+        ? cached
+        : target
+      const url = URL.canParse(credentials?.uploadUrl ?? '') ? new URL(credentials.uploadUrl) : null
       if (!url || url.protocol !== 'https:' || url.port || url.username || url.password ||
           !/^pod-[a-z0-9-]+\.backblaze(?:b2)?\.com$/.test(url.hostname) ||
           !/^\/b2api\/v[1-4]\/b2_upload_file(?:\/|$)/.test(url.pathname) ||
-          typeof target.authorizationToken !== 'string' || !target.authorizationToken ||
-          typeof target.objectKey !== 'string' || !target.objectKey) {
+          typeof credentials.authorizationToken !== 'string' || !credentials.authorizationToken ||
+          typeof target?.objectKey !== 'string' || !target.objectKey) {
         throw new Error('Native direct upload target is invalid.')
       }
       await beforeStorage?.(url)
-      const uploaded = await sendStorage(url, {
-        method: 'POST',
-        headers: {
-          Authorization: target.authorizationToken,
-          'X-Bz-File-Name': encodeURIComponent(target.objectKey),
-          'X-Bz-Content-Sha1': sha1,
-          'Content-Type': 'application/octet-stream',
-          'Content-Length': String(ciphertext.byteLength),
-        },
-        body: ciphertext,
-      }, 'Native direct upload')
-      const receipt = await readJson(uploaded, 'Native direct upload')
+      const receipt = await timeUpload('native_pod', async () => {
+        try {
+          const uploaded = await sendStorage(url, {
+            method: 'POST',
+            headers: {
+              Authorization: credentials.authorizationToken,
+              'X-Bz-File-Name': encodeURIComponent(target.objectKey),
+              'X-Bz-Content-Sha1': sha1,
+              'Content-Type': 'application/octet-stream',
+              'Content-Length': String(ciphertext.byteLength),
+            },
+            body: ciphertext,
+          }, 'Native direct upload')
+          return await readJson(uploaded, 'Native direct upload')
+        } catch (error) {
+          delete directUpload.target
+          if (error.status === 503 || error.status === 429 || error.storageBusy) directUpload.onCongestion?.()
+          throw error
+        }
+      })
       if (typeof receipt?.fileId !== 'string' ||
           !/^[a-zA-Z0-9_-]{1,200}$/.test(receipt.fileId)) {
         throw new Error('Native direct upload returned an invalid version ID.')
       }
-      await withUploadRetry(async () => {
-        const operation = 'Promote native upload'
-        const promoted = await apiRequest({
-          url: new URL(NATIVE_UPLOAD_PATH, apiBaseUrl), accessToken,
-          body: JSON.stringify({ fileId, objectKey: target.objectKey, stagedFileId: receipt.fileId }),
-          operation, auth,
-        })
-        if (!promoted.ok) throw responseError(operation, promoted, await readJson(promoted, operation))
-      }, onRetry, STORAGE_ATTEMPTS)
+      if (credentials !== cached && directUpload.reuseTargets) {
+        directUpload.target = {
+          apiBaseUrl: String(apiBaseUrl),
+          uploadUrl: credentials.uploadUrl,
+          authorizationToken: credentials.authorizationToken,
+          expiresAt: Date.now() + 23 * 60 * 60_000,
+        }
+      }
+      return { objectKey: target.objectKey, stagedFileId: receipt.fileId }
     } catch (err) {
       err.storageFailure = true
       throw err
     }
   }, onRetry, STORAGE_ATTEMPTS)
+
+  // Retry promotion with the same staged version. A lost response can arrive
+  // after the server already copied and deleted that version.
+  await withUploadRetry(() => timeUpload('native_promote', async () => {
+    const operation = 'Promote native upload'
+    try {
+      const promoted = await apiRequest({
+        url: new URL(NATIVE_UPLOAD_PATH, apiBaseUrl), accessToken,
+        body: JSON.stringify({ fileId, objectKey, stagedFileId }),
+        operation, auth,
+      })
+      if (!promoted.ok) throw responseError(operation, promoted, await readJson(promoted, operation))
+      const timing = promoted.headers.get('server-timing')
+      if (process.env.SF_UPLOAD_TIMINGS === '1' && timing) {
+        process.stderr.write(`upload timing native_server ${timing}\n`)
+      }
+    } catch (error) {
+      error.storageFailure = true
+      if (error.status === 503 || error.status === 429) directUpload.onCongestion?.()
+      throw error
+    }
+  }), onRetry, STORAGE_ATTEMPTS)
 }
 
 async function putDirectPresigned({ context, session, ciphertext, onRetry, beforeStorage, directUpload }) {
@@ -484,7 +532,7 @@ async function uploadDirect({ apiBaseUrl, accessToken, session, parts, nameEncry
       if (directUpload.mode === 's3' || !canFallback(err)) throw err
       onRetry?.(`${err.message}; trying a direct native upload`)
       try {
-        await postNative({ apiBaseUrl, accessToken, fileId: session.fileId, ciphertext, sha1, onRetry, beforeStorage })
+        await postNative({ apiBaseUrl, accessToken, fileId: session.fileId, ciphertext, sha1, onRetry, beforeStorage, directUpload })
       } catch (nativeError) {
         nativeError.message = `${err.message}; ${nativeError.message}`
         throw nativeError
@@ -492,7 +540,7 @@ async function uploadDirect({ apiBaseUrl, accessToken, session, parts, nameEncry
       directUpload.mode = 'native'
     }
   } else {
-    await postNative({ apiBaseUrl, accessToken, fileId: session.fileId, ciphertext, sha1, onRetry, beforeStorage })
+    await postNative({ apiBaseUrl, accessToken, fileId: session.fileId, ciphertext, sha1, onRetry, beforeStorage, directUpload })
   }
   onPartUploaded?.()
 
@@ -501,7 +549,7 @@ async function uploadDirect({ apiBaseUrl, accessToken, session, parts, nameEncry
   // HEADs the object for the real version id. Forwarding the PUT's ETag instead
   // would be persisted verbatim into files.b2_file_id with no format check --
   // a bogus delete handle, permanently, which is worse than failing.
-  return finalizeUpload({
+  return timeUpload('finalize', () => finalizeUpload({
     apiBaseUrl,
     accessToken,
     fileId: session.fileId,
@@ -510,7 +558,7 @@ async function uploadDirect({ apiBaseUrl, accessToken, session, parts, nameEncry
     proof,
     ciphertextHash: sha1,
     nameEncryptedV6,
-  })
+  }))
 }
 
 // Each concurrent upload holds one encrypted frame and, for the native
@@ -721,7 +769,7 @@ export async function uploadFile({ apiBaseUrl, accessToken, rootKey, name, path,
   if (thumbnail === undefined) {
     thumbnail = process.env.SF_NO_THUMBNAILS === '1' ? null : await makeThumbnail({ path, name, size })
   }
-  const { session, csk, nameEncryptedV6 } = await createUploadSession({
+  const { session, csk, nameEncryptedV6 } = await timeUpload('session_create', () => createUploadSession({
     apiBaseUrl,
     accessToken,
     rootKey,
@@ -732,7 +780,7 @@ export async function uploadFile({ apiBaseUrl, accessToken, rootKey, name, path,
     folderId,
     folderKey,
     thumbnail,
-  })
+  }))
   // From here on a pending row exists. Any failure before finalize answers
   // cancels it (see cancelUploadSession).
   const envelopeKey = base64ToBytes(csk)

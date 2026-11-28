@@ -123,7 +123,9 @@ was created, the pending session is cancelled so it does not hold quota.
 `sf push` copies the whole tree: it creates one vault folder named after
 `<folder>` and recreates every subfolder (empty ones too) inside it, the way the
 web app's Upload folder does. Three files upload at a time
-(`SF_PUSH_CONCURRENCY`, 1-8); large files also send three parts at a time
+(`SF_PUSH_CONCURRENCY`, 1-8). On native fallback, the default scales up to eight
+workers for single-chunk files and returns to three when storage is busy. Large
+files also send three parts at a time
 (`SF_UPLOAD_CONCURRENCY`). Network errors, 5xx, 408 and 429 answers are retried
 with backoff. It prints each file as it finishes and a progress line every 10
 seconds. A full vault or a refused session stops the run; any other file that
