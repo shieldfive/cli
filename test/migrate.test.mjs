@@ -312,7 +312,7 @@ test('native small-file workers ramp up and back off after congestion', async ()
         congested = true
         directUpload.onCongestion()
       }
-      await new Promise((resolve) => setTimeout(resolve, 20))
+      await new Promise((resolve) => setTimeout(resolve, 160))
       active--
     },
   })

@@ -405,9 +405,18 @@ export async function runPush({
   const state = await loadState(statePath, { account, source })
   const save = (() => {
     let chain = Promise.resolve()
-    // Serialised; one failed write (disk full) fails its caller but does not
-    // poison every later save.
-    return () => (chain = chain.catch(() => {}).then(() => saveState(statePath, state)))
+    let queued
+    // Coalesce checkpoint requests made before the next write starts. A worker
+    // still waits for its pending row to reach disk before it uploads anything.
+    return () => {
+      if (queued) return queued
+      queued = chain.catch(() => {}).then(() => {
+        queued = undefined
+        return saveState(statePath, state)
+      })
+      chain = queued
+      return queued
+    }
   })()
 
   // Folders: resume into the ones recorded, create the rest.
