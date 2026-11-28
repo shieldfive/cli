@@ -285,3 +285,39 @@ test('keeps an unconfirmed finalization in the checkpoint for the next run', asy
   assert.equal(resumed.alreadyThere, 1)
   assert.deepEqual(uploads, [])
 })
+
+test('native small-file workers ramp up and back off after congestion', async () => {
+  const src = join(dir, 'photos')
+  await mkdir(src)
+  await Promise.all(Array.from({ length: 60 }, (_, index) =>
+    writeFile(join(src, `photo-${String(index).padStart(2, '0')}.jpg`), 'photo'),
+  ))
+  let active = 0
+  let peak = 0
+  let congested = false
+  let postCongestion = 0
+  let postPeak = 0
+  const result = await runPush({
+    source: src, apiBaseUrl: 'https://x.test', accessToken: 't', rootKey,
+    account: 'a@x', statePath: join(dir, 'state.json'), thumbnails: false, ...quiet,
+    uploadFn: async ({ directUpload }) => {
+      active++
+      peak = Math.max(peak, active)
+      if (congested) {
+        postCongestion++
+        postPeak = Math.max(postPeak, active)
+      }
+      directUpload.mode = 'native'
+      if (!congested && active === 8) {
+        congested = true
+        directUpload.onCongestion()
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      active--
+    },
+  })
+  assert.equal(result.uploaded, 60)
+  assert.equal(peak, 8)
+  assert.ok(postCongestion > 3)
+  assert.equal(postPeak, 3)
+})
